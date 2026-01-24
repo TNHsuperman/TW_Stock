@@ -184,4 +184,24 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
             macd_s = exp1 - exp2
             signal_s = macd_s.ewm(span=9, adjust=False).mean()
             hist_s = macd_s - signal_s
-            h_colors = ['red' if v >= 0 else 'green' for v in
+            h_colors = ['red' if v >= 0 else 'green' for v in hist_s]
+            fig.add_trace(go.Bar(x=df_plot.index, y=hist_s, marker_color=h_colors, name="MACD柱狀體"), row=3, col=1)
+
+        # 核心：移除未開盤時間 (週六、週日與非交易時段)
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]), # 移除週末
+                # 若需要移除特定連續假期，可在這裡加入 dict(values=["2026-02-14", ...])
+            ]
+        )
+
+        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='pan', margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+    # 列表放在下方作為輔助選擇
+    st.write("---")
+    st.write("📊 篩選清單總覽")
+    st.dataframe(df_filtered, hide_index=True, use_container_width=True)
+
+elif 'scan_results' in st.session_state:
+    st.warning("查無標的，請試著放寬過濾條件。")
