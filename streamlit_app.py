@@ -9,14 +9,14 @@ import urllib3
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# --- 1. 系統初始化與安全設定 ---
+# --- 1. 系統初始化 ---
 if 'warnings' not in sys.modules:
     sys.modules['warnings'] = warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="台股智慧選股", layout="centered")
 
-# --- 2. 資料抓取與緩存 ---
+# --- 2. 資料抓取 ---
 @st.cache_data(ttl=86400)
 def get_stock_info_map():
     stock_info_map = {}
@@ -45,20 +45,18 @@ def get_stock_info_map():
         except: continue
     return stocks_list, stock_info_map
 
-# --- 3. UI 策略與指標設定 ---
+# --- 3. UI 設定 ---
 st.sidebar.header("⚙️ 策略參數")
 strategy_option = st.sidebar.radio("選擇選股策略：", ("均線多頭回測", "均線糾結偵測"))
 indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示", "RSI (強弱指標)", "MACD (趨勢指標)"])
-
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
-# --- 4. 核心掃描邏輯 ---
+# --- 4. 掃描邏輯 ---
 if st.button(f"🔍 開始全市場掃描", use_container_width=True):
     all_stocks, info_map = get_stock_info_map()
     results = []
     progress_bar = st.progress(0)
-    
     batch_size = 100
     for i in range(0, len(all_stocks), batch_size):
         batch = all_stocks[i:i + batch_size]
@@ -69,20 +67,16 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
                     df = data[ticker] if len(batch) > 1 else data
                     df = df.dropna(subset=['Close'])
                     if len(df) < 60: continue
-                    
-                    avg_vol = df['Volume'].tail(5).mean() / 1000
-                    if avg_vol < min_volume: continue
+                    if (df['Volume'].tail(5).mean() / 1000) < min_volume: continue
 
                     close = float(df['Close'].iloc[-1])
                     m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
                     
+                    # 計算選股指標
                     delta = df['Close'].diff()
-                    gain, loss = (delta.where(delta > 0, 0)).rolling(14).mean(), (-delta.where(delta < 0, 0)).rolling(14).mean()
-                    rsi = (100 - (100 / (1 + gain/loss))).iloc[-1]
-
-                    exp1, exp2 = df['Close'].ewm(span=12, adjust=False).mean(), df['Close'].ewm(span=26, adjust=False).mean()
-                    macd_v, signal_v = exp1 - exp2, (exp1 - exp2).ewm(span=9, adjust=False).mean()
-                    hist_v = (macd_v - signal_v).iloc[-1]
+                    rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
+                    exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
+                    hist_v = (exp1 - exp2 - (exp1 - exp2).ewm(span=9).mean()).iloc[-1]
                     
                     keep = False
                     if strategy_option == "均線多頭回測":
@@ -104,7 +98,7 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
     st.session_state['scan_results'] = pd.DataFrame(results)
     st.session_state['selected_index'] = 0
 
-# --- 5. 顯示與同步邏輯 ---
+# --- 5. 顯示與同步 ---
 if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
@@ -113,36 +107,28 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
 
     if 'selected_index' not in st.session_state:
         st.session_state['selected_index'] = 0
-    
-    # 修正索引溢出
     if st.session_state['selected_index'] >= len(df_filtered):
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
-    
-    # 修復 TypeError: 使用更穩健的 selection 傳遞方式
-    # 我們將 selection 狀態獨立出來處理
-    current_selection = [st.session_state['selected_index']]
-    
+    # 使用 key="stock_table" 讓 Streamlit 自動管理狀態
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
         use_container_width=True, 
         on_select="rerun", 
         selection_mode="single-row",
-        selection=current_selection 
+        key="stock_table"
     )
 
-    # 處理清單點選更新索引
-    if event.selection.rows:
-        clicked_index = event.selection.rows[0]
-        if clicked_index != st.session_state['selected_index']:
-            st.session_state['selected_index'] = clicked_index
-            st.rerun()
+    # 同步點擊事件到 selected_index
+    if event.selection and event.selection.rows:
+        st.session_state['selected_index'] = event.selection.rows[0]
 
     # 左右切換按鈕
     st.write("---")
     c1, c2, c3 = st.columns([1, 2, 1])
+    
     with c1:
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
@@ -154,7 +140,7 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
             st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
             st.rerun()
 
-    # 繪圖區域
+    # 繪圖
     row = df_filtered.iloc[st.session_state['selected_index']]
     ticker_id = row['ID']
     
@@ -165,7 +151,6 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
         
         n_rows = 3 if indicator_choice != "都不顯示" else 2
         fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.2, 0.3] if n_rows==3 else [0.7, 0.3])
-        
         fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
         for ma, clr in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p[ma], line=dict(color=clr, width=1.2), name=ma), row=1, col=1)
@@ -184,15 +169,7 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
             fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['red' if v>=0 else 'green' for v in h_s], name="MACD柱"), row=3, col=1)
 
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        
-        fig.update_layout(
-            title=f"<b>{row['名稱']} ({ticker_id})</b>", 
-            xaxis_rangeslider_visible=False, 
-            height=600, 
-            template="plotly_white", 
-            dragmode='zoom',
-            margin=dict(l=10, r=10, t=50, b=10)
-        )
+        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
 elif 'scan_results' in st.session_state:
