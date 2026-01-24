@@ -52,6 +52,12 @@ indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示"
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
+# 初始化 Session State
+if 'selected_index' not in st.session_state:
+    st.session_state['selected_index'] = 0
+if 'scan_results' not in st.session_state:
+    st.session_state['scan_results'] = pd.DataFrame()
+
 # --- 4. 掃描邏輯 ---
 if st.button(f"🔍 開始全市場掃描", use_container_width=True):
     all_stocks, info_map = get_stock_info_map()
@@ -72,7 +78,6 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
                     close = float(df['Close'].iloc[-1])
                     m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
                     
-                    # 計算選股指標
                     delta = df['Close'].diff()
                     rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
                     exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
@@ -97,33 +102,37 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
         progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
     st.session_state['scan_results'] = pd.DataFrame(results)
     st.session_state['selected_index'] = 0
+    st.rerun()
 
 # --- 5. 顯示與同步 ---
-if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
+if not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
     df_filtered = df_filtered.reset_index(drop=True)
 
-    if 'selected_index' not in st.session_state:
-        st.session_state['selected_index'] = 0
     if st.session_state['selected_index'] >= len(df_filtered):
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
-    # 使用 key="stock_table" 讓 Streamlit 自動管理狀態
+    
+    # 核心修正：利用 selection 參數搭配 session_state，實現雙向聯動且不報錯
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
         use_container_width=True, 
         on_select="rerun", 
         selection_mode="single-row",
+        selection=[st.session_state['selected_index']],
         key="stock_table"
     )
 
-    # 同步點擊事件到 selected_index
+    # 如果點擊清單中的列，更新索引
     if event.selection and event.selection.rows:
-        st.session_state['selected_index'] = event.selection.rows[0]
+        clicked_index = event.selection.rows[0]
+        if clicked_index != st.session_state['selected_index']:
+            st.session_state['selected_index'] = clicked_index
+            st.rerun()
 
     # 左右切換按鈕
     st.write("---")
@@ -172,5 +181,5 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
         fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
-elif 'scan_results' in st.session_state:
+elif not st.session_state['scan_results'].empty:
     st.warning("查無標的。")
