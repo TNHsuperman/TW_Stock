@@ -111,30 +111,33 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
     df_filtered = df_filtered.reset_index(drop=True)
 
-    # 狀態管理：確保按鈕與清單點選同步
     if 'selected_index' not in st.session_state:
         st.session_state['selected_index'] = 0
     
-    # 防止索引越界（例如切換產業後清單變短）
+    # 修正索引溢出
     if st.session_state['selected_index'] >= len(df_filtered):
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
-    # 使用 selection 參數來讓清單反白狀態與 session_state 同步
+    
+    # 修復 TypeError: 使用更穩健的 selection 傳遞方式
+    # 我們將 selection 狀態獨立出來處理
+    current_selection = [st.session_state['selected_index']]
+    
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
         use_container_width=True, 
         on_select="rerun", 
         selection_mode="single-row",
-        selection=[st.session_state['selected_index']] # 讓清單自動跟隨按鈕變動
+        selection=current_selection 
     )
 
-    # 如果點選清單，同步更新索引
+    # 處理清單點選更新索引
     if event.selection.rows:
-        new_index = event.selection.rows[0]
-        if new_index != st.session_state['selected_index']:
-            st.session_state['selected_index'] = new_index
+        clicked_index = event.selection.rows[0]
+        if clicked_index != st.session_state['selected_index']:
+            st.session_state['selected_index'] = clicked_index
             st.rerun()
 
     # 左右切換按鈕
@@ -151,7 +154,7 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
             st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
             st.rerun()
 
-    # 繪圖
+    # 繪圖區域
     row = df_filtered.iloc[st.session_state['selected_index']]
     ticker_id = row['ID']
     
@@ -163,16 +166,13 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
         n_rows = 3 if indicator_choice != "都不顯示" else 2
         fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.2, 0.3] if n_rows==3 else [0.7, 0.3])
         
-        # Row 1: K線
         fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
         for ma, clr in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p[ma], line=dict(color=clr, width=1.2), name=ma), row=1, col=1)
         
-        # Row 2: 成交量
         v_clrs = ['red' if c >= o else 'green' for c, o in zip(df_p['Close'], df_p['Open'])]
         fig.add_trace(go.Bar(x=df_p.index, y=df_p['Volume'], marker_color=v_clrs, name="成交量"), row=2, col=1)
         
-        # Row 3: 條件指標
         if indicator_choice == "RSI (強弱指標)":
             d = df_p['Close'].diff()
             rsi_s = 100 - (100 / (1 + (d.where(d > 0, 0)).rolling(14).mean()/( -d.where(d < 0, 0)).rolling(14).mean()))
@@ -185,16 +185,14 @@ if 'scan_results' in st.session_state and not st.session_state['scan_results'].e
 
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
         
-        # 關鍵：開啟放大縮小與觸控優化
         fig.update_layout(
             title=f"<b>{row['名稱']} ({ticker_id})</b>", 
             xaxis_rangeslider_visible=False, 
             height=600, 
             template="plotly_white", 
-            dragmode='zoom', # 預設為縮放模式
+            dragmode='zoom',
             margin=dict(l=10, r=10, t=50, b=10)
         )
-        # 設定 config 以支援手機兩指縮放
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
 elif 'scan_results' in st.session_state:
