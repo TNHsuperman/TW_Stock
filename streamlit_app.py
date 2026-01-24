@@ -14,7 +14,7 @@ if 'warnings' not in sys.modules:
     sys.modules['warnings'] = warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="台股趨勢選股", layout="centered")
+st.set_page_config(page_title="台股快速選股", layout="centered")
 
 # --- 2. 資料抓取與緩存 ---
 @st.cache_data(ttl=86400)
@@ -49,7 +49,7 @@ def get_stock_info_map():
 # --- 3. UI 策略與指標設定 ---
 st.sidebar.header("⚙️ 策略參數")
 strategy_option = st.sidebar.radio("選擇選股策略：", ("均線多頭回測", "均線糾結偵測"))
-indicator_choice = st.sidebar.selectbox("查看確認指標：", ["RSI (強弱指標)", "MACD (趨勢指標)"])
+indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示", "RSI (強弱指標)", "MACD (趨勢指標)"])
 
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
@@ -65,14 +65,12 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
         batch = all_stocks[i:i + batch_size]
         try:
             data = yf.download(batch, period="150d", group_by='ticker', progress=False)
-            
             for ticker in batch:
                 try:
                     df = data[ticker] if len(batch) > 1 else data
                     df = df.dropna(subset=['Close'])
                     if len(df) < 60: continue
                     
-                    # 成交量過濾
                     avg_vol = df['Volume'].tail(5).mean() / 1000
                     if avg_vol < min_volume: continue
 
@@ -114,65 +112,76 @@ if st.button(f"🔍 開始全市場掃描", use_container_width=True):
                             "類股": stock_data["industry"], "收盤": round(close, 2),
                             "RSI": round(rsi, 1), "MACD柱": round(hist_val, 2)
                         })
-                except:
-                    continue
-        except:
-            continue
+                except: continue
+        except: continue
         progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
     
     st.session_state['scan_results'] = pd.DataFrame(results)
+    st.session_state['selected_index'] = 0  # 重設切換索引
 
-# --- 5. 顯示與繪圖 ---
+# --- 5. 顯示與切換邏輯 ---
 if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
+    df_filtered = df_filtered.reset_index(drop=True)
 
-    st.info("📱 點擊下方個股查看趨勢圖")
-    event = st.dataframe(df_filtered, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row")
+    # 左右切換按鈕區域
+    st.write("---")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    if 'selected_index' not in st.session_state:
+        st.session_state['selected_index'] = 0
 
-    if event.selection.rows:
-        row = df_filtered.iloc[event.selection.rows[0]]
-        ticker_id = row['ID']
+    with col1:
+        if st.button("⬅️ 上一支", use_container_width=True):
+            st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
+    with col2:
+        st.write(f"<center><b>{st.session_state['selected_index'] + 1} / {len(df_filtered)}</b></center>", unsafe_allow_html=True)
+    with col3:
+        if st.button("下一支 ➡️", use_container_width=True):
+            st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
+
+    # 繪圖邏輯
+    row = df_filtered.iloc[st.session_state['selected_index']]
+    ticker_id = row['ID']
+    
+    with st.spinner(f'載入 {row["名稱"]} ({ticker_id})...'):
+        df_plot = yf.download(ticker_id, period="8mo", progress=False)
+        if isinstance(df_plot.columns, pd.MultiIndex): df_plot.columns = df_plot.columns.get_level_values(0)
         
-        with st.spinner('載入圖表中...'):
-            df_plot = yf.download(ticker_id, period="8mo", progress=False)
-            if isinstance(df_plot.columns, pd.MultiIndex): df_plot.columns = df_plot.columns.get_level_values(0)
-            
-            df_plot['30MA'] = df_plot['Close'].rolling(30).mean()
-            df_plot['45MA'] = df_plot['Close'].rolling(45).mean()
-            df_plot['60MA'] = df_plot['Close'].rolling(60).mean()
-            
-            if indicator_choice == "RSI (強弱指標)":
-                delta = df_plot['Close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                df_plot['Indicator'] = 100 - (100 / (1 + gain/loss))
-            else:
-                exp1 = df_plot['Close'].ewm(span=12, adjust=False).mean()
-                exp2 = df_plot['Close'].ewm(span=26, adjust=False).mean()
-                df_plot['MACD'] = exp1 - exp2
-                df_plot['Signal'] = df_plot['MACD'].ewm(span=9, adjust=False).mean()
-                df_plot['Indicator'] = df_plot['MACD'] - df_plot['Signal']
-
-            df_plot = df_plot.tail(60)
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.2, 0.3])
-            fig.add_trace(go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'], name="K線"), row=1, col=1)
-            for ma, color in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
-                fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot[ma], line=dict(color=color, width=1.2), name=ma), row=1, col=1)
-            
-            v_colors = ['red' if c >= o else 'green' for c, o in zip(df_plot['Close'], df_plot['Open'])]
-            fig.add_trace(go.Bar(x=df_plot.index, y=df_plot['Volume'], marker_color=v_colors, name="成交量"), row=2, col=1)
-            
-            if indicator_choice == "RSI (強弱指標)":
-                fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Indicator'], line=dict(color='purple'), name="RSI(14)"), row=3, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
-                fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
-            else:
-                h_colors = ['red' if v >= 0 else 'green' for v in df_plot['Indicator']]
-                fig.add_trace(go.Bar(x=df_plot.index, y=df_plot['Indicator'], marker_color=h_colors, name="MACD柱狀體"), row=3, col=1)
-
-            fig.update_layout(title=f"{row['名稱']} ({ticker_id})", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='pan', margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-elif 'scan_results' in st.session_state:
-    st.warning("查無標的，請試著調低成交量或放寬指標過濾。")
+        df_plot['30MA'] = df_plot['Close'].rolling(30).mean()
+        df_plot['45MA'] = df_plot['Close'].rolling(45).mean()
+        df_plot['60MA'] = df_plot['Close'].rolling(60).mean()
+        
+        # 設定副圖數量
+        num_rows = 3 if indicator_choice != "都不顯示" else 2
+        row_heights = [0.5, 0.2, 0.3] if num_rows == 3 else [0.7, 0.3]
+        
+        fig = make_subplots(rows=num_rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=row_heights)
+        
+        # Row 1: K線
+        fig.add_trace(go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'], name="K線"), row=1, col=1)
+        for ma, color in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
+            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot[ma], line=dict(color=color, width=1.2), name=ma), row=1, col=1)
+        
+        # Row 2: 成交量
+        v_colors = ['red' if c >= o else 'green' for c, o in zip(df_plot['Close'], df_plot['Open'])]
+        fig.add_trace(go.Bar(x=df_plot.index, y=df_plot['Volume'], marker_color=v_colors, name="成交量"), row=2, col=1)
+        
+        # Row 3: 條件指標
+        if indicator_choice == "RSI (強弱指標)":
+            delta = df_plot['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rsi_series = 100 - (100 / (1 + gain/loss))
+            fig.add_trace(go.Scatter(x=df_plot.index, y=rsi_series, line=dict(color='purple'), name="RSI(14)"), row=3, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
+        elif indicator_choice == "MACD (趨勢指標)":
+            exp1 = df_plot['Close'].ewm(span=12, adjust=False).mean()
+            exp2 = df_plot['Close'].ewm(span=26, adjust=False).mean()
+            macd_s = exp1 - exp2
+            signal_s = macd_s.ewm(span=9, adjust=False).mean()
+            hist_s = macd_s - signal_s
+            h_colors = ['red' if v >= 0 else 'green' for v in
