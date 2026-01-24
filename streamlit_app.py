@@ -15,6 +15,7 @@ if 'warnings' not in sys.modules:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="台股智慧選股", layout="centered")
+st.title("📈 台股多策略選股儀表板")
 
 # --- 2. 資料抓取 ---
 @st.cache_data(ttl=86400)
