@@ -15,7 +15,14 @@ if 'warnings' not in sys.modules:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="台股智慧選股", layout="centered")
-st.title("📈 台股多策略選股儀表板")
+
+# 初始化 Session State
+if 'selected_index' not in st.session_state:
+    st.session_state['selected_index'] = 0
+if 'scan_results' not in st.session_state:
+    st.session_state['scan_results'] = pd.DataFrame()
+if 'is_scanning' not in st.session_state:
+    st.session_state['is_scanning'] = False
 
 # --- 2. 資料抓取 ---
 @st.cache_data(ttl=86400)
@@ -53,57 +60,65 @@ indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示"
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
-# 初始化狀態
-if 'selected_index' not in st.session_state:
-    st.session_state['selected_index'] = 0
-if 'scan_results' not in st.session_state:
-    st.session_state['scan_results'] = pd.DataFrame()
-
 # --- 4. 掃描邏輯 ---
-if st.button(f"🔍 開始全市場掃描", use_container_width=True):
-    all_stocks, info_map = get_stock_info_map()
-    results = []
-    progress_bar = st.progress(0)
-    batch_size = 100
-    for i in range(0, len(all_stocks), batch_size):
-        batch = all_stocks[i:i + batch_size]
-        try:
-            data = yf.download(batch, period="150d", group_by='ticker', progress=False)
-            for ticker in batch:
-                try:
-                    df = data[ticker] if len(batch) > 1 else data
-                    df = df.dropna(subset=['Close'])
-                    if len(df) < 60: continue
-                    if (df['Volume'].tail(5).mean() / 1000) < min_volume: continue
+# 這裡使用 disabled 參數來鎖定按鈕
+btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中，請稍候..."
+if st.button(btn_label, use_container_width=True, disabled=st.session_state['is_scanning']):
+    st.session_state['is_scanning'] = True
+    st.rerun() # 立即觸發重新渲染以鎖定按鈕
 
-                    close = float(df['Close'].iloc[-1])
-                    m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
-                    
-                    delta = df['Close'].diff()
-                    rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
-                    exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
-                    hist_v = (exp1 - exp2 - (exp1 - exp2).ewm(span=9).mean()).iloc[-1]
-                    
-                    keep = False
-                    if strategy_option == "均線多頭回測":
-                        if m30 > m45 > m60 and close > m30 and (close - m30) / m30 <= 0.02: keep = True
-                    elif strategy_option == "均線糾結偵測":
-                        ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
-                        if ma_spread <= 0.015 and abs(close - m30) / m30 <= 0.02: keep = True
-                    
-                    if keep and use_filter:
-                        if indicator_choice == "RSI (強弱指標)" and rsi < 50: keep = False
-                        if indicator_choice == "MACD (趨勢指標)" and hist_v < 0: keep = False
+# 執行掃描 (當 is_scanning 為 True 時)
+if st.session_state['is_scanning']:
+    try:
+        all_stocks, info_map = get_stock_info_map()
+        results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        batch_size = 100
+        for i in range(0, len(all_stocks), batch_size):
+            batch = all_stocks[i:i + batch_size]
+            status_text.text(f"正在掃描第 {i} 至 {min(i+batch_size, len(all_stocks))} 支股票...")
+            try:
+                data = yf.download(batch, period="150d", group_by='ticker', progress=False)
+                for ticker in batch:
+                    try:
+                        df = data[ticker] if len(batch) > 1 else data
+                        df = df.dropna(subset=['Close'])
+                        if len(df) < 60: continue
+                        if (df['Volume'].tail(5).mean() / 1000) < min_volume: continue
 
-                    if keep:
-                        stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
-                        results.append({"ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], "類股": stock_data["industry"], "收盤": round(close, 2)})
-                except: continue
-        except: continue
-        progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
-    st.session_state['scan_results'] = pd.DataFrame(results)
-    st.session_state['selected_index'] = 0
-    st.rerun()
+                        close = float(df['Close'].iloc[-1])
+                        m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
+                        
+                        delta = df['Close'].diff()
+                        rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
+                        exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
+                        hist_v = (exp1 - exp2 - (exp1 - exp2).ewm(span=9).mean()).iloc[-1]
+                        
+                        keep = False
+                        if strategy_option == "均線多頭回測":
+                            if m30 > m45 > m60 and close > m30 and (close - m30) / m30 <= 0.02: keep = True
+                        elif strategy_option == "均線糾結偵測":
+                            ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
+                            if ma_spread <= 0.015 and abs(close - m30) / m30 <= 0.02: keep = True
+                        
+                        if keep and use_filter:
+                            if indicator_choice == "RSI (強弱指標)" and rsi < 50: keep = False
+                            if indicator_choice == "MACD (趨勢指標)" and hist_v < 0: keep = False
+
+                        if keep:
+                            stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
+                            results.append({"ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], "類股": stock_data["industry"], "收盤": round(close, 2)})
+                    except: continue
+            except: continue
+            progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
+        
+        st.session_state['scan_results'] = pd.DataFrame(results)
+        st.session_state['selected_index'] = 0
+    finally:
+        st.session_state['is_scanning'] = False # 掃描完畢或報錯後解鎖
+        st.rerun()
 
 # --- 5. 顯示與同步 ---
 if not st.session_state['scan_results'].empty:
@@ -116,7 +131,6 @@ if not st.session_state['scan_results'].empty:
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
-    # 核心修正：移除 selection 參數以避開 TypeError，改用 key 並監測點擊
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
@@ -126,7 +140,6 @@ if not st.session_state['scan_results'].empty:
         key="stock_table"
     )
 
-    # 同步點擊：如果使用者點了清單，則更新全局索引
     if event.selection and event.selection.rows:
         new_pick = event.selection.rows[0]
         if new_pick != st.session_state['selected_index']:
