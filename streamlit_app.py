@@ -61,13 +61,11 @@ min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
 # --- 4. 掃描邏輯 ---
-# 這裡使用 disabled 參數來鎖定按鈕
 btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中，請稍候..."
 if st.button(btn_label, use_container_width=True, disabled=st.session_state['is_scanning']):
     st.session_state['is_scanning'] = True
-    st.rerun() # 立即觸發重新渲染以鎖定按鈕
+    st.rerun()
 
-# 執行掃描 (當 is_scanning 為 True 時)
 if st.session_state['is_scanning']:
     try:
         all_stocks, info_map = get_stock_info_map()
@@ -91,6 +89,9 @@ if st.session_state['is_scanning']:
                         close = float(df['Close'].iloc[-1])
                         m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
                         
+                        # 計算乖離率 (股價相對於 30MA 的百分比距離)
+                        bias = (close - m30) / m30 * 100
+                        
                         delta = df['Close'].diff()
                         rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
                         exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
@@ -98,10 +99,12 @@ if st.session_state['is_scanning']:
                         
                         keep = False
                         if strategy_option == "均線多頭回測":
-                            if m30 > m45 > m60 and close > m30 and (close - m30) / m30 <= 0.02: keep = True
+                            if m30 > m45 > m60 and close > m30 and (bias <= 2.0): # 距離在 2% 以內
+                                keep = True
                         elif strategy_option == "均線糾結偵測":
-                            ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
-                            if ma_spread <= 0.015 and abs(close - m30) / m30 <= 0.02: keep = True
+                            ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60) * 100
+                            if ma_spread <= 1.5 and abs(bias) <= 2.0:
+                                keep = True
                         
                         if keep and use_filter:
                             if indicator_choice == "RSI (強弱指標)" and rsi < 50: keep = False
@@ -109,7 +112,14 @@ if st.session_state['is_scanning']:
 
                         if keep:
                             stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
-                            results.append({"ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], "類股": stock_data["industry"], "收盤": round(close, 2)})
+                            results.append({
+                                "ID": ticker, 
+                                "代碼": ticker.split('.')[0], 
+                                "名稱": stock_data["name"], 
+                                "類股": stock_data["industry"], 
+                                "收盤": round(close, 2),
+                                "乖離%": round(bias, 2)
+                            })
                     except: continue
             except: continue
             progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
@@ -117,7 +127,7 @@ if st.session_state['is_scanning']:
         st.session_state['scan_results'] = pd.DataFrame(results)
         st.session_state['selected_index'] = 0
     finally:
-        st.session_state['is_scanning'] = False # 掃描完畢或報錯後解鎖
+        st.session_state['is_scanning'] = False
         st.rerun()
 
 # --- 5. 顯示與同步 ---
@@ -125,19 +135,24 @@ if not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
-    df_filtered = df_filtered.reset_index(drop=True)
+    # 預設按乖離率排序，讓最接近 30MA 的在最上面
+    df_filtered = df_filtered.sort_values(by="乖離%", ascending=True).reset_index(drop=True)
 
     if st.session_state['selected_index'] >= len(df_filtered):
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
+    # 設定表格欄位，顯示乖離%
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
         use_container_width=True, 
         on_select="rerun", 
         selection_mode="single-row",
-        key="stock_table"
+        key="stock_table",
+        column_config={
+            "乖離%": st.column_config.NumberColumn("乖離%", format="%.2f%%")
+        }
     )
 
     if event.selection and event.selection.rows:
@@ -189,8 +204,8 @@ if not st.session_state['scan_results'].empty:
             fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['red' if v>=0 else 'green' for v in h_s], name="MACD柱"), row=3, col=1)
 
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
+        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id}) - 乖離: {row['乖離%']}%</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
 
 elif not st.session_state['scan_results'].empty:
-    st.warning("查無標的。")
+    st.warning("查與此策略條件相符的標的。")
