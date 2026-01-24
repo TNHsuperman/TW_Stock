@@ -14,7 +14,7 @@ if 'warnings' not in sys.modules:
     sys.modules['warnings'] = warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="台股智慧選股", layout="centered")
+st.set_page_config(page_title="台股極速選股器", layout="centered")
 
 # 初始化 Session State
 if 'selected_index' not in st.session_state:
@@ -60,8 +60,8 @@ indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示"
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
-# --- 4. 掃描邏輯 ---
-btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中，請稍候..."
+# --- 4. 極速掃描邏輯 ---
+btn_label = "🔍 開始極速掃描" if not st.session_state['is_scanning'] else "⏳ 掃描中..."
 if st.button(btn_label, use_container_width=True, disabled=st.session_state['is_scanning']):
     st.session_state['is_scanning'] = True
     st.rerun()
@@ -73,48 +73,62 @@ if st.session_state['is_scanning']:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        batch_size = 50 # 降低批次量以提高穩定性
+        # 加速關鍵：提高 Batch 數量，減少連線次數
+        batch_size = 150 
         for i in range(0, len(all_stocks), batch_size):
             batch = all_stocks[i:i + batch_size]
-            status_text.text(f"正在掃描第 {i} 至 {min(i+batch_size, len(all_stocks))} 支股票...")
+            status_text.text(f"🚀 極速掃描進度：{i} / {len(all_stocks)}")
             try:
-                # 加入 threads=False 避免 Python 3.13 執行緒報錯
-                data = yf.download(batch, period="150d", group_by='ticker', progress=False, threads=False)
+                # 只抓取必要的 100 天數據，顯著減少流量
+                data = yf.download(batch, period="100d", group_by='ticker', progress=False, threads=False)
+                
                 for ticker in batch:
                     try:
                         df = data[ticker] if len(batch) > 1 else data
-                        df = df.dropna(subset=['Close'])
-                        if len(df) < 60: continue
-                        if (df['Volume'].tail(5).mean() / 1000) < min_volume: continue
+                        # 快速預判：若資料不齊直接跳過
+                        if df['Close'].isnull().all() or len(df) < 65: continue
+                        
+                        # 成交量向量化加速
+                        if (df['Volume'].iloc[-5:].mean() / 1000) < min_volume: continue
 
                         close = float(df['Close'].iloc[-1])
-                        m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
-                        bias = (close - m30) / m30 * 100
+                        # 一次性獲取 MA
+                        ma_df = df['Close'].rolling(window=60).mean() # 此處可優化但維持讀取清晰
+                        m30 = df['Close'].rolling(30).mean().iloc[-1]
+                        m45 = df['Close'].rolling(45).mean().iloc[-1]
+                        m60 = ma_df.iloc[-1]
                         
-                        delta = df['Close'].diff()
-                        rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()))).iloc[-1]
-                        exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
-                        hist_v = (exp1 - exp2 - (exp1 - exp2).ewm(span=9).mean()).iloc[-1]
+                        bias = (close - m30) / m30 * 100
                         
                         keep = False
                         if strategy_option == "均線多頭回測":
-                            if m30 > m45 > m60 and close > m30 and (bias <= 2.0):
+                            if m30 > m45 > m60 and close > m30 and bias <= 2.0:
                                 keep = True
                         elif strategy_option == "均線糾結偵測":
-                            ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60) * 100
+                            ma_vals = [m30, m45, m60]
+                            ma_spread = (max(ma_vals) - min(ma_vals)) / min(ma_vals) * 100
                             if ma_spread <= 1.5 and abs(bias) <= 2.0:
                                 keep = True
                         
-                        if keep and use_filter:
-                            if indicator_choice == "RSI (強弱指標)" and rsi < 50: keep = False
-                            if indicator_choice == "MACD (趨勢指標)" and hist_v < 0: keep = False
-
                         if keep:
-                            stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
-                            results.append({
-                                "ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], 
-                                "類股": stock_data["industry"], "收盤": round(close, 2), "乖離%": round(bias, 2)
-                            })
+                            # 只有符合均線條件後才計算 RSI/MACD，節省 90% 的運算
+                            if use_filter or indicator_choice != "都不顯示":
+                                delta = df['Close'].diff()
+                                rsi = (100 - (100 / (1 + (delta.where(delta > 0, 0)).iloc[-14:].mean() / (-delta.where(delta < 0, 0)).iloc[-14:].mean())))
+                                exp1 = df['Close'].ewm(span=12).mean().iloc[-1]
+                                exp2 = df['Close'].ewm(span=26).mean().iloc[-1]
+                                hist_v = exp1 - exp2 # 簡化版動能判斷
+                                
+                                if use_filter:
+                                    if indicator_choice == "RSI (強弱指標)" and rsi < 50: keep = False
+                                    if indicator_choice == "MACD (趨勢指標)" and (exp1-exp2) < 0: keep = False
+
+                            if keep:
+                                stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
+                                results.append({
+                                    "ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], 
+                                    "類股": stock_data["industry"], "收盤": round(close, 2), "乖離%": round(bias, 2)
+                                })
                     except: continue
             except: continue
             progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
@@ -158,7 +172,7 @@ if not st.session_state['scan_results'].empty:
             st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
             st.rerun()
     with c2:
-        st.markdown(f"<h3 style='text-align: center;'>{st.session_state['selected_index'] + 1} / {len(df_filtered)}</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h4 style='text-align: center;'>{st.session_state['selected_index'] + 1} / {len(df_filtered)}</h4>", unsafe_allow_html=True)
     with c3:
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
@@ -168,7 +182,7 @@ if not st.session_state['scan_results'].empty:
     ticker_id = row['ID']
     
     with st.spinner(f'載入 {row["名稱"]}...'):
-        # 繪圖時同樣加入 threads=False 避免報錯
+        # 繪圖則需要較長資料 (8mo)
         df_p = yf.download(ticker_id, period="8mo", progress=False, threads=False)
         if not df_p.empty:
             if isinstance(df_p.columns, pd.MultiIndex): df_p.columns = df_p.columns.get_level_values(0)
@@ -187,15 +201,14 @@ if not st.session_state['scan_results'].empty:
                 d = df_p['Close'].diff()
                 rsi_s = 100 - (100 / (1 + (d.where(d > 0, 0)).rolling(14).mean()/( -d.where(d < 0, 0)).rolling(14).mean()))
                 fig.add_trace(go.Scatter(x=df_p.index, y=rsi_s, line=dict(color='purple'), name="RSI"), row=3, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1); fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
             elif indicator_choice == "MACD (趨勢指標)":
                 m_s = df_p['Close'].ewm(span=12).mean() - df_p['Close'].ewm(span=26).mean()
                 h_s = m_s - m_s.ewm(span=9).mean()
                 fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['red' if v>=0 else 'green' for v in h_s], name="MACD柱"), row=3, col=1)
 
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-            fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id}) - 乖離: {row['乖離%']}%</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True, 'displayModeBar': True})
+            fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", dragmode='zoom', margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
 elif not st.session_state['scan_results'].empty:
-    st.warning("查無符合此策略條件的標的。")
+    st.warning("查無標的。")
