@@ -52,7 +52,7 @@ indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示"
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
-# 初始化 Session State
+# 初始化狀態
 if 'selected_index' not in st.session_state:
     st.session_state['selected_index'] = 0
 if 'scan_results' not in st.session_state:
@@ -115,29 +115,26 @@ if not st.session_state['scan_results'].empty:
         st.session_state['selected_index'] = 0
 
     st.write("📊 篩選清單")
-    
-    # 核心修正：利用 selection 參數搭配 session_state，實現雙向聯動且不報錯
+    # 核心修正：移除 selection 參數以避開 TypeError，改用 key 並監測點擊
     event = st.dataframe(
         df_filtered, 
         hide_index=True, 
         use_container_width=True, 
         on_select="rerun", 
         selection_mode="single-row",
-        selection=[st.session_state['selected_index']],
         key="stock_table"
     )
 
-    # 如果點擊清單中的列，更新索引
+    # 同步點擊：如果使用者點了清單，則更新全局索引
     if event.selection and event.selection.rows:
-        clicked_index = event.selection.rows[0]
-        if clicked_index != st.session_state['selected_index']:
-            st.session_state['selected_index'] = clicked_index
+        new_pick = event.selection.rows[0]
+        if new_pick != st.session_state['selected_index']:
+            st.session_state['selected_index'] = new_pick
             st.rerun()
 
     # 左右切換按鈕
     st.write("---")
     c1, c2, c3 = st.columns([1, 2, 1])
-    
     with c1:
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
