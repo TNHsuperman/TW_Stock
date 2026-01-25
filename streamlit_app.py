@@ -74,7 +74,7 @@ if st.session_state['is_scanning']:
     batch_size = 100
     for i in range(0, len(all_stocks), batch_size):
         batch = all_stocks[i:i + batch_size]
-        status_text.text(f"掃描進度: {i} / {len(all_stocks)}")
+        status_text.text(f"正在掃描第 {i} 至 {min(i+batch_size, len(all_stocks))} 支股票...")
         try:
             data = yf.download(batch, period="150d", group_by='ticker', progress=False)
             for ticker in batch:
@@ -124,11 +124,13 @@ if not st.session_state['scan_results'].empty:
 
     if len(df_filtered) > 0:
         st.write(f"📊 符合條件標的：{len(df_filtered)} 支")
+        # 顯示清單表格
         event = st.dataframe(df_filtered, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row", key="stock_table")
         
         if event.selection and event.selection.rows:
             st.session_state['selected_index'] = event.selection.rows[0]
 
+        # 導覽按鈕
         st.write("---")
         c1, c2, c3 = st.columns([1, 2, 1])
         with c1:
@@ -142,63 +144,62 @@ if not st.session_state['scan_results'].empty:
                 st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
                 st.rerun()
 
-        # 抓取個股繪圖資料
+        # 獲取選中資料
         idx = min(st.session_state['selected_index'], len(df_filtered)-1)
         row = df_filtered.iloc[idx]
         
-        with st.spinner(f'載入中... {row["名稱"]}'):
+        with st.spinner(f'載入中... {row["名稱"]} ({row["ID"]})'):
             df_p = yf.download(row['ID'], period="8mo", progress=False)
             if isinstance(df_p.columns, pd.MultiIndex): df_p.columns = df_p.columns.get_level_values(0)
             
-            # --- 重要：移除任何含有空值的行 ---
-            df_p = df_p.dropna(subset=['Close', 'Open', 'High', 'Low'])
+            # 確保資料沒有空值並重設 index 將日期變為字串以消除間隔
+            df_p = df_p.dropna(subset=['Close'])
+            # 重要：將 index 轉換為字串格式，Plotly 就不會去補週末空白
+            df_p['Date_Str'] = df_p.index.strftime('%Y-%m-%d')
             
+            # 計算指標
             df_p['30MA'] = df_p['Close'].rolling(30).mean()
             df_p['45MA'] = df_p['Close'].rolling(45).mean()
             df_p['60MA'] = df_p['Close'].rolling(60).mean()
             
-            # 買點標記
+            # 買點邏輯
             df_p['Is_Signal'] = (df_p['Close'] > df_p['30MA']) & (((df_p['Close'] - df_p['30MA']) / df_p['30MA']) <= 0.025)
+            if strategy_option == "均線多頭回測":
+                df_p['Is_Signal'] &= (df_p['30MA'] > df_p['45MA']) & (df_p['45MA'] > df_p['60MA'])
+            
             df_p['Buy_Marker'] = df_p.apply(lambda r: r['Low'] * 0.985 if r['Is_Signal'] else None, axis=1)
 
             # 繪製圖表
             n_rows = 3 if indicator_choice != "都不顯示" else 2
             fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.15, 0.25] if n_rows==3 else [0.75, 0.25])
             
-            # K線圖
-            fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
+            # K線圖 (使用 Date_Str 作為 X 軸)
+            fig.add_trace(go.Candlestick(x=df_p['Date_Str'], open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
             
             # 均線
             for ma, color in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
-                fig.add_trace(go.Scatter(x=df_p.index, y=df_p[ma], line=dict(color=color, width=1.5), name=ma), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_p['Date_Str'], y=df_p[ma], line=dict(color=color, width=1.5), name=ma), row=1, col=1)
 
-            # 買點標記
-            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Buy_Marker'], mode='markers',
+            # 精確買點標記
+            fig.add_trace(go.Scatter(x=df_p['Date_Str'], y=df_p['Buy_Marker'], mode='markers',
                 marker=dict(symbol='triangle-up', size=15, color='#9400D3', line=dict(width=1, color='white')), name='買點'), row=1, col=1)
 
-            # 成交量 (移除空白)
+            # 成交量
             v_clrs = ['#ef5350' if c >= o else '#26a69a' for c, o in zip(df_p['Close'], df_p['Open'])]
-            fig.add_trace(go.Bar(x=df_p.index, y=df_p['Volume'], marker_color=v_clrs, name="成交量"), row=2, col=1)
+            fig.add_trace(go.Bar(x=df_p['Date_Str'], y=df_p['Volume'], marker_color=v_clrs, name="成交量"), row=2, col=1)
 
-            # 指標
+            # 技術指標
             if indicator_choice == "RSI (強弱指標)":
                 d = df_p['Close'].diff()
                 rsi = 100 - (100 / (1 + (d.where(d > 0, 0)).rolling(14).mean()/( ( -d.where(d < 0, 0)).rolling(14).mean() + 1e-9)))
-                fig.add_trace(go.Scatter(x=df_p.index, y=rsi, line=dict(color='purple', width=1.2), name="RSI"), row=3, col=1)
+                fig.add_trace(go.Scatter(x=df_p['Date_Str'], y=rsi, line=dict(color='purple', width=1.2), name="RSI"), row=3, col=1)
             elif indicator_choice == "MACD (趨勢指標)":
                 m_s = df_p['Close'].ewm(span=12).mean() - df_p['Close'].ewm(span=26).mean()
                 h_s = m_s - m_s.ewm(span=9).mean()
-                fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['#ef5350' if v>=0 else '#26a69a' for v in h_s], name="MACD柱"), row=3, col=1)
+                fig.add_trace(go.Bar(x=df_p['Date_Str'], y=h_s, marker_color=['#ef5350' if v>=0 else '#26a69a' for v in h_s], name="MACD柱"), row=3, col=1)
 
-            # --- 核心：移除圖表上的非交易日空白 (週末/國定假日) ---
-            fig.update_xaxes(
-                rangebreaks=[
-                    dict(bounds=["sat", "mon"]), # 移除週末
-                    dict(values=["2025-01-27", "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31"]) # 可手動加入農曆年等國定假日
-                ],
-                showgrid=True, gridcolor='rgba(200,200,200,0.2)'
-            )
-            
+            # 佈局美化與 X 軸類別設定 (關鍵：type='category')
+            fig.update_xaxes(type='category', showgrid=True, gridcolor='rgba(200,200,200,0.2)', tickangle=-45, nbinsx=20)
             fig.update_layout(
                 title=f"<b>{row['名稱']} ({row['ID']}) | 乖離率: {row['乖離(%)']}%</b>",
                 xaxis_rangeslider_visible=False, height=750, template="plotly_white",
@@ -208,4 +209,4 @@ if not st.session_state['scan_results'].empty:
     else:
         st.warning("查無符合條件標的。")
 elif not st.session_state['is_scanning']:
-    st.info("💡 提示：點擊上方按鈕開始全市場掃描。")
+    st.info("💡 歡迎！請點擊上方按鈕進行全市場掃描。")
