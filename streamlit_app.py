@@ -14,7 +14,7 @@ if 'warnings' not in sys.modules:
     sys.modules['warnings'] = warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="台股智慧選股 - 強勢突破版", layout="centered")
+st.set_page_config(page_title="台股智慧選股 - 突破修正版", layout="wide")
 
 # 初始化 Session State
 if 'selected_index' not in st.session_state:
@@ -24,7 +24,20 @@ if 'scan_results' not in st.session_state:
 if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 
-# --- 2. 資料抓取 ---
+# --- 2. 工具函數：處理 yfinance 的索引問題 ---
+def fix_yfinance_format(df, ticker=None):
+    """處理 yfinance MultiIndex 問題，確保返回單一 Ticker 的乾淨 DataFrame"""
+    temp_df = df.copy()
+    # 如果是多重索引 (下載多支股票時常見)
+    if isinstance(temp_df.columns, pd.MultiIndex):
+        if ticker and ticker in temp_df.columns.get_level_values(1):
+            # 提取特定股票的資料
+            temp_df = temp_df.xs(ticker, axis=1, level=1)
+        else:
+            # 只有一級的情況下取第一級
+            temp_df.columns = temp_df.columns.get_level_values(0)
+    return temp_df
+
 @st.cache_data(ttl=86400)
 def get_stock_info_map():
     stock_info_map = {}
@@ -41,7 +54,7 @@ def get_stock_info_map():
             df = df_list[0]
             df.columns = df.iloc[0]
             df = df.iloc[1:]
-            for index, row in df.iterrows():
+            for _, row in df.iterrows():
                 val = row['有價證券代號及名稱']
                 industry = row['產業別']
                 if val and '　' in str(val):
@@ -64,7 +77,7 @@ min_volume = st.sidebar.slider("日均成交量門檻 (張)", 0, 2000, 500, step
 use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD 柱狀體 > 0)")
 
 # --- 4. 掃描邏輯 ---
-btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中，請稍候..."
+btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中..."
 if st.button(btn_label, use_container_width=True, disabled=st.session_state['is_scanning']):
     st.session_state['is_scanning'] = True
     st.rerun()
@@ -76,21 +89,25 @@ if st.session_state['is_scanning']:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        batch_size = 100
+        batch_size = 50 # 稍微調小 batch 增加穩定性
         for i in range(0, len(all_stocks), batch_size):
             batch = all_stocks[i:i + batch_size]
             status_text.text(f"正在掃描第 {i} 至 {min(i+batch_size, len(all_stocks))} 支股票...")
             try:
-                data = yf.download(batch, period="150d", group_by='ticker', progress=False)
+                # 使用 auto_adjust=True 避免一些格式衝突
+                data = yf.download(batch, period="150d", group_by='ticker', progress=False, auto_adjust=True)
+                
                 for ticker in batch:
                     try:
-                        df = data[ticker] if len(batch) > 1 else data
+                        # 核心修正點：確保 df 是乾淨的 Open, High, Low, Close
+                        df = fix_yfinance_format(data, ticker)
                         df = df.dropna(subset=['Close'])
+                        
                         if len(df) < 60: continue
                         
-                        # 基礎資料計算
-                        avg_vol_5d = df['Volume'].tail(6).iloc[:-1].mean() / 1000 # 前5日均量(張)
-                        current_vol = df['Volume'].iloc[-1] / 1000 # 今日成交量(張)
+                        # 交易量計算 (yfinance 預設為股，除以 1000 為張)
+                        current_vol = df['Volume'].iloc[-1] / 1000
+                        avg_vol_5d = df['Volume'].iloc[-6:-1].mean() / 1000 
                         
                         if (df['Volume'].tail(5).mean() / 1000) < min_volume: continue
 
@@ -106,7 +123,7 @@ if st.session_state['is_scanning']:
                         exp1, exp2 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
                         hist_v = (exp1 - exp2 - (exp1 - exp2).ewm(span=9).mean()).iloc[-1]
                         
-                        # 策略判斷邏輯
+                        # 策略判斷
                         keep = False
                         ma_list = [m30, m45, m60]
                         ma_spread = (max(ma_list) - min(ma_list)) / min(ma_list)
@@ -119,7 +136,6 @@ if st.session_state['is_scanning']:
                         elif strategy_option == "成交量倍增 (量能爆發)":
                             if vol_ratio >= 2.0 and close > open_p: keep = True
                         elif strategy_option == "強勢突破 (糾結+量增)":
-                            # 條件：均線糾結 < 2% 且 成交量翻倍 且 股價站上均線
                             if ma_spread <= 0.02 and vol_ratio >= 2.0 and close > max(ma_list): keep = True
                         
                         if keep and use_filter:
@@ -129,12 +145,9 @@ if st.session_state['is_scanning']:
                         if keep:
                             stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
                             results.append({
-                                "ID": ticker, 
-                                "代碼": ticker.split('.')[0], 
-                                "名稱": stock_data["name"], 
-                                "類股": stock_data["industry"], 
-                                "收盤": round(close, 2),
-                                "量增倍數": round(vol_ratio, 1)
+                                "ID": ticker, "代碼": ticker.split('.')[0], 
+                                "名稱": stock_data["name"], "類股": stock_data["industry"], 
+                                "收盤": round(close, 2), "量增倍數": round(vol_ratio, 1)
                             })
                     except: continue
             except: continue
@@ -146,74 +159,63 @@ if st.session_state['is_scanning']:
         st.session_state['is_scanning'] = False
         st.rerun()
 
-# --- 5. 顯示與同步 ---
+# --- 5. 顯示結果 ---
 if not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
     df_filtered = df_filtered.reset_index(drop=True)
 
-    if st.session_state['selected_index'] >= len(df_filtered):
-        st.session_state['selected_index'] = 0
-
     st.write(f"📊 篩選清單 (共 {len(df_filtered)} 檔)")
     event = st.dataframe(df_filtered, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row", key="stock_table")
 
     if event.selection and event.selection.rows:
-        new_pick = event.selection.rows[0]
-        if new_pick != st.session_state['selected_index']:
-            st.session_state['selected_index'] = new_pick
-            st.rerun()
+        st.session_state['selected_index'] = event.selection.rows[0]
 
-    st.write("---")
+    # 切換按鈕
     c1, c2, c3 = st.columns([1, 2, 1])
     with c1:
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
-            st.rerun()
     with c2:
         st.markdown(f"<h3 style='text-align: center;'>{st.session_state['selected_index'] + 1} / {len(df_filtered)}</h3>", unsafe_allow_html=True)
     with c3:
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
-            st.rerun()
 
-    # 繪圖
+    # 繪製圖表
     row = df_filtered.iloc[st.session_state['selected_index']]
     ticker_id = row['ID']
     
-    with st.spinner(f'載入 {row["名稱"]}...'):
-        df_p = yf.download(ticker_id, period="8mo", progress=False)
-        if isinstance(df_p.columns, pd.MultiIndex): df_p.columns = df_p.columns.get_level_values(0)
+    with st.spinner(f'載入 {row["名稱"]} 圖表中...'):
+        df_p = yf.download(ticker_id, period="8mo", progress=False, auto_adjust=True)
+        df_p = fix_yfinance_format(df_p) # 繪圖前同樣進行格式修正
+        
         df_p['30MA'], df_p['45MA'], df_p['60MA'] = df_p['Close'].rolling(30).mean(), df_p['Close'].rolling(45).mean(), df_p['Close'].rolling(60).mean()
         df_p['V_MA5'] = df_p['Volume'].rolling(5).mean()
         
         n_rows = 3 if indicator_choice != "都不顯示" else 2
         fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.2, 0.3] if n_rows==3 else [0.7, 0.3])
         
-        # 主圖：K線與均線
         fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
         for ma, clr in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p[ma], line=dict(color=clr, width=1.2), name=ma), row=1, col=1)
         
-        # 量圖：成交量與5日均量
         v_clrs = ['red' if c >= o else 'green' for c, o in zip(df_p['Close'], df_p['Open'])]
         fig.add_trace(go.Bar(x=df_p.index, y=df_p['Volume'], marker_color=v_clrs, name="成交量"), row=2, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['V_MA5'], line=dict(color='gray', width=1), name="5日均量"), row=2, col=1)
         
-        # 技術指標
         if indicator_choice == "RSI (強弱指標)":
             d = df_p['Close'].diff()
             rsi_s = 100 - (100 / (1 + (d.where(d > 0, 0)).rolling(14).mean()/( -d.where(d < 0, 0)).rolling(14).mean()))
             fig.add_trace(go.Scatter(x=df_p.index, y=rsi_s, line=dict(color='purple'), name="RSI"), row=3, col=1)
-            fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1); fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
         elif indicator_choice == "MACD (趨勢指標)":
             m_s = df_p['Close'].ewm(span=12).mean() - df_p['Close'].ewm(span=26).mean()
             h_s = m_s - m_s.ewm(span=9).mean()
             fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['red' if v>=0 else 'green' for v in h_s], name="MACD柱"), row=3, col=1)
 
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id}) - 量增倍數: {row['量增倍數']}</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", margin=dict(l=10, r=10, t=50, b=10))
+        fig.update_layout(title=f"<b>{row['名稱']} ({ticker_id})</b>", xaxis_rangeslider_visible=False, height=600, template="plotly_white", margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
 elif not st.session_state['scan_results'].empty:
