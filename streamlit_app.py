@@ -58,7 +58,6 @@ st.sidebar.header("⚙️ 策略參數設定")
 strategy_option = st.sidebar.radio("選擇選股策略：", ("均線多頭回測", "均線糾結偵測"))
 indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示", "RSI (強弱指標)", "MACD (趨勢指標)"])
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
-use_filter = st.sidebar.checkbox("僅顯示轉強標的 (RSI > 50 或 MACD > 0)", value=True)
 
 # --- 4. 掃描邏輯 ---
 btn_label = "🔍 開始全市場掃描" if not st.session_state['is_scanning'] else "⏳ 正在掃描中..."
@@ -75,7 +74,7 @@ if st.session_state['is_scanning']:
     batch_size = 100
     for i in range(0, len(all_stocks), batch_size):
         batch = all_stocks[i:i + batch_size]
-        status_text.text(f"正在分析第 {i} 至 {min(i+batch_size, len(all_stocks))} 支股票...")
+        status_text.text(f"掃描進度: {i} / {len(all_stocks)}")
         try:
             data = yf.download(batch, period="150d", group_by='ticker', progress=False)
             for ticker in batch:
@@ -88,25 +87,21 @@ if st.session_state['is_scanning']:
                     m30 = df['Close'].rolling(30).mean().iloc[-1]
                     m45 = df['Close'].rolling(45).mean().iloc[-1]
                     m60 = df['Close'].rolling(60).mean().iloc[-1]
-                    
                     bias_30 = ((close - m30) / m30) * 100
                     
                     keep = False
                     if strategy_option == "均線多頭回測":
-                        if m30 > m45 > m60 and close > m30 and bias_30 <= 2.5: 
-                            keep = True
+                        if m30 > m45 > m60 and close > m30 and bias_30 <= 2.5: keep = True
                     elif strategy_option == "均線糾結偵測":
                         ma_list = [m30, m45, m60]
                         ma_spread = (max(ma_list) - min(ma_list)) / min(ma_list)
-                        if ma_spread <= 0.02 and abs(bias_30) <= 2.5: 
-                            keep = True
+                        if ma_spread <= 0.02 and abs(bias_30) <= 2.5: keep = True
                     
                     if keep:
                         stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
                         results.append({
                             "ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], 
-                            "類股": stock_data["industry"], "收盤": round(close, 2),
-                            "乖離(%)": round(bias_30, 2)
+                            "類股": stock_data["industry"], "收盤": round(close, 2), "乖離(%)": round(bias_30, 2)
                         })
                 except: continue
         except: continue
@@ -115,101 +110,77 @@ if st.session_state['is_scanning']:
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df = res_df.sort_values(by="乖離(%)", ascending=True)
-        
     st.session_state['scan_results'] = res_df
-    st.session_state['selected_index'] = 0 # 重置索引
+    st.session_state['selected_index'] = 0
     st.session_state['is_scanning'] = False
     st.rerun()
 
-# --- 5. 結果顯示與左右切換邏輯 ---
+# --- 5. 顯示與導覽邏輯 ---
 if not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
-    
-    # 類股過濾
     selected_industry = st.selectbox("🎯 篩選類股：", ["全部"] + sorted(df_raw["類股"].unique().tolist()))
     df_filtered = df_raw if selected_industry == "全部" else df_raw[df_raw["類股"] == selected_industry]
     df_filtered = df_filtered.reset_index(drop=True)
 
-    if len(df_filtered) == 0:
-        st.warning("此類股下無符合條件標的。")
-    else:
-        # 表格顯示
-        st.write(f"📊 篩選清單 (共 {len(df_filtered)} 支)")
-        event = st.dataframe(
-            df_filtered, 
-            hide_index=True, 
-            use_container_width=True, 
-            on_select="rerun", 
-            selection_mode="single-row", 
-            key="stock_table"
-        )
+    if len(df_filtered) > 0:
+        st.write(f"📊 符合條件標的：{len(df_filtered)} 支")
+        event = st.dataframe(df_filtered, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row", key="stock_table")
         
-        # 處理表格選取同步到索引
         if event.selection and event.selection.rows:
-            new_idx = event.selection.rows[0]
-            if new_idx != st.session_state['selected_index']:
-                st.session_state['selected_index'] = new_idx
-                st.rerun()
+            st.session_state['selected_index'] = event.selection.rows[0]
 
-        # --- 左右切換按鈕區域 ---
         st.write("---")
         c1, c2, c3 = st.columns([1, 2, 1])
-        
         with c1:
             if st.button("⬅️ 上一支", use_container_width=True):
                 st.session_state['selected_index'] = (st.session_state['selected_index'] - 1) % len(df_filtered)
                 st.rerun()
-        
         with c2:
-            current_pos = st.session_state['selected_index']
-            st.markdown(f"<h3 style='text-align: center; color: #9400D3;'>{current_pos + 1} / {len(df_filtered)}</h3>", unsafe_allow_html=True)
-        
+            st.markdown(f"<h3 style='text-align: center; color: #9400D3;'>{st.session_state['selected_index'] + 1} / {len(df_filtered)}</h3>", unsafe_allow_html=True)
         with c3:
             if st.button("下一支 ➡️", use_container_width=True):
                 st.session_state['selected_index'] = (st.session_state['selected_index'] + 1) % len(df_filtered)
                 st.rerun()
 
-        # 獲取目前選中的股票資料
+        # 抓取個股繪圖資料
         idx = min(st.session_state['selected_index'], len(df_filtered)-1)
         row = df_filtered.iloc[idx]
         
-        # --- 繪圖區 ---
-        
-        with st.spinner(f'載入中: {row["名稱"]} ({row["ID"]})...'):
+        with st.spinner(f'載入中... {row["名稱"]}'):
             df_p = yf.download(row['ID'], period="8mo", progress=False)
             if isinstance(df_p.columns, pd.MultiIndex): df_p.columns = df_p.columns.get_level_values(0)
+            
+            # --- 重要：移除任何含有空值的行 ---
+            df_p = df_p.dropna(subset=['Close', 'Open', 'High', 'Low'])
             
             df_p['30MA'] = df_p['Close'].rolling(30).mean()
             df_p['45MA'] = df_p['Close'].rolling(45).mean()
             df_p['60MA'] = df_p['Close'].rolling(60).mean()
             
-            # 買入訊號
+            # 買點標記
             df_p['Is_Signal'] = (df_p['Close'] > df_p['30MA']) & (((df_p['Close'] - df_p['30MA']) / df_p['30MA']) <= 0.025)
-            if strategy_option == "均線多頭回測":
-                df_p['Is_Signal'] &= (df_p['30MA'] > df_p['45MA']) & (df_p['45MA'] > df_p['60MA'])
-            
             df_p['Buy_Marker'] = df_p.apply(lambda r: r['Low'] * 0.985 if r['Is_Signal'] else None, axis=1)
 
-            # 建立 Plotly 圖表
+            # 繪製圖表
             n_rows = 3 if indicator_choice != "都不顯示" else 2
             fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.15, 0.25] if n_rows==3 else [0.75, 0.25])
             
-            # K線與均線
+            # K線圖
             fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['30MA'], line=dict(color='#FFA500', width=1.8), name="30MA"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['45MA'], line=dict(color='#2E8B57', width=1.5), name="45MA"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['60MA'], line=dict(color='#4169E1', width=1.5), name="60MA"), row=1, col=1)
+            
+            # 均線
+            for ma, color in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
+                fig.add_trace(go.Scatter(x=df_p.index, y=df_p[ma], line=dict(color=color, width=1.5), name=ma), row=1, col=1)
 
             # 買點標記
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Buy_Marker'], mode='markers',
-                marker=dict(symbol='triangle-up', size=14, color='#9400D3', line=dict(width=1, color='white')),
-                name='策略買點'), row=1, col=1)
+                marker=dict(symbol='triangle-up', size=15, color='#9400D3', line=dict(width=1, color='white')), name='買點'), row=1, col=1)
 
-            # 成交量
+            # 成交量 (移除空白)
             v_clrs = ['#ef5350' if c >= o else '#26a69a' for c, o in zip(df_p['Close'], df_p['Open'])]
             fig.add_trace(go.Bar(x=df_p.index, y=df_p['Volume'], marker_color=v_clrs, name="成交量"), row=2, col=1)
 
-            # 技術指標
+            # 指標
             if indicator_choice == "RSI (強弱指標)":
                 d = df_p['Close'].diff()
                 rsi = 100 - (100 / (1 + (d.where(d > 0, 0)).rolling(14).mean()/( ( -d.where(d < 0, 0)).rolling(14).mean() + 1e-9)))
@@ -219,13 +190,22 @@ if not st.session_state['scan_results'].empty:
                 h_s = m_s - m_s.ewm(span=9).mean()
                 fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['#ef5350' if v>=0 else '#26a69a' for v in h_s], name="MACD柱"), row=3, col=1)
 
-            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+            # --- 核心：移除圖表上的非交易日空白 (週末/國定假日) ---
+            fig.update_xaxes(
+                rangebreaks=[
+                    dict(bounds=["sat", "mon"]), # 移除週末
+                    dict(values=["2025-01-27", "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31"]) # 可手動加入農曆年等國定假日
+                ],
+                showgrid=True, gridcolor='rgba(200,200,200,0.2)'
+            )
+            
             fig.update_layout(
-                title=f"<b>{row['名稱']} ({row['ID']}) | 當前位置: {current_pos+1} | 乖離率: {row['乖離(%)']}%</b>",
-                xaxis_rangeslider_visible=False, height=700, template="plotly_white",
+                title=f"<b>{row['名稱']} ({row['ID']}) | 乖離率: {row['乖離(%)']}%</b>",
+                xaxis_rangeslider_visible=False, height=750, template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig, use_container_width=True)
-
+    else:
+        st.warning("查無符合條件標的。")
 elif not st.session_state['is_scanning']:
-    st.info("💡 歡迎！請先點擊上方按鈕進行全市場掃描。")
+    st.info("💡 提示：點擊上方按鈕開始全市場掃描。")
