@@ -86,18 +86,31 @@ if st.session_state['is_scanning']:
 
                     # 指標計算
                     close = df['Close'].iloc[-1]
-                    m30, m45, m60 = df['Close'].rolling(30).mean().iloc[-1], df['Close'].rolling(45).mean().iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
+                    m30 = df['Close'].rolling(30).mean().iloc[-1]
+                    m45 = df['Close'].rolling(45).mean().iloc[-1]
+                    m60 = df['Close'].rolling(60).mean().iloc[-1]
                     
                     keep = False
                     if strategy_option == "均線多頭回測":
-                        if m30 > m45 > m60 and close > m30 and (close - m30) / m30 <= 0.02: keep = True
+                        # 多頭排列：30MA > 45MA > 60MA
+                        if m30 > m45 > m60 and close > m30 and (close - m30) / m30 <= 0.02: 
+                            keep = True
                     elif strategy_option == "均線糾結偵測":
-                        ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
-                        if ma_spread <= 0.015 and abs(close - m30) / m30 <= 0.02: keep = True
+                        # 糾結定義：三條線最大差距在 1.5% 以內
+                        ma_list = [m30, m45, m60]
+                        ma_spread = (max(ma_list) - min(ma_list)) / min(ma_list)
+                        if ma_spread <= 0.015 and abs(close - m30) / m30 <= 0.02: 
+                            keep = True
                     
                     if keep:
                         stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
-                        results.append({"ID": ticker, "代碼": ticker.split('.')[0], "名稱": stock_data["name"], "類股": stock_data["industry"], "收盤": round(close, 2)})
+                        results.append({
+                            "ID": ticker, 
+                            "代碼": ticker.split('.')[0], 
+                            "名稱": stock_data["name"], 
+                            "類股": stock_data["industry"], 
+                            "收盤": round(close, 2)
+                        })
                 except: continue
         except: continue
         progress_bar.progress(min((i + batch_size) / len(all_stocks), 1.0))
@@ -118,11 +131,9 @@ if not st.session_state['scan_results'].empty:
     # 選擇股票
     event = st.dataframe(df_filtered, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row", key="stock_table")
     
-    # 更新選中索引
     if event.selection and event.selection.rows:
         st.session_state['selected_index'] = event.selection.rows[0]
 
-    # 防呆
     idx = min(st.session_state['selected_index'], len(df_filtered)-1)
     row = df_filtered.iloc[idx]
     
@@ -130,34 +141,40 @@ if not st.session_state['scan_results'].empty:
         df_p = yf.download(row['ID'], period="8mo", progress=False)
         if isinstance(df_p.columns, pd.MultiIndex): df_p.columns = df_p.columns.get_level_values(0)
         
-        # 建立均線與買入訊號邏輯
+        # 建立均線
         df_p['30MA'] = df_p['Close'].rolling(30).mean()
         df_p['45MA'] = df_p['Close'].rolling(45).mean()
         df_p['60MA'] = df_p['Close'].rolling(60).mean()
         
         # --- 自動買入訊號偵測 ---
-        # 定義：當日收盤大於 30MA 且 (收盤-30MA)/30MA < 2% (即靠近均線支撐)
+        # 基礎條件：股價在 30MA 之上且距離極近
         df_p['Signal'] = (df_p['Close'] > df_p['30MA']) & ((df_p['Close'] - df_p['30MA']) / df_p['30MA'] <= 0.02)
+        
+        # 策略加強條件
         if strategy_option == "均線多頭回測":
             df_p['Signal'] &= (df_p['30MA'] > df_p['45MA']) & (df_p['45MA'] > df_p['60MA'])
-        
+        elif strategy_option == "均線糾結偵測":
+            ma_max = df_p[['30MA', '45MA', '60MA']].max(axis=1)
+            ma_min = df_p[['30MA', '45MA', '60MA']].min(axis=1)
+            df_p['Signal'] &= ((ma_max - ma_min) / ma_min <= 0.02)
+
         # 繪圖
         n_rows = 3 if indicator_choice != "都不顯示" else 2
         fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.2, 0.3] if n_rows==3 else [0.7, 0.3])
         
-        # 1. K線圖
+        # 1. K線圖與三條均線
         fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="K線"), row=1, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['30MA'], line=dict(color='#FFA500', width=1.5), name="30MA"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['45MA'], line=dict(color='#2E8B57', width=1.5), name="45MA"), row=1, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['60MA'], line=dict(color='#4169E1', width=1.5), name="60MA"), row=1, col=1)
 
-        # 2. 加入買入訊號標註 (Annotation)
-        # 我們只標註最近 60 天內的訊號，避免圖表太亂
+        # 2. 加入買入訊號標註
         sig_dates = df_p[df_p['Signal']].tail(5).index 
         for sig_date in sig_dates:
             fig.add_annotation(
-                x=sig_date, y=df_p.loc[sig_date, 'Low'] * 0.98,
-                text="買入", showarrow=True, arrowhead=2, arrowcolor="#9400D3",
-                arrowsize=1.5, arrowwidth=2, ay=-30, bgcolor="#9400D3", font=dict(color="white"), row=1, col=1
+                x=sig_date, y=df_p.loc[sig_date, 'Low'] * 0.97,
+                text="★買點", showarrow=True, arrowhead=2, arrowcolor="#D111D1",
+                arrowsize=1.2, arrowwidth=2, ay=35, bgcolor="#D111D1", font=dict(color="white", size=12), row=1, col=1
             )
 
         # 3. 成交量
@@ -176,9 +193,16 @@ if not st.session_state['scan_results'].empty:
             h_s = m_s - m_s.ewm(span=9).mean()
             fig.add_trace(go.Bar(x=df_p.index, y=h_s, marker_color=['red' if v>=0 else 'green' for v in h_s], name="MACD柱"), row=3, col=1)
 
+        # 圖表格式美化
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        fig.update_layout(title=f"<b>{row['名稱']} ({row['ID']}) - 買入訊號分析</b>", xaxis_rangeslider_visible=False, height=700, template="plotly_white")
+        fig.update_layout(
+            title=f"<b>{row['名稱']} ({row['ID']}) - 30/45/60MA 趨勢分析</b>",
+            xaxis_rangeslider_visible=False,
+            height=750,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 elif not st.session_state['is_scanning']:
-    st.info("請點擊上方按鈕開始掃描市場標的。")
+    st.info("👋 歡迎使用台股智慧選股系統，請點擊上方按鈕開始全市場掃描。")
