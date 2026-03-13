@@ -2,6 +2,7 @@ streamlit
 yfinance
 pandas
 requests
+lxml
 urllib3
 plotly
-lxml
+html5lib
