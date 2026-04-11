@@ -19,14 +19,15 @@ if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 if 'selected_index' not in st.session_state:
     st.session_state['selected_index'] = 0
+if 'yf_session' not in st.session_state:
+    st.session_state['yf_session'] = None  # 快取 Yahoo Finance session（cookie+crumb）
+
+
+# ============================================================
+# 2. 股票清單
+# ============================================================
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-
-
-# ============================================================
-# 2. 股票清單（TWSE ISIN — 仍可正常使用）
-# ============================================================
 
 @st.cache_data(ttl=86400)
 def get_stock_info_map():
@@ -49,9 +50,12 @@ def get_stock_info_map():
                 if val and '　' in str(val):
                     code, name = val.split('　')
                     if len(code) == 4 and code.isdigit():
-                        stocks_list.append((code, market))
-                        stock_info_map[code] = {
+                        suffix = ".TW" if market == "TW" else ".TWO"
+                        ticker = f"{code}{suffix}"
+                        stocks_list.append((ticker, market))
+                        stock_info_map[ticker] = {
                             "name": name,
+                            "code": code,
                             "market": market,
                             "industry": industry if pd.notna(industry) else "其他"
                         }
@@ -61,151 +65,130 @@ def get_stock_info_map():
 
 
 # ============================================================
-# 3. 資料來源：FinMind API（第三方，不會封鎖 Cloud IP）
+# 3. Yahoo Finance Cookie + Crumb（繞過 IP 封鎖的關鍵）
 #
-#   FinMind 免費版限制：
-#   - 未登入：每 10 分鐘 300 次請求
-#   - 註冊後（免費）：每天 600 次請求
-#   - 申請 Token 可提高至每天 3000 次
+#   Yahoo Finance 新版 API 需要：
+#   1. 先取得 Cookie（訪問首頁）
+#   2. 再用 Cookie 取得 Crumb（一次性驗證碼）
+#   3. 每次 API 請求帶上 Cookie 和 Crumb
 #
-#   申請 Token：https://finmindtrade.com/
-#   取得後填入側邊欄的 Token 欄位即可
+#   Cookie + Crumb 只需取得一次，後續所有請求共用。
+#   這樣就不會被當成機器人封鎖。
 # ============================================================
 
-def fetch_finmind(code: str, token: str = "", days: int = 130) -> pd.DataFrame:
+@st.cache_data(ttl=3600)  # Cookie 快取 1 小時
+def get_yf_cookie_and_crumb() -> tuple[dict, str]:
     """
-    透過 FinMind API 抓取台股歷史日線資料。
-
-    參數：
-        code  : 股票代碼（純數字，如 '2330'）
-        token : FinMind API Token（選填，填入可提高請求上限）
-        days  : 抓取天數
-
-    FinMind API 文件：https://finmindtrade.com/analysis/#/data/document
-    dataset: TaiwanStockPrice — 台灣股價日成交資訊
+    取得 Yahoo Finance 的 Cookie 和 Crumb。
+    Cookie 有效期約數小時，快取 1 小時確保不過期。
     """
-    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    params = {
-        "dataset":    "TaiwanStockPrice",
-        "data_id":    code,
-        "start_date": start,
-        "token":      token,
-    }
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36'),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    })
+
+    # 步驟 1：訪問 Yahoo Finance 首頁取得 Cookie
     try:
-        resp = requests.get(FINMIND_URL, params=params, timeout=15)
+        resp = session.get('https://fc.yahoo.com', timeout=10)
+    except Exception:
+        pass
+    try:
+        resp = session.get('https://finance.yahoo.com', timeout=10)
+    except Exception:
+        pass
+
+    cookies = dict(session.cookies)
+
+    # 步驟 2：用 Cookie 換取 Crumb
+    crumb = ""
+    try:
+        resp = session.get(
+            'https://query1.finance.yahoo.com/v1/test/csrfToken',
+            timeout=10
+        )
+        crumb = resp.text.strip()
+    except Exception:
+        pass
+
+    if not crumb:
+        try:
+            resp = session.get(
+                'https://query2.finance.yahoo.com/v1/test/csrfToken',
+                timeout=10
+            )
+            crumb = resp.text.strip()
+        except Exception:
+            pass
+
+    return cookies, crumb
+
+
+def fetch_yf_history(ticker: str, days: int = 130) -> pd.DataFrame:
+    """
+    直接呼叫 Yahoo Finance v8 CSV API 下載歷史日線。
+    帶上 Cookie + Crumb 避免被封鎖。
+
+    相較於 yfinance 套件的優點：
+    - 不依賴套件版本，直接控制 HTTP 請求
+    - 可以共用 Cookie，減少被封鎖的機率
+    - 輕量，不需要初始化 Ticker 物件
+    """
+    cookies, crumb = get_yf_cookie_and_crumb()
+
+    p2 = int(datetime.now().timestamp())
+    p1 = int((datetime.now() - timedelta(days=days)).timestamp())
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "period1":  p1,
+        "period2":  p2,
+        "interval": "1d",
+        "events":   "history",
+        "crumb":    crumb,
+    }
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36'),
+        'Accept': '*/*',
+        'Referer': 'https://finance.yahoo.com',
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers,
+                            cookies=cookies, timeout=15)
         if resp.status_code != 200:
             return pd.DataFrame()
+
         data = resp.json()
-        if data.get('status') != 200:
-            return pd.DataFrame()
-        records = data.get('data', [])
-        if not records:
+        result = data.get('chart', {}).get('result', [])
+        if not result:
             return pd.DataFrame()
 
-        df = pd.DataFrame(records)
-        # FinMind 回傳欄位：date, open, max, min, close, Trading_Volume, ...
-        df = df.rename(columns={
-            'date':             'Date',
-            'open':             'Open',
-            'max':              'High',
-            'min':              'Low',
-            'close':            'Close',
-            'Trading_Volume':   'Volume',
+        r         = result[0]
+        timestamps = r.get('timestamp', [])
+        quote      = r.get('indicators', {}).get('quote', [{}])[0]
+
+        if not timestamps:
+            return pd.DataFrame()
+
+        df = pd.DataFrame({
+            'Date':   pd.to_datetime(timestamps, unit='s').normalize(),
+            'Open':   quote.get('open',   [None] * len(timestamps)),
+            'High':   quote.get('high',   [None] * len(timestamps)),
+            'Low':    quote.get('low',    [None] * len(timestamps)),
+            'Close':  quote.get('close',  [None] * len(timestamps)),
+            'Volume': quote.get('volume', [None] * len(timestamps)),
         })
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-        df = df.sort_values('Date').set_index('Date')
 
-        # 確保數值型別正確
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+
         df = df.dropna(subset=['Close'])
-        return df
-
-    except Exception:
-        return pd.DataFrame()
-
-
-# ============================================================
-# 4. 分析
-# ============================================================
-
-def parse_price(s):
-    try:
-        v = float(str(s).replace(',', '').strip())
-        return v if v > 0 else None
-    except Exception:
-        return None
-
-
-def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
-    if len(df) < 60:
-        return None
-    # 成交量篩選（FinMind 的 Volume 單位是股，除 1000 換算張）
-    if (df['Volume'].tail(5).mean() / 1000) < min_vol:
-        return None
-    close = float(df['Close'].iloc[-1])
-    m30   = float(df['Close'].rolling(30).mean().iloc[-1])
-    m45   = float(df['Close'].rolling(45).mean().iloc[-1])
-    m60   = float(df['Close'].rolling(60).mean().iloc[-1])
-    if any(np.isnan(v) for v in [close, m30, m45, m60]):
-        return None
-    bias_30 = ((close - m30) / m30) * 100
-    if strategy == "均線多頭回測":
-        if m30 > m45 > m60 and close > m30 and bias_30 < 2.0:
-            return {"close": close, "bias_30": bias_30}
-    elif strategy == "均線糾結偵測":
-        spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
-        if spread <= 0.02 and abs(bias_30) < 2.0:
-            return {"close": close, "bias_30": bias_30}
-    return None
-
-
-def fetch_finmind_single(code: str, token: str = "", days: int = 130) -> pd.DataFrame:
-    """
-    下載單支股票歷史資料。
-    FinMind 的 data_id 只能填單一股票代碼，不支援批次。
-    改用 ThreadPoolExecutor 多執行緒並行提升速度。
-    """
-    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    params = {
-        "dataset":    "TaiwanStockPrice",
-        "data_id":    code,
-        "start_date": start,
-        "token":      token,
-    }
-    try:
-        resp = requests.get(FINMIND_URL, params=params, timeout=15)
-        if resp.status_code != 200:
-            return pd.DataFrame()
-        data = resp.json()
-        if data.get('status') != 200:
-            return pd.DataFrame()
-        records = data.get('data', [])
-        if not records:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(records)
-        df = df.rename(columns={
-            'date':           'Date',
-            'open':           'Open',
-            'max':            'High',
-            'min':            'Low',
-            'close':          'Close',
-            'Trading_Volume': 'Volume',
-        })
-        # 相容不同欄位名稱
-        if 'Volume' not in df.columns:
-            for alt in ['volume', 'trading_volume', 'TradeVolume']:
-                if alt in df.columns:
-                    df = df.rename(columns={alt: 'Volume'})
-                    break
-
-        df['Date'] = pd.to_datetime(df['Date'])
-        cols = [c for c in ['Date','Open','High','Low','Close','Volume'] if c in df.columns]
-        df = df[cols].dropna(subset=['Close'])
-        for col in cols[1:]:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
         return df.sort_values('Date').drop_duplicates('Date').set_index('Date')
 
     except Exception:
@@ -216,17 +199,10 @@ def fetch_finmind_single(code: str, token: str = "", days: int = 130) -> pd.Data
 # 4. 分析
 # ============================================================
 
-def parse_price(s):
-    try:
-        v = float(str(s).replace(',', '').strip())
-        return v if v > 0 else None
-    except Exception:
-        return None
-
-
 def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
     if len(df) < 60:
         return None
+    # Volume 單位為股，除 1000 換算為張
     if (df['Volume'].tail(5).mean() / 1000) < min_vol:
         return None
     close = float(df['Close'].iloc[-1])
@@ -246,46 +222,45 @@ def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
     return None
 
 
-def fetch_and_analyze(code: str, market: str, strategy: str,
-                      min_vol: float, token: str) -> dict | None:
+def fetch_and_analyze(ticker: str, market: str, strategy: str,
+                      min_vol: float) -> dict | None:
     try:
-        df = fetch_finmind_single(code, token=token, days=130)
+        df = fetch_yf_history(ticker, days=130)
         if df.empty:
             return None
         result = analyze(df, strategy, min_vol)
         if result:
-            result.update({"code": code, "market": market})
+            result.update({"ticker": ticker, "market": market})
         return result
     except Exception:
         return None
 
 
 # ============================================================
-# 5. 掃描主流程（多執行緒並行）
+# 5. 掃描主流程
 # ============================================================
 
-def run_scan(all_stocks, info_map, strategy, min_vol, token,
-             progress_bar, status_text):
+def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text):
     """
-    FinMind 不支援批次，改用 ThreadPoolExecutor 多執行緒並行。
-
-    MAX_WORKERS 設定原則：
-    - 無 Token：請求數有限，用 5 條避免超限
-    - 有 Token：可開到 20 條，速度大幅提升
-    - FinMind 伺服器實測可承受 20~30 條並行
+    Yahoo Finance v8 API + Cookie/Crumb + ThreadPoolExecutor。
+    無請求次數限制，MAX_WORKERS=15 在 Streamlit Cloud 實測穩定。
     """
-    MAX_WORKERS = 5 if not token else 20
+    MAX_WORKERS = 15
     total     = len(all_stocks)
     completed = 0
     results   = []
     empty_cnt = 0
 
+    # 預先取得 Cookie（共用，不用每次重新取）
+    status_text.text("🍪 取得 Yahoo Finance 授權中...")
+    get_yf_cookie_and_crumb()  # 觸發快取
+
     status_text.text(f"🔍 掃描 {total} 支（{MAX_WORKERS} 條執行緒並行）...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(fetch_and_analyze, c, m, strategy, min_vol, token): c
-            for c, m in all_stocks
+            executor.submit(fetch_and_analyze, t, m, strategy, min_vol): t
+            for t, m in all_stocks
         }
         for future in as_completed(futures):
             completed += 1
@@ -293,23 +268,23 @@ def run_scan(all_stocks, info_map, strategy, min_vol, token,
                 progress_bar.progress(min(completed / total, 1.0))
                 status_text.text(
                     f"🔍 進度：{completed} / {total}  |  找到 {len(results)} 支"
-                    + (f"  ⚠️ {empty_cnt} 支無資料" if empty_cnt > 100 else "")
+                    + (f"  ⚠️ {empty_cnt} 支無資料" if empty_cnt > 200 else "")
                 )
             try:
                 result = future.result()
                 if result is None:
                     empty_cnt += 1
                 else:
-                    code = result["code"]
-                    info = info_map.get(code, {"name": "未知", "industry": "其他"})
+                    ticker = result["ticker"]
+                    info   = info_map.get(ticker, {"name": "未知", "industry": "其他", "code": ticker})
                     results.append({
-                        "代碼":    code,
+                        "代碼":    info.get("code", ticker.split('.')[0]),
                         "名稱":    info["name"],
                         "市場":    result["market"],
                         "類股":    info["industry"],
                         "收盤":    round(result["close"], 2),
                         "乖離(%)": round(result["bias_30"], 2),
-                        "_code":   code,
+                        "_ticker": ticker,
                         "_market": result["market"],
                     })
             except Exception:
@@ -330,44 +305,22 @@ strategy_option  = st.sidebar.radio("選擇選股策略：", ("均線多頭回�
 indicator_choice = st.sidebar.selectbox("查看確認指標：",
                                         ["都不顯示", "RSI (強弱指標)", "MACD (趨勢指標)"])
 min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
-
 st.sidebar.markdown("---")
 
-# Token 從 secrets.toml 自動讀取，不需要使用者手動輸入
-# 本機開發：將 secrets.toml 放在專案根目錄的 .streamlit/ 資料夾內
-# Streamlit Cloud：在 App 設定頁的 Secrets 區塊貼入內容
-finmind_token = st.secrets.get("FINMIND_TOKEN", "")
-
-if finmind_token:
-    st.sidebar.success("✅ FinMind Token 已載入")
-else:
-    st.sidebar.warning("⚠️ 未設定 Token，每天限 600 次請求")
-
-# 診斷：印出 FinMind 原始回應，確認欄位名稱
-if st.sidebar.button("🔧 診斷 FinMind 回應"):
+# 診斷按鈕
+if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
     with st.sidebar:
         with st.spinner("測試中..."):
-            start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-            params = {
-                "dataset":    "TaiwanStockPrice",
-                "data_id":    "2330,2317",
-                "start_date": start,
-                "token":      finmind_token,
-            }
-            try:
-                resp = requests.get(FINMIND_URL, params=params, timeout=15)
-                data = resp.json()
-                st.sidebar.write(f"status: {data.get('status')}")
-                st.sidebar.write(f"msg: {data.get('msg', '')}")
-                records = data.get('data', [])
-                st.sidebar.write(f"筆數: {len(records)}")
-                if records:
-                    st.sidebar.write("欄位：", list(records[0].keys()))
-                    st.sidebar.write("第一筆：", records[0])
-            except Exception as e:
-                st.sidebar.error(str(e))
+            cookies, crumb = get_yf_cookie_and_crumb()
+            st.sidebar.write(f"Cookie 數量: {len(cookies)}")
+            st.sidebar.write(f"Crumb: {crumb[:20] + '...' if len(crumb) > 20 else crumb or '(空)'}")
+            df_test = fetch_yf_history("2330.TW", days=10)
+            if df_test.empty:
+                st.sidebar.error("❌ 無法取得 2330.TW 資料")
+            else:
+                st.sidebar.success(f"✅ 2330.TW 成功，{len(df_test)} 筆，最新收盤：{df_test['Close'].iloc[-1]:.1f}")
 
-st.sidebar.caption("📡 資料來源：[FinMind](https://finmindtrade.com/)")
+st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
 
 # ============================================================
@@ -384,16 +337,14 @@ else:
     status_text  = st.empty()
 
     res_df, empty_cnt = run_scan(
-        all_stocks, info_map,
-        strategy_option, min_volume, finmind_token,
+        all_stocks, info_map, strategy_option, min_volume,
         progress_bar, status_text
     )
 
-    if empty_cnt > len(all_stocks) * 0.5:
+    if empty_cnt > len(all_stocks) * 0.8:
         status_text.warning(
-            f"⚠️ {empty_cnt} 支股票無資料。"
-            "可能已超過 FinMind 免費請求上限（每天 600 次），"
-            "請明天再試或填入 API Token。"
+            f"⚠️ {empty_cnt} 支無資料。Cookie/Crumb 可能過期，"
+            "請重新整理頁面後再試。"
         )
     else:
         status_text.text(f"🎉 完成！找到 {len(res_df)} 支符合條件標的。")
@@ -446,10 +397,10 @@ if not st.session_state['scan_results'].empty:
         sel = df_filtered.iloc[idx]
 
         with st.spinner(f'載入中... {sel["名稱"]} ({sel["代碼"]})'):
-            df_p = fetch_finmind(sel["_code"], token=finmind_token, days=240)
+            df_p = fetch_yf_history(sel["_ticker"], days=240)
 
             if df_p.empty:
-                st.error("無法載入資料，可能已超過 FinMind 請求上限，請稍後再試。")
+                st.error("無法載入資料，請稍後再試。")
             else:
                 df_p = df_p.dropna(subset=['Close'])
                 df_p['Date_Str'] = df_p.index.strftime('%Y-%m-%d')
@@ -503,9 +454,4 @@ if not st.session_state['scan_results'].empty:
     else:
         st.warning("目前篩選條件下無標的。")
 else:
-    st.info(
-        "💡 點擊「開始全市場掃描」按鈕。\n\n"
-        "📡 資料來源已改為 **FinMind API**，解決 TWSE/TPEX IP 封鎖問題。\n\n"
-        "建議先至 [finmindtrade.com](https://finmindtrade.com/) 免費註冊取得 Token，"
-        "填入左側欄位後掃描效果更穩定。"
-    )
+    st.info("💡 點擊「開始全市場掃描」按鈕。\n\n先點左側「🔧 診斷 Yahoo Finance 連線」確認連線正常。")
