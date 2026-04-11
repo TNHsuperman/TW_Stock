@@ -505,8 +505,11 @@ else:
         )
     else:
         if not res_df.empty:
-            # 補充本益比、營收增減、熱門題材（只對符合條件的股票查詢）
-            res_df = enrich_results(res_df, status_text)
+            try:
+                res_df = enrich_results(res_df, status_text)
+                st.write("✅ enrich 完成，欄位：", list(res_df.columns))  # 除錯用
+            except Exception as e:
+                st.error(f"enrich_results 發生錯誤：{e}")
         status_text.text(f"🎉 完成！找到 {len(res_df)} 支符合條件標的。")
 
     st.session_state['scan_results'] = res_df
