@@ -161,67 +161,55 @@ def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
     return None
 
 
-def fetch_finmind_batch(codes: list, token: str = "", days: int = 130) -> dict:
+def fetch_finmind_single(code: str, token: str = "", days: int = 130) -> pd.DataFrame:
     """
-    批次下載多支股票歷史資料。
-
-    FinMind 支援在 data_id 欄位傳入逗號分隔的多個股票代碼，
-    一次請求回傳所有股票的資料，大幅減少請求次數。
-
-    例如原本 100 支股票需要 100 次請求，
-    改用 batch_size=50 後只需要 2 次請求，速度提升約 30~50 倍。
-
-    回傳：dict，key 為股票代碼，value 為 DataFrame
+    下載單支股票歷史資料。
+    FinMind 的 data_id 只能填單一股票代碼，不支援批次。
+    改用 ThreadPoolExecutor 多執行緒並行提升速度。
     """
-    if not codes:
-        return {}
-
     start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
     params = {
         "dataset":    "TaiwanStockPrice",
-        "data_id":    ",".join(codes),   # 多支股票用逗號串接
+        "data_id":    code,
         "start_date": start,
         "token":      token,
     }
     try:
-        resp = requests.get(FINMIND_URL, params=params, timeout=30)
+        resp = requests.get(FINMIND_URL, params=params, timeout=15)
         if resp.status_code != 200:
-            return {}
+            return pd.DataFrame()
         data = resp.json()
         if data.get('status') != 200:
-            return {}
+            return pd.DataFrame()
         records = data.get('data', [])
         if not records:
-            return {}
+            return pd.DataFrame()
 
-        df_all = pd.DataFrame(records)
-        df_all = df_all.rename(columns={
+        df = pd.DataFrame(records)
+        df = df.rename(columns={
             'date':           'Date',
-            'stock_id':       'Code',
             'open':           'Open',
             'max':            'High',
             'min':            'Low',
             'close':          'Close',
             'Trading_Volume': 'Volume',
         })
-        df_all['Date'] = pd.to_datetime(df_all['Date'])
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            df_all[col] = pd.to_numeric(df_all[col], errors='coerce')
-        df_all = df_all.dropna(subset=['Close', 'Code'])
+        # 相容不同欄位名稱
+        if 'Volume' not in df.columns:
+            for alt in ['volume', 'trading_volume', 'TradeVolume']:
+                if alt in df.columns:
+                    df = df.rename(columns={alt: 'Volume'})
+                    break
 
-        # 依股票代碼拆分成個別 DataFrame
-        result = {}
-        for code, group in df_all.groupby('Code'):
-            df = (group[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-                  .sort_values('Date')
-                  .drop_duplicates('Date')
-                  .set_index('Date'))
-            result[str(code)] = df
-
-        return result
+        df['Date'] = pd.to_datetime(df['Date'])
+        cols = [c for c in ['Date','Open','High','Low','Close','Volume'] if c in df.columns]
+        df = df[cols].dropna(subset=['Close'])
+        for col in cols[1:]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df.sort_values('Date').drop_duplicates('Date').set_index('Date')
 
     except Exception:
-        return {}
+        return pd.DataFrame()
 
 
 # ============================================================
@@ -239,7 +227,6 @@ def parse_price(s):
 def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
     if len(df) < 60:
         return None
-    # 成交量篩選（FinMind 的 Volume 單位是股，除 1000 換算張）
     if (df['Volume'].tail(5).mean() / 1000) < min_vol:
         return None
     close = float(df['Close'].iloc[-1])
@@ -259,74 +246,79 @@ def analyze(df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
     return None
 
 
+def fetch_and_analyze(code: str, market: str, strategy: str,
+                      min_vol: float, token: str) -> dict | None:
+    try:
+        df = fetch_finmind_single(code, token=token, days=130)
+        if df.empty:
+            return None
+        result = analyze(df, strategy, min_vol)
+        if result:
+            result.update({"code": code, "market": market})
+        return result
+    except Exception:
+        return None
+
+
 # ============================================================
-# 5. 掃描主流程（批次下載版）
+# 5. 掃描主流程（多執行緒並行）
 # ============================================================
 
 def run_scan(all_stocks, info_map, strategy, min_vol, token,
              progress_bar, status_text):
     """
-    批次掃描流程：
+    FinMind 不支援批次，改用 ThreadPoolExecutor 多執行緒並行。
 
-    舊版：每支股票各自發一次請求 → 1800 次請求
-    新版：每批 50 支合併成一次請求 → 36 次請求
-         速度提升約 30~50 倍
-
-    batch_size=50 是 FinMind 實測最穩定的批次大小，
-    太大（>100）偶爾會超時或回傳不完整。
+    MAX_WORKERS 設定原則：
+    - 無 Token：請求數有限，用 5 條避免超限
+    - 有 Token：可開到 20 條，速度大幅提升
+    - FinMind 伺服器實測可承受 20~30 條並行
     """
-    BATCH_SIZE = 50
-    codes    = [c for c, _ in all_stocks]
-    markets  = {c: m for c, m in all_stocks}
-    total    = len(codes)
-    results  = []
-    done     = 0
+    MAX_WORKERS = 5 if not token else 20
+    total     = len(all_stocks)
+    completed = 0
+    results   = []
+    empty_cnt = 0
 
-    # 將所有股票切成批次
-    batches = [codes[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-    n_batches = len(batches)
+    status_text.text(f"🔍 掃描 {total} 支（{MAX_WORKERS} 條執行緒並行）...")
 
-    status_text.text(f"⚡ 批次下載中：共 {n_batches} 批，每批 {BATCH_SIZE} 支...")
-
-    for batch_idx, batch in enumerate(batches):
-        # 每批次一次請求拿到所有股票資料
-        batch_data = fetch_finmind_batch(batch, token=token, days=130)
-
-        # 逐支分析（純 CPU，不需要網路，速度快）
-        for code in batch:
-            df = batch_data.get(code)
-            if df is not None and not df.empty:
-                result = analyze(df, strategy, min_vol)
-                if result:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_and_analyze, c, m, strategy, min_vol, token): c
+            for c, m in all_stocks
+        }
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 30 == 0 or completed == total:
+                progress_bar.progress(min(completed / total, 1.0))
+                status_text.text(
+                    f"🔍 進度：{completed} / {total}  |  找到 {len(results)} 支"
+                    + (f"  ⚠️ {empty_cnt} 支無資料" if empty_cnt > 100 else "")
+                )
+            try:
+                result = future.result()
+                if result is None:
+                    empty_cnt += 1
+                else:
+                    code = result["code"]
                     info = info_map.get(code, {"name": "未知", "industry": "其他"})
                     results.append({
                         "代碼":    code,
                         "名稱":    info["name"],
-                        "市場":    markets.get(code, "TW"),
+                        "市場":    result["market"],
                         "類股":    info["industry"],
                         "收盤":    round(result["close"], 2),
                         "乖離(%)": round(result["bias_30"], 2),
                         "_code":   code,
-                        "_market": markets.get(code, "TW"),
+                        "_market": result["market"],
                     })
-            done += 1
-
-        # 更新進度
-        pct = (batch_idx + 1) / n_batches
-        progress_bar.progress(min(pct, 1.0))
-        status_text.text(
-            f"⚡ 批次進度：{batch_idx+1} / {n_batches} 批"
-            f"  ({done} / {total} 支)  |  找到 {len(results)} 支"
-        )
-
-        # 批次間短暫休息，避免觸發 FinMind 速率限制
-        if batch_idx < n_batches - 1:
-            time.sleep(0.5)
+            except Exception:
+                continue
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df = res_df.sort_values("乖離(%)").reset_index(drop=True)
-    return res_df, done - len([c for c in codes if c in {r["_code"] for r in results}])
+    return res_df, empty_cnt
 
 
 # ============================================================
