@@ -307,51 +307,92 @@ def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
         return "N/A", "N/A"
 
 
-# 熱門題材關鍵字對應表
-THEME_KEYWORDS = {
-    "AI/算力":    ["AI", "人工智慧", "算力", "GPU", "HPC", "CoWoS", "GB200", "Blackwell"],
-    "電動車":     ["電動車", "EV", "Tesla", "電池", "充電"],
-    "半導體":     ["先進封裝", "CoWoS", "HBM", "晶圓", "台積電", "N2", "N3"],
-    "散熱/機殼":  ["散熱", "液冷", "水冷", "機殼"],
-    "軍工/航太":  ["軍工", "國防", "航太", "無人機"],
-    "儲能/綠能":  ["儲能", "綠能", "太陽能", "風電", "ESG"],
-    "機器人":     ["機器人", "人形機器人", "Humanoid"],
-}
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
-def fetch_hot_themes(ticker: str) -> str:
+def fetch_news_titles(ticker: str) -> str:
     """
-    抓取 Yahoo Finance 近期新聞標題，比對熱門題材關鍵字。
-    回傳命中的題材標籤（如「AI/算力、散熱」），無命中回傳空字串。
+    從 Yahoo Finance Search API 抓取該股近期新聞標題。
+    回傳合併後的標題字串，失敗回傳空字串。
     """
     cookies, _ = get_yf_cookie_and_crumb()
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"interval": "1d", "range": "5d", "events": ""}
     headers = {
         'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                        'AppleWebKit/537.36 (KHTML, like Gecko) '
                        'Chrome/124.0.0.0 Safari/537.36'),
         'Referer': 'https://finance.yahoo.com',
     }
-    # 嘗試從 Yahoo Finance news API 抓新聞
-    news_url = f"https://query1.finance.yahoo.com/v1/finance/search"
     try:
         resp = requests.get(
-            news_url,
-            params={"q": ticker, "newsCount": 5, "enableFuzzyQuery": False},
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": ticker, "newsCount": 8, "enableFuzzyQuery": False},
             headers=headers, cookies=cookies, timeout=8
         )
-        data  = resp.json()
-        news  = data.get('news', [])
-        # 合併所有新聞標題
-        texts = " ".join([n.get('title', '') for n in news])
-
-        matched = []
-        for theme, keywords in THEME_KEYWORDS.items():
-            if any(kw.lower() in texts.lower() for kw in keywords):
-                matched.append(theme)
-        return "、".join(matched) if matched else ""
+        news = resp.json().get('news', [])
+        titles = [n.get('title', '') for n in news if n.get('title')]
+        return "\n".join(titles)
     except Exception:
         return ""
+
+
+def analyze_theme_with_claude(stock_name: str, news_titles: str) -> str:
+    """
+    將新聞標題傳給 Claude，讓 Claude 動態判斷該股屬於哪些熱門題材。
+
+    不硬編碼任何關鍵字，由 Claude 根據新聞內容自由判斷，
+    能捕捉到最新的市場熱點（如最近才出現的新題材）。
+
+    回傳：題材標籤字串（如「AI伺服器、散熱」），無明確題材回傳空字串。
+    """
+    if not news_titles.strip():
+        return ""
+
+    prompt = f"""以下是台股「{stock_name}」的近期新聞標題：
+
+{news_titles}
+
+請根據這些新聞標題，判斷這支股票目前屬於哪些熱門投資題材。
+規則：
+1. 只列出新聞中有明確提及或強烈暗示的題材
+2. 題材名稱請簡短（2~6個中文字），例如：AI伺服器、散熱、電動車、軍工、儲能
+3. 多個題材用頓號「、」分隔
+4. 若新聞沒有明顯題材，請只回傳空字串
+5. 只回傳題材標籤，不要任何解釋或標點符號以外的文字
+
+回傳格式範例：AI伺服器、散熱
+若無題材：（空字串）"""
+
+    try:
+        resp = requests.post(
+            CLAUDE_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+        if resp.status_code != 200:
+            return ""
+        content = resp.json().get('content', [])
+        text = content[0].get('text', '').strip() if content else ''
+        # 過濾掉明顯是說明文字而非題材的回應
+        if len(text) > 30 or '\n' in text:
+            return ""
+        return text
+    except Exception:
+        return ""
+
+
+def fetch_hot_themes(ticker: str, stock_name: str) -> str:
+    """
+    抓取新聞後交由 Claude 動態判斷熱門題材。
+    """
+    news_titles = fetch_news_titles(ticker)
+    if not news_titles:
+        return ""
+    return analyze_theme_with_claude(stock_name, news_titles)
+
 
 
 def enrich_results(res_df: pd.DataFrame, status_text) -> pd.DataFrame:
@@ -371,7 +412,7 @@ def enrich_results(res_df: pd.DataFrame, status_text) -> pd.DataFrame:
         with ThreadPoolExecutor(max_workers=3) as ex:
             f_pe    = ex.submit(fetch_yf_pe, ticker)
             f_rev   = ex.submit(fetch_revenue_growth, ticker)
-            f_theme = ex.submit(fetch_hot_themes, ticker)
+            f_theme = ex.submit(fetch_hot_themes, ticker, row['名稱'])
             pe         = f_pe.result()
             mom, yoy   = f_rev.result()
             theme      = f_theme.result()
