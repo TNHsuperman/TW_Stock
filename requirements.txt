@@ -6,3 +6,4 @@ lxml
 urllib3
 plotly
 html5lib
+aiohttp
