@@ -228,9 +228,162 @@ def fetch_and_analyze(ticker: str, market: str, strategy: str,
         return None
 
 
-# ============================================================
-# 5. 掃描主流程
-# ============================================================
+def fetch_yf_pe(ticker: str) -> str:
+    """
+    從 Yahoo Finance quoteSummary API 取得本益比（trailingPE）。
+    回傳格式化字串，取得失敗回傳 'N/A'。
+    """
+    cookies, _ = get_yf_cookie_and_crumb()
+    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+    params = {"modules": "summaryDetail"}
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36'),
+        'Referer': 'https://finance.yahoo.com',
+    }
+    try:
+        resp = requests.get(url, params=params, headers=headers,
+                            cookies=cookies, timeout=10)
+        data = resp.json()
+        pe = (data.get('quoteSummary', {})
+                  .get('result', [{}])[0]
+                  .get('summaryDetail', {})
+                  .get('trailingPE', {})
+                  .get('fmt', None))
+        return pe if pe else "N/A"
+    except Exception:
+        return "N/A"
+
+
+def fetch_revenue_growth(code: str) -> tuple[str, str]:
+    """
+    從 FinMind TaiwanStockMonthRevenue 取得最近兩個月的營收，
+    計算月增率與年增率。
+
+    只對最終符合條件的幾十支股票查詢，不會超過 FinMind 免費額度。
+    回傳：(月增%, 年增%)，失敗回傳 ('N/A', 'N/A')
+    """
+    FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+    start = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+    params = {
+        "dataset":    "TaiwanStockMonthRevenue",
+        "data_id":    code,
+        "start_date": start,
+    }
+    try:
+        resp = requests.get(FINMIND_URL, params=params, timeout=10)
+        data = resp.json()
+        if data.get('status') != 200:
+            return "N/A", "N/A"
+        records = data.get('data', [])
+        if len(records) < 2:
+            return "N/A", "N/A"
+
+        df = pd.DataFrame(records).sort_values('date')
+        # 取最新月與上個月
+        latest  = df.iloc[-1]
+        prev_m  = df.iloc[-2]  # 上個月（月增比較用）
+
+        # 找去年同月（年增比較用）
+        latest_date = pd.to_datetime(latest['date'])
+        year_ago    = latest_date - timedelta(days=365)
+        prev_y_df   = df[pd.to_datetime(df['date']) <= year_ago]
+
+        rev_now  = float(latest.get('revenue', 0))
+        rev_pm   = float(prev_m.get('revenue', 0))
+        rev_py   = float(prev_y_df.iloc[-1].get('revenue', 0)) if not prev_y_df.empty else 0
+
+        mom = f"{(rev_now - rev_pm) / rev_pm * 100:+.1f}%" if rev_pm else "N/A"
+        yoy = f"{(rev_now - rev_py) / rev_py * 100:+.1f}%" if rev_py else "N/A"
+        return mom, yoy
+
+    except Exception:
+        return "N/A", "N/A"
+
+
+# 熱門題材關鍵字對應表
+THEME_KEYWORDS = {
+    "AI/算力":    ["AI", "人工智慧", "算力", "GPU", "HPC", "CoWoS", "GB200", "Blackwell"],
+    "電動車":     ["電動車", "EV", "Tesla", "電池", "充電"],
+    "半導體":     ["先進封裝", "CoWoS", "HBM", "晶圓", "台積電", "N2", "N3"],
+    "散熱/機殼":  ["散熱", "液冷", "水冷", "機殼"],
+    "軍工/航太":  ["軍工", "國防", "航太", "無人機"],
+    "儲能/綠能":  ["儲能", "綠能", "太陽能", "風電", "ESG"],
+    "機器人":     ["機器人", "人形機器人", "Humanoid"],
+}
+
+def fetch_hot_themes(ticker: str) -> str:
+    """
+    抓取 Yahoo Finance 近期新聞標題，比對熱門題材關鍵字。
+    回傳命中的題材標籤（如「AI/算力、散熱」），無命中回傳空字串。
+    """
+    cookies, _ = get_yf_cookie_and_crumb()
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"interval": "1d", "range": "5d", "events": ""}
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36'),
+        'Referer': 'https://finance.yahoo.com',
+    }
+    # 嘗試從 Yahoo Finance news API 抓新聞
+    news_url = f"https://query1.finance.yahoo.com/v1/finance/search"
+    try:
+        resp = requests.get(
+            news_url,
+            params={"q": ticker, "newsCount": 5, "enableFuzzyQuery": False},
+            headers=headers, cookies=cookies, timeout=8
+        )
+        data  = resp.json()
+        news  = data.get('news', [])
+        # 合併所有新聞標題
+        texts = " ".join([n.get('title', '') for n in news])
+
+        matched = []
+        for theme, keywords in THEME_KEYWORDS.items():
+            if any(kw.lower() in texts.lower() for kw in keywords):
+                matched.append(theme)
+        return "、".join(matched) if matched else ""
+    except Exception:
+        return ""
+
+
+def enrich_results(res_df: pd.DataFrame, status_text) -> pd.DataFrame:
+    """
+    對掃描結果補充本益比、營收月增、營收年增、熱門題材。
+    只對符合條件的股票查詢，請求數少，不會超過 FinMind 額度。
+    """
+    total = len(res_df)
+    pe_list, mom_list, yoy_list, theme_list = [], [], [], []
+
+    for i, row in res_df.iterrows():
+        status_text.text(f"📊 補充基本面資料 {i+1}/{total}：{row['名稱']}...")
+        ticker = row['_ticker']
+        code   = row['代碼']
+
+        # 並行抓三種資料（縮短等待時間）
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_pe    = ex.submit(fetch_yf_pe, ticker)
+            f_rev   = ex.submit(fetch_revenue_growth, code)
+            f_theme = ex.submit(fetch_hot_themes, ticker)
+            pe             = f_pe.result()
+            mom, yoy       = f_rev.result()
+            theme          = f_theme.result()
+
+        pe_list.append(pe)
+        mom_list.append(mom)
+        yoy_list.append(yoy)
+        theme_list.append(theme)
+
+    res_df = res_df.copy()
+    res_df['本益比']    = pe_list
+    res_df['營收月增']  = mom_list
+    res_df['營收年增']  = yoy_list
+    res_df['熱門題材']  = theme_list
+    return res_df
+
+
 
 def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text):
     """
@@ -346,6 +499,9 @@ else:
             "請重新整理頁面後再試。"
         )
     else:
+        if not res_df.empty:
+            # 補充本益比、營收增減、熱門題材（只對符合條件的股票查詢）
+            res_df = enrich_results(res_df, status_text)
         status_text.text(f"🎉 完成！找到 {len(res_df)} 支符合條件標的。")
 
     st.session_state['scan_results'] = res_df
@@ -365,7 +521,9 @@ if not st.session_state['scan_results'].empty:
     )
     df_filtered = (df_raw if selected_industry == "全部"
                    else df_raw[df_raw["類股"] == selected_industry]).reset_index(drop=True)
-    display_cols = ["代碼", "名稱", "市場", "類股", "收盤", "乖離(%)"]
+    display_cols = ["代碼", "名稱", "市場", "類股", "收盤", "乖離(%)", "本益比", "營收月增", "營收年增", "熱門題材"]
+    # 只顯示實際存在的欄位（首次掃描尚未補充時的相容）
+    display_cols = [c for c in display_cols if c in df_filtered.columns]
 
     if len(df_filtered) > 0:
         st.write(f"📊 符合條件標的：{len(df_filtered)} 支")
