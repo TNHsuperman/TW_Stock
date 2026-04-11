@@ -250,8 +250,9 @@ def fetch_yf_pe(ticker: str) -> str:
 
 def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
     """
-    從 TWSE 個股月營收 API 取得月增率與年增率。
-    使用 https://www.twse.com.tw/exchangeReport/t05st10（非 rwd 路徑）
+    從 TWSE/TPEX 月營收公告頁面取得月增率與年增率。
+    改用 https://www.twse.com.tw/zh/trading/historical/t05st10.html
+    的 JSON API，這個路徑與 exchangeReport 不同。
     """
     code   = ticker.split('.')[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
@@ -263,47 +264,40 @@ def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
         month  = target.month
 
         if market == "TW":
-            url    = "https://www.twse.com.tw/exchangeReport/t05st10"
-            params = {"response": "json", "date": f"{yr_roc}{month:02d}01",
-                      "stockNo": code}
+            # 嘗試多個 TWSE 路徑
+            urls_params = [
+                ("https://www.twse.com.tw/zh/trading/historical/t05st10.html",
+                 {"response": "json", "date": f"{yr_roc}{month:02d}01", "stockNo": code}),
+                ("https://www.twse.com.tw/fund/T05ST10",
+                 {"response": "json", "date": f"{yr_roc}{month:02d}01", "stockNo": code}),
+            ]
         else:
-            url    = "https://www.tpex.org.tw/web/stock/financial/revenue/monthly_rev_result.php"
-            params = {"l": "zh-tw", "d": f"{yr_roc}/{month:02d}",
-                      "stkno": code}
-        try:
-            resp = requests.get(url, params=params, headers=HEADERS,
-                                timeout=10, verify=False)
-            if resp.status_code != 200 or not resp.text.strip():
-                continue
+            urls_params = [
+                ("https://www.tpex.org.tw/web/stock/financial/revenue/monthly_rev_result.php",
+                 {"l": "zh-tw", "d": f"{yr_roc}/{month:02d}", "stkno": code}),
+            ]
 
-            # 嘗試解析 JSON
+        for url, params in urls_params:
             try:
+                resp = requests.get(url, params=params, headers=HEADERS,
+                                    timeout=10, verify=False)
+                if resp.status_code != 200 or not resp.text.strip():
+                    continue
+                if '<html' in resp.text[:50].lower():
+                    continue  # 回傳 HTML 代表被擋
                 data = resp.json()
+                rows = data.get('data', data.get('aaData', []))
+                if not rows:
+                    continue
+                row = rows[0]
+                try:
+                    mom = f"{float(str(row[4]).replace(',','').replace('%','')):+.1f}%"
+                    yoy = f"{float(str(row[5]).replace(',','').replace('%','')):+.1f}%"
+                    return mom, yoy
+                except Exception:
+                    continue
             except Exception:
                 continue
-
-            if market == "TW":
-                rows = data.get('data', [])
-            else:
-                rows = data.get('aaData', [])
-
-            if not rows:
-                continue
-
-            row = rows[0]
-            # TWSE t05st10 欄位順序：
-            # 0:年月, 1:當月, 2:上月, 3:去年同月, 4:月增率, 5:年增率, ...
-            try:
-                mom_raw = str(row[4]).replace(',', '').replace('%', '').strip()
-                yoy_raw = str(row[5]).replace(',', '').replace('%', '').strip()
-                mom = f"{float(mom_raw):+.1f}%"
-                yoy = f"{float(yoy_raw):+.1f}%"
-                return mom, yoy
-            except Exception:
-                continue
-
-        except Exception:
-            continue
 
     return "N/A", "N/A"
 
@@ -396,38 +390,60 @@ def fetch_hot_themes(ticker: str, stock_name: str) -> str:
 
 
 
+def enrich_one(row_data: dict) -> dict:
+    """
+    對單一股票並行抓取本益比、營收、題材。
+    設計為在 ThreadPoolExecutor 的執行緒中執行。
+    """
+    ticker = row_data['_ticker']
+    name   = row_data['名稱']
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_pe    = ex.submit(fetch_yf_pe, ticker)
+        f_rev   = ex.submit(fetch_revenue_growth, ticker)
+        f_theme = ex.submit(fetch_hot_themes, ticker, name)
+        pe       = f_pe.result()
+        mom, yoy = f_rev.result()
+        theme    = f_theme.result()
+    return {
+        "_ticker":  ticker,
+        "本益比":   pe,
+        "營收月增": mom,
+        "營收年增": yoy,
+        "熱門題材": theme,
+    }
+
+
 def enrich_results(res_df: pd.DataFrame, status_text) -> pd.DataFrame:
     """
-    對掃描結果補充本益比、營收季增、營收年增、熱門題材。
-    全部使用 Yahoo Finance API，不依賴 FinMind。
-    只對符合條件的股票查詢，請求數少。
+    對所有符合條件的股票同時並行抓取基本面資料。
+
+    舊版：逐支股票，每支約 3~5 秒 → 22 支需 60~110 秒
+    新版：MAX_WORKERS=10 同時並行 → 22 支約 5~15 秒
     """
     total = len(res_df)
-    pe_list, mom_list, yoy_list, theme_list = [], [], [], []
+    status_text.text(f"📊 並行補充 {total} 支基本面資料...")
 
-    for i, (_, row) in enumerate(res_df.iterrows()):
-        status_text.text(f"📊 補充基本面資料 {i+1}/{total}：{row['名稱']}...")
-        ticker = row['_ticker']
+    rows_input = res_df.to_dict('records')
+    enrich_map = {}
 
-        # 三種資料並行抓取，節省時間
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            f_pe    = ex.submit(fetch_yf_pe, ticker)
-            f_rev   = ex.submit(fetch_revenue_growth, ticker)
-            f_theme = ex.submit(fetch_hot_themes, ticker, row['名稱'])
-            pe         = f_pe.result()
-            mom, yoy   = f_rev.result()
-            theme      = f_theme.result()
-
-        pe_list.append(pe)
-        mom_list.append(mom)
-        yoy_list.append(yoy)
-        theme_list.append(theme)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(enrich_one, row): row['_ticker']
+                   for row in rows_input}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            status_text.text(f"📊 補充基本面：{done}/{total} 完成")
+            try:
+                result = future.result()
+                enrich_map[result['_ticker']] = result
+            except Exception:
+                continue
 
     res_df = res_df.copy()
-    res_df['本益比']    = pe_list
-    res_df['營收季增']  = mom_list   # 改為「季增」，反映資料實際為季度
-    res_df['營收年增']  = yoy_list
-    res_df['熱門題材']  = theme_list
+    res_df['本益比']   = res_df['_ticker'].map(lambda t: enrich_map.get(t, {}).get('本益比',   'N/A'))
+    res_df['營收月增'] = res_df['_ticker'].map(lambda t: enrich_map.get(t, {}).get('營收月增', 'N/A'))
+    res_df['營收年增'] = res_df['_ticker'].map(lambda t: enrich_map.get(t, {}).get('營收年增', 'N/A'))
+    res_df['熱門題材'] = res_df['_ticker'].map(lambda t: enrich_map.get(t, {}).get('熱門題材', ''))
     return res_df
 
 
@@ -509,8 +525,22 @@ if st.sidebar.button("🔧 診斷連線"):
             st.sidebar.write("歷史資料：", "✅" if not df_test.empty else "❌")
             pe = fetch_yf_pe("2330.TW")
             st.sidebar.write(f"本益比：{pe}")
-            qoq, yoy = fetch_revenue_growth("2330.TW")
-            st.sidebar.write(f"月增率：{qoq}，年增率：{yoy}")
+
+            # 測試各個月營收路徑
+            now    = datetime.now()
+            yr_roc = now.year - 1911
+            rev_urls = {
+                "zh/trading/historical": f"https://www.twse.com.tw/zh/trading/historical/t05st10.html?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
+                "fund/T05ST10":          f"https://www.twse.com.tw/fund/T05ST10?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
+                "pcversion/t05st10":     f"https://www.twse.com.tw/pcversion/zh/trading/historical/t05st10?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
+            }
+            for name, url in rev_urls.items():
+                try:
+                    r = requests.get(url, headers=HEADERS, timeout=8, verify=False)
+                    body = r.text[:100].replace('\n',' ')
+                    st.sidebar.caption(f"{name}: HTTP {r.status_code} | {body}")
+                except Exception as e:
+                    st.sidebar.caption(f"{name}: ❌ {str(e)[:50]}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
@@ -576,7 +606,7 @@ if not st.session_state['scan_results'].empty:
     )
     df_filtered = (df_raw if selected_industry == "全部"
                    else df_raw[df_raw["類股"] == selected_industry]).reset_index(drop=True)
-    display_cols = ["代碼", "名稱", "市場", "類股", "收盤", "乖離(%)", "本益比", "營收季增", "營收年增", "熱門題材"]
+    display_cols = ["代碼", "名稱", "市場", "類股", "收盤", "乖離(%)", "本益比", "營收月增", "營收年增", "熱門題材"]
     display_cols = [c for c in display_cols if c in df_filtered.columns]
 
     if len(df_filtered) > 0:
