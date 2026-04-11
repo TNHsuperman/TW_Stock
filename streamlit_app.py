@@ -91,6 +91,11 @@ def fetch_and_analyze(ticker: str, strategy: str, min_vol: float) -> dict | None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
+        # yfinance 新版單支下載時欄位可能為 DataFrame，統一 squeeze 成 Series
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in df.columns and isinstance(df[col], pd.DataFrame):
+                df[col] = df[col].squeeze()
+
         df = df.dropna(subset=['Close'])
 
         if len(df) < 60:
@@ -296,15 +301,22 @@ if not st.session_state['scan_results'].empty:
             if isinstance(df_p.columns, pd.MultiIndex):
                 df_p.columns = df_p.columns.get_level_values(0)
 
+            # yfinance 新版下載單支股票時，各欄位可能回傳 DataFrame（而非 Series）
+            # 用 squeeze() 統一壓成 Series，避免 rolling().mean() 結果無法賦值的 ValueError
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df_p.columns and isinstance(df_p[col], pd.DataFrame):
+                    df_p[col] = df_p[col].squeeze()
+
             df_p = df_p.dropna(subset=['Close'])
 
             if df_p.empty:
                 st.error("無法載入該股票資料，請稍後再試。")
             else:
                 df_p['Date_Str'] = df_p.index.strftime('%Y-%m-%d')
-                df_p['30MA'] = df_p['Close'].rolling(30).mean()
-                df_p['45MA'] = df_p['Close'].rolling(45).mean()
-                df_p['60MA'] = df_p['Close'].rolling(60).mean()
+                close_s = df_p['Close'].squeeze()  # 確保是 Series
+                df_p['30MA'] = close_s.rolling(30).mean()
+                df_p['45MA'] = close_s.rolling(45).mean()
+                df_p['60MA'] = close_s.rolling(60).mean()
 
                 n_rows = 3 if indicator_choice != "都不顯示" else 2
                 row_heights = [0.6, 0.15, 0.25] if n_rows == 3 else [0.75, 0.25]
@@ -337,7 +349,7 @@ if not st.session_state['scan_results'].empty:
                 ), row=2, col=1)
 
                 if indicator_choice == "RSI (強弱指標)":
-                    d = df_p['Close'].diff()
+                    d = close_s.diff()
                     rsi = 100 - (100 / (
                         1 + (d.where(d > 0, 0)).rolling(14).mean() /
                         ((-d.where(d < 0, 0)).rolling(14).mean() + 1e-9)
@@ -350,7 +362,7 @@ if not st.session_state['scan_results'].empty:
                     fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
                 elif indicator_choice == "MACD (趨勢指標)":
-                    m_s = df_p['Close'].ewm(span=12).mean() - df_p['Close'].ewm(span=26).mean()
+                    m_s = close_s.ewm(span=12).mean() - close_s.ewm(span=26).mean()
                     h_s = m_s - m_s.ewm(span=9).mean()
                     fig.add_trace(go.Bar(
                         x=df_p['Date_Str'], y=h_s,
