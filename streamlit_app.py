@@ -230,77 +230,81 @@ def fetch_and_analyze(ticker: str, market: str, strategy: str,
 
 def fetch_yf_pe(ticker: str) -> str:
     """
-    從 Yahoo Finance quoteSummary API 取得本益比（trailingPE）。
-    回傳格式化字串，取得失敗回傳 'N/A'。
+    從 Yahoo Finance quote endpoint 取得台股本益比。
+    v10 quoteSummary 對台股資料稀疏，改用 v8 chart metadata。
     """
     cookies, _ = get_yf_cookie_and_crumb()
-    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-    params = {"modules": "summaryDetail"}
     headers = {
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) '
-                       'Chrome/124.0.0.0 Safari/537.36'),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://finance.yahoo.com',
     }
+    # 方法一：用 /v7/finance/quote 直接拿 trailingPE
     try:
-        resp = requests.get(url, params=params, headers=headers,
-                            cookies=cookies, timeout=10)
-        data = resp.json()
-        pe = (data.get('quoteSummary', {})
-                  .get('result', [{}])[0]
-                  .get('summaryDetail', {})
-                  .get('trailingPE', {})
-                  .get('fmt', None))
-        return pe if pe else "N/A"
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v7/finance/quote",
+            params={"symbols": ticker, "fields": "trailingPE,epsTrailingTwelveMonths,regularMarketPrice"},
+            headers=headers, cookies=cookies, timeout=10
+        )
+        result = resp.json().get('quoteResponse', {}).get('result', [])
+        if result:
+            pe = result[0].get('trailingPE')
+            if pe:
+                return f"{pe:.1f}"
     except Exception:
-        return "N/A"
+        pass
+
+    # 方法二：用股價 / EPS 自己算
+    try:
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/" + ticker,
+            params={"interval": "1d", "range": "1d"},
+            headers=headers, cookies=cookies, timeout=10
+        )
+        data = resp.json()
+        meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
+        price = meta.get('regularMarketPrice', 0)
+        eps   = meta.get('epsTrailingTwelveMonths', 0)
+        if price and eps and eps > 0:
+            return f"{price/eps:.1f}"
+    except Exception:
+        pass
+
+    return "N/A"
 
 
 def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
     """
-    從 Yahoo Finance quoteSummary 取得營收月增率與年增率。
-    使用 financialData 模組，不需要 FinMind。
-
-    Yahoo Finance 提供的是季度營收，用最近兩季計算：
-    - 月增：用最新季 vs 上一季（QoQ）
-    - 年增：用最新季 vs 去年同季（YoY）
-    回傳格式化字串如 '+12.3%' 或 'N/A'
+    台股營收資料 Yahoo Finance 幾乎沒有，
+    改從 Yahoo Finance /v10/finance/quoteSummary 的
+    earningsTrend 模組取得營收成長率估計值。
+    若無資料則回傳 N/A。
     """
     cookies, _ = get_yf_cookie_and_crumb()
-    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-    params = {"modules": "incomeStatementHistoryQuarterly,financialData"}
     headers = {
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) '
-                       'Chrome/124.0.0.0 Safari/537.36'),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://finance.yahoo.com',
     }
     try:
-        resp = requests.get(url, params=params, headers=headers,
-                            cookies=cookies, timeout=10)
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+            params={"modules": "earningsTrend"},
+            headers=headers, cookies=cookies, timeout=10
+        )
         data   = resp.json()
-        result = data.get('quoteSummary', {}).get('result', [{}])
+        result = data.get('quoteSummary', {}).get('result', [])
         if not result:
             return "N/A", "N/A"
 
-        # 從季度損益表取得四季的總收入
-        stmts = (result[0]
-                 .get('incomeStatementHistoryQuarterly', {})
-                 .get('incomeStatementHistory', []))
-        if len(stmts) < 2:
-            return "N/A", "N/A"
-
-        # stmts[0] = 最新季, stmts[1] = 上一季, stmts[3] ≈ 去年同季
-        def get_rev(stmt):
-            v = stmt.get('totalRevenue', {}).get('raw', None)
-            return float(v) if v else None
-
-        r0 = get_rev(stmts[0])   # 最新季
-        r1 = get_rev(stmts[1])   # 上一季（QoQ）
-        r4 = get_rev(stmts[3]) if len(stmts) > 3 else None  # 去年同季（YoY）
-
-        qoq = f"{(r0 - r1) / abs(r1) * 100:+.1f}%" if r0 and r1 else "N/A"
-        yoy = f"{(r0 - r4) / abs(r4) * 100:+.1f}%" if r0 and r4 else "N/A"
+        trends = result[0].get('earningsTrend', {}).get('trend', [])
+        # trend 包含 0q(本季)、+1q(下季)、0y(本年)、+1y(明年) 等預估
+        qoq, yoy = "N/A", "N/A"
+        for t in trends:
+            period = t.get('period', '')
+            growth = t.get('revenueEstimate', {}).get('growth', {}).get('fmt', None)
+            if period == '0q' and growth:
+                qoq = growth
+            if period == '0y' and growth:
+                yoy = growth
         return qoq, yoy
 
     except Exception:
@@ -503,40 +507,20 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
     with st.sidebar:
         with st.spinner("測試中..."):
             get_yf_cookie_and_crumb.clear()
-            cookies, crumb = get_yf_cookie_and_crumb()
+            cookies, _ = get_yf_cookie_and_crumb()
             st.sidebar.write(f"Cookie keys: {list(cookies.keys())}")
 
-            # 測試歷史價格
-            df_test = fetch_yf_history("2330.TW", days=10)
+            df_test = fetch_yf_history("2330.TW", days=5)
             if df_test.empty:
-                st.sidebar.error("❌ 歷史資料：無法取得 2330.TW")
+                st.sidebar.error("❌ 歷史資料失敗")
             else:
-                st.sidebar.success(f"✅ 歷史資料：{len(df_test)} 筆，收盤 {df_test['Close'].iloc[-1]:.1f}")
+                st.sidebar.success(f"✅ 歷史資料：收盤 {df_test['Close'].iloc[-1]:.1f}")
 
-            # 測試 quoteSummary（本益比 + 營收）
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': 'https://finance.yahoo.com',
-            }
-            try:
-                url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/2330.TW"
-                resp = requests.get(url,
-                    params={"modules": "summaryDetail,incomeStatementHistoryQuarterly"},
-                    headers=headers, cookies=cookies, timeout=10)
-                raw = resp.text[:300]
-                try:
-                    data = resp.json()
-                    result = data.get('quoteSummary', {}).get('result', [{}])
-                    pe = result[0].get('summaryDetail', {}).get('trailingPE', {}).get('fmt', 'N/A') if result else 'N/A'
-                    stmts = result[0].get('incomeStatementHistoryQuarterly', {}).get('incomeStatementHistory', []) if result else []
-                    st.sidebar.success(f"✅ quoteSummary：PE={pe}, 季報筆數={len(stmts)}")
-                    if stmts:
-                        st.sidebar.write("第一季欄位：", list(stmts[0].keys()))
-                except Exception as e:
-                    st.sidebar.error(f"❌ quoteSummary JSON 解析失敗：{e}")
-                    st.sidebar.write(f"原始回應：{raw}")
-            except Exception as e:
-                st.sidebar.error(f"❌ quoteSummary 請求失敗：{e}")
+            pe = fetch_yf_pe("2330.TW")
+            st.sidebar.write(f"本益比：{pe}")
+
+            qoq, yoy = fetch_revenue_growth("2330.TW")
+            st.sidebar.write(f"營收季增：{qoq}，年增：{yoy}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
