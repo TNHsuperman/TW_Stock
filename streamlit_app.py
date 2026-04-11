@@ -519,7 +519,6 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
         with st.spinner("測試中..."):
             get_yf_cookie_and_crumb.clear()
             cookies, _ = get_yf_cookie_and_crumb()
-            st.sidebar.write(f"Cookie keys: {list(cookies.keys())}")
 
             df_test = fetch_yf_history("2330.TW", days=5)
             if df_test.empty:
@@ -527,22 +526,35 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
             else:
                 st.sidebar.success(f"✅ 歷史資料：收盤 {df_test['Close'].iloc[-1]:.1f}")
 
-            # 測試 mis.twse 本益比
+            # 印出 mis.twse 所有欄位的實際值
             try:
-                resp = requests.get(
+                resp  = requests.get(
                     "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",
                     headers=HEADERS, timeout=8, verify=False)
                 items = resp.json().get('msgArray', [])
                 if items:
-                    st.sidebar.write("mis.twse 全部欄位：", list(items[0].keys()))
-                    st.sidebar.write("pe 欄位值：", items[0].get('pe', '無此欄位'))
+                    st.sidebar.write("mis.twse 欄位值（全部）：")
+                    st.sidebar.json(items[0])
             except Exception as e:
                 st.sidebar.error(f"mis.twse 失敗：{e}")
 
-            pe = fetch_yf_pe("2330.TW")
-            qoq, yoy = fetch_revenue_growth("2330.TW")
-            st.sidebar.write(f"本益比：{pe}")
-            st.sidebar.write(f"月增率：{qoq}，年增率：{yoy}")
+            # 測試 mops 月營收
+            try:
+                now    = datetime.now()
+                yr_roc = now.year - 1911
+                resp   = requests.post(
+                    "https://mops.twse.com.tw/mops/web/ajax_t05st10",
+                    data={"encodeURIComponent":"1","step":"1","firstin":"1",
+                          "off":"1","co_id":"2330","TYPEK":"sii","isnew":"false",
+                          "year": str(yr_roc), "month": f"{now.month:02d}"},
+                    headers={**HEADERS,
+                             'Content-Type':'application/x-www-form-urlencoded',
+                             'Referer':'https://mops.twse.com.tw/mops/web/t05st10'},
+                    timeout=12, verify=False)
+                st.sidebar.write(f"mops HTTP {resp.status_code}")
+                st.sidebar.caption(resp.text[:300])
+            except Exception as e:
+                st.sidebar.error(f"mops 失敗：{e}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
