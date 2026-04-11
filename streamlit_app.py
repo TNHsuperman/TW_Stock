@@ -351,6 +351,30 @@ if finmind_token:
 else:
     st.sidebar.warning("⚠️ 未設定 Token，每天限 600 次請求")
 
+# 診斷：印出 FinMind 原始回應，確認欄位名稱
+if st.sidebar.button("🔧 診斷 FinMind 回應"):
+    with st.sidebar:
+        with st.spinner("測試中..."):
+            start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+            params = {
+                "dataset":    "TaiwanStockPrice",
+                "data_id":    "2330,2317",
+                "start_date": start,
+                "token":      finmind_token,
+            }
+            try:
+                resp = requests.get(FINMIND_URL, params=params, timeout=15)
+                data = resp.json()
+                st.sidebar.write(f"status: {data.get('status')}")
+                st.sidebar.write(f"msg: {data.get('msg', '')}")
+                records = data.get('data', [])
+                st.sidebar.write(f"筆數: {len(records)}")
+                if records:
+                    st.sidebar.write("欄位：", list(records[0].keys()))
+                    st.sidebar.write("第一筆：", records[0])
+            except Exception as e:
+                st.sidebar.error(str(e))
+
 st.sidebar.caption("📡 資料來源：[FinMind](https://finmindtrade.com/)")
 
 
