@@ -230,20 +230,18 @@ def fetch_and_analyze(ticker: str, market: str, strategy: str,
 
 def fetch_yf_pe(ticker: str) -> str:
     """
-    從 mis.twse.com.tw 即時報價 API 取得本益比。
-    診斷確認此 endpoint 在 Streamlit Cloud 可用。
-    回應格式：{"msgArray":[{"@":"2330.tw","pe":"21.5",...}]}
+    從 mis.twse.com.tw 即時報價取得本益比。
+    診斷確認欄位名稱為 'i'（本益比），'it' 為本益比（另一版本）。
     """
     code   = ticker.split('.')[0]
     market = "tse" if ticker.endswith(".TW") else "otc"
     url    = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{code}.tw&json=1&delay=0"
-
     try:
         resp  = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         items = resp.json().get('msgArray', [])
         if items:
-            pe = items[0].get('pe', '').strip()
-            if pe and pe not in ('-', '', '0'):
+            pe = str(items[0].get('i', '')).strip()
+            if pe and pe not in ('-', '', '0', '—'):
                 return pe
     except Exception:
         pass
@@ -252,70 +250,58 @@ def fetch_yf_pe(ticker: str) -> str:
 
 def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
     """
-    從 mops.twse.com.tw（公開資訊觀測站）取得月營收及增減率。
-    診斷確認此 endpoint 在 Streamlit Cloud 可用（HTTP 200）。
-
-    POST 參數：
-        encodeURIComponent=1, step=1, firstin=1,
-        off=1, co_id=股票代碼, TYPEK=sii(上市)/otc(上櫃)
+    從 TWSE 個股月營收 API 取得月增率與年增率。
+    使用 https://www.twse.com.tw/exchangeReport/t05st10（非 rwd 路徑）
     """
     code   = ticker.split('.')[0]
-    market = "sii" if ticker.endswith(".TW") else "otc"
-    url    = "https://mops.twse.com.tw/mops/web/ajax_t05st10"
+    market = "TW" if ticker.endswith(".TW") else "TWO"
+    now    = datetime.now()
 
-    now = datetime.now()
-    # 嘗試本月和上個月
     for delta in [0, 1, 2]:
         target = now.replace(day=1) - timedelta(days=delta * 28)
         yr_roc = target.year - 1911
         month  = target.month
 
-        payload = {
-            "encodeURIComponent": "1",
-            "step":    "1",
-            "firstin": "1",
-            "off":     "1",
-            "co_id":   code,
-            "TYPEK":   market,
-            "isnew":   "false",
-            "year":    str(yr_roc),
-            "month":   f"{month:02d}",
-        }
+        if market == "TW":
+            url    = "https://www.twse.com.tw/exchangeReport/t05st10"
+            params = {"response": "json", "date": f"{yr_roc}{month:02d}01",
+                      "stockNo": code}
+        else:
+            url    = "https://www.tpex.org.tw/web/stock/financial/revenue/monthly_rev_result.php"
+            params = {"l": "zh-tw", "d": f"{yr_roc}/{month:02d}",
+                      "stkno": code}
         try:
-            resp = requests.post(url, data=payload, headers={
-                **HEADERS,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': 'https://mops.twse.com.tw/mops/web/t05st10',
-            }, timeout=12, verify=False)
-
-            if resp.status_code != 200:
+            resp = requests.get(url, params=params, headers=HEADERS,
+                                timeout=10, verify=False)
+            if resp.status_code != 200 or not resp.text.strip():
                 continue
 
-            # MOPS 回傳 HTML 表格，用 pandas 解析
-            tables = pd.read_html(StringIO(resp.text), flavor='lxml')
-            for tbl in tables:
-                # 找包含「月增率」或「增減率」的表格
-                cols = [str(c) for c in tbl.columns]
-                flat = " ".join(cols)
-                if '增' in flat or '月' in flat:
-                    # 通常第一筆資料列包含當月數字
-                    for _, row in tbl.iterrows():
-                        vals = [str(v) for v in row.values]
-                        # 找月增率（通常是第4或5欄，格式如 +12.34 或 -5.67）
-                        nums = []
-                        for v in vals:
-                            v = v.replace(',', '').replace('%', '').strip()
-                            try:
-                                n = float(v)
-                                nums.append(n)
-                            except Exception:
-                                nums.append(None)
-                        # 月增率通常在倒數第2~3個數值欄位
-                        valid = [n for n in nums if n is not None]
-                        if len(valid) >= 3:
-                            mom = f"{valid[-2]:+.1f}%"
-                            yoy = f"{valid[-1]:+.1f}%"
-                            return mom, yoy
+            # 嘗試解析 JSON
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+
+            if market == "TW":
+                rows = data.get('data', [])
+            else:
+                rows = data.get('aaData', [])
+
+            if not rows:
+                continue
+
+            row = rows[0]
+            # TWSE t05st10 欄位順序：
+            # 0:年月, 1:當月, 2:上月, 3:去年同月, 4:月增率, 5:年增率, ...
+            try:
+                mom_raw = str(row[4]).replace(',', '').replace('%', '').strip()
+                yoy_raw = str(row[5]).replace(',', '').replace('%', '').strip()
+                mom = f"{float(mom_raw):+.1f}%"
+                yoy = f"{float(yoy_raw):+.1f}%"
+                return mom, yoy
+            except Exception:
+                continue
+
         except Exception:
             continue
 
@@ -514,47 +500,17 @@ min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 st.sidebar.markdown("---")
 
 # 診斷按鈕
-if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
+if st.sidebar.button("🔧 診斷連線"):
     with st.sidebar:
         with st.spinner("測試中..."):
             get_yf_cookie_and_crumb.clear()
             cookies, _ = get_yf_cookie_and_crumb()
-
             df_test = fetch_yf_history("2330.TW", days=5)
-            if df_test.empty:
-                st.sidebar.error("❌ 歷史資料失敗")
-            else:
-                st.sidebar.success(f"✅ 歷史資料：收盤 {df_test['Close'].iloc[-1]:.1f}")
-
-            # 印出 mis.twse 所有欄位的實際值
-            try:
-                resp  = requests.get(
-                    "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",
-                    headers=HEADERS, timeout=8, verify=False)
-                items = resp.json().get('msgArray', [])
-                if items:
-                    st.sidebar.write("mis.twse 欄位值（全部）：")
-                    st.sidebar.json(items[0])
-            except Exception as e:
-                st.sidebar.error(f"mis.twse 失敗：{e}")
-
-            # 測試 mops 月營收
-            try:
-                now    = datetime.now()
-                yr_roc = now.year - 1911
-                resp   = requests.post(
-                    "https://mops.twse.com.tw/mops/web/ajax_t05st10",
-                    data={"encodeURIComponent":"1","step":"1","firstin":"1",
-                          "off":"1","co_id":"2330","TYPEK":"sii","isnew":"false",
-                          "year": str(yr_roc), "month": f"{now.month:02d}"},
-                    headers={**HEADERS,
-                             'Content-Type':'application/x-www-form-urlencoded',
-                             'Referer':'https://mops.twse.com.tw/mops/web/t05st10'},
-                    timeout=12, verify=False)
-                st.sidebar.write(f"mops HTTP {resp.status_code}")
-                st.sidebar.caption(resp.text[:300])
-            except Exception as e:
-                st.sidebar.error(f"mops 失敗：{e}")
+            st.sidebar.write("歷史資料：", "✅" if not df_test.empty else "❌")
+            pe = fetch_yf_pe("2330.TW")
+            st.sidebar.write(f"本益比：{pe}")
+            qoq, yoy = fetch_revenue_growth("2330.TW")
+            st.sidebar.write(f"月增率：{qoq}，年增率：{yoy}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
