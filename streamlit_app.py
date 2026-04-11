@@ -67,22 +67,42 @@ def get_stock_info_map():
 
 def diagnose_api() -> dict:
     """
-    測試各個 API endpoint 是否可以從 Streamlit Cloud 連線，
-    回傳診斷結果供使用者參考。
+    測試各個 API endpoint，並顯示原始回應內容前 200 字元，
+    方便判斷是被 WAF 擋截、需要 Cookie、還是其他問題。
     """
     results = {}
 
-    # 測試 TWSE STOCK_DAY（2330 台積電，最近一個月）
+    # 測試 TWSE STOCK_DAY（2330 台積電）
     try:
         date_str = datetime.now().strftime('%Y%m01')
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo=2330&date={date_str}"
         resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        data = resp.json()
-        stat = data.get('stat', 'unknown')
-        row_count = len(data.get('data', []))
-        results['TWSE STOCK_DAY'] = f"✅ HTTP {resp.status_code}, stat={stat}, rows={row_count}"
+        raw = resp.text[:200].strip()
+        try:
+            data = resp.json()
+            stat = data.get('stat', 'unknown')
+            rows = len(data.get('data', []))
+            results['TWSE STOCK_DAY'] = f"✅ HTTP {resp.status_code}, stat={stat}, rows={rows}"
+        except Exception:
+            results['TWSE STOCK_DAY'] = f"⚠️ HTTP {resp.status_code}, body={repr(raw)}"
     except Exception as e:
-        results['TWSE STOCK_DAY'] = f"❌ {type(e).__name__}: {str(e)[:80]}"
+        results['TWSE STOCK_DAY'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
+
+    # 測試 TWSE STOCK_DAY（用 http 而非 https）
+    try:
+        date_str = datetime.now().strftime('%Y%m01')
+        url = f"http://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo=2330&date={date_str}"
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False, allow_redirects=True)
+        raw = resp.text[:200].strip()
+        try:
+            data = resp.json()
+            stat = data.get('stat', 'unknown')
+            rows = len(data.get('data', []))
+            results['TWSE STOCK_DAY (http)'] = f"✅ HTTP {resp.status_code}, stat={stat}, rows={rows}"
+        except Exception:
+            results['TWSE STOCK_DAY (http)'] = f"⚠️ HTTP {resp.status_code}, body={repr(raw)}"
+    except Exception as e:
+        results['TWSE STOCK_DAY (http)'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
 
     # 測試 TPEX
     try:
@@ -90,19 +110,38 @@ def diagnose_api() -> dict:
         mo = datetime.now().month
         url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={yr_roc}/{mo:02d}&stkno=6488&s=0,asc"
         resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        data = resp.json()
-        row_count = len(data.get('aaData', []))
-        results['TPEX STOCK_DAY'] = f"✅ HTTP {resp.status_code}, rows={row_count}"
+        raw = resp.text[:200].strip()
+        try:
+            data = resp.json()
+            rows = len(data.get('aaData', []))
+            results['TPEX STOCK_DAY'] = f"✅ HTTP {resp.status_code}, rows={rows}"
+        except Exception:
+            results['TPEX STOCK_DAY'] = f"⚠️ HTTP {resp.status_code}, body={repr(raw)}"
     except Exception as e:
-        results['TPEX STOCK_DAY'] = f"❌ {type(e).__name__}: {str(e)[:80]}"
+        results['TPEX STOCK_DAY'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
 
-    # 測試 TWSE ISIN（股票清單來源）
+    # 測試 TWSE 另一個 endpoint
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date=20250101&stockNo=2330&response=json"
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
+        raw = resp.text[:200].strip()
+        try:
+            data = resp.json()
+            stat = data.get('stat', 'unknown')
+            rows = len(data.get('data', []))
+            results['TWSE rwd endpoint'] = f"✅ HTTP {resp.status_code}, stat={stat}, rows={rows}"
+        except Exception:
+            results['TWSE rwd endpoint'] = f"⚠️ HTTP {resp.status_code}, body={repr(raw)}"
+    except Exception as e:
+        results['TWSE rwd endpoint'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
+
+    # 測試 TWSE ISIN
     try:
         url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
         resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         results['TWSE ISIN'] = f"✅ HTTP {resp.status_code}, bytes={len(resp.content)}"
     except Exception as e:
-        results['TWSE ISIN'] = f"❌ {type(e).__name__}: {str(e)[:80]}"
+        results['TWSE ISIN'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
 
     return results
 
@@ -121,7 +160,9 @@ def parse_price(s):
 
 def fetch_twse_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
     """
-    回傳 (DataFrame, 錯誤訊息)，方便除錯。
+    嘗試兩個 TWSE endpoint：
+    1. 舊版：exchangeReport/STOCK_DAY
+    2. 新版：rwd/zh/afterTrading/STOCK_DAY（較新，部分環境需用此版）
     """
     all_rows = []
     last_error = ""
@@ -129,47 +170,56 @@ def fetch_twse_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
     for i in range(months, -1, -1):
         target   = datetime.now().replace(day=1) - timedelta(days=i * 28)
         date_str = target.strftime('%Y%m01')
-        url = (f"https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-               f"?response=json&stockNo={code}&date={date_str}")
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
-            if resp.status_code != 200:
-                last_error = f"HTTP {resp.status_code}"
-                time.sleep(0.1)
-                continue
-            data = resp.json()
-            if data.get('stat') != 'OK':
-                last_error = f"stat={data.get('stat')}"
-                time.sleep(0.1)
-                continue
-            fields = data.get('fields', [])
-            idx = {
-                'date':  fields.index('日期')   if '日期'   in fields else 0,
-                'vol':   fields.index('成交股數') if '成交股數' in fields else 1,
-                'open':  fields.index('開盤價') if '開盤價'  in fields else 3,
-                'high':  fields.index('最高價') if '最高價'  in fields else 4,
-                'low':   fields.index('最低價') if '最低價'  in fields else 5,
-                'close': fields.index('收盤價') if '收盤價'  in fields else 6,
-            }
-            for row in data.get('data', []):
-                try:
-                    parts = str(row[idx['date']]).split('/')
-                    if len(parts) != 3:
-                        continue
-                    o = parse_price(row[idx['open']])
-                    h = parse_price(row[idx['high']])
-                    l = parse_price(row[idx['low']])
-                    c = parse_price(row[idx['close']])
-                    v = parse_price(row[idx['vol']])
-                    if all(x is not None for x in [o, h, l, c, v]):
-                        all_rows.append({
-                            'Date':  f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
-                            'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
-                        })
-                except Exception:
+
+        # 嘗試兩個 endpoint，哪個有資料就用哪個
+        endpoints = [
+            f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={code}&date={date_str}",
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date={date_str}&stockNo={code}&response=json",
+        ]
+
+        got_data = False
+        for url in endpoints:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
+                if resp.status_code != 200 or not resp.text.strip():
                     continue
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:60]}"
+                data = resp.json()
+                if data.get('stat') != 'OK':
+                    continue
+                fields = data.get('fields', [])
+                idx = {
+                    'date':  fields.index('日期')   if '日期'   in fields else 0,
+                    'vol':   fields.index('成交股數') if '成交股數' in fields else 1,
+                    'open':  fields.index('開盤價') if '開盤價'  in fields else 3,
+                    'high':  fields.index('最高價') if '最高價'  in fields else 4,
+                    'low':   fields.index('最低價') if '最低價'  in fields else 5,
+                    'close': fields.index('收盤價') if '收盤價'  in fields else 6,
+                }
+                for row in data.get('data', []):
+                    try:
+                        parts = str(row[idx['date']]).split('/')
+                        if len(parts) != 3:
+                            continue
+                        o = parse_price(row[idx['open']])
+                        h = parse_price(row[idx['high']])
+                        l = parse_price(row[idx['low']])
+                        c = parse_price(row[idx['close']])
+                        v = parse_price(row[idx['vol']])
+                        if all(x is not None for x in [o, h, l, c, v]):
+                            all_rows.append({
+                                'Date':  f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
+                                'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
+                            })
+                    except Exception:
+                        continue
+                got_data = True
+                break  # 成功就跳出 endpoint 迴圈
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {str(e)[:60]}"
+                continue
+
+        if not got_data:
+            time.sleep(0.1)
         time.sleep(0.08)
 
     if not all_rows:
