@@ -505,18 +505,38 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
             get_yf_cookie_and_crumb.clear()
             cookies, crumb = get_yf_cookie_and_crumb()
             st.sidebar.write(f"Cookie keys: {list(cookies.keys())}")
-            if crumb and '<' not in crumb:
-                st.sidebar.write(f"Crumb: ✅ {crumb[:15]}...")
-            else:
-                st.sidebar.write("Crumb: 不需要（Cookie 已足夠）")
+
+            # 測試歷史價格
             df_test = fetch_yf_history("2330.TW", days=10)
             if df_test.empty:
-                st.sidebar.error("❌ 無法取得 2330.TW 資料")
+                st.sidebar.error("❌ 歷史資料：無法取得 2330.TW")
             else:
-                st.sidebar.success(
-                    f"✅ 2330.TW 成功，{len(df_test)} 筆，"
-                    f"最新收盤：{df_test['Close'].iloc[-1]:.1f}"
-                )
+                st.sidebar.success(f"✅ 歷史資料：{len(df_test)} 筆，收盤 {df_test['Close'].iloc[-1]:.1f}")
+
+            # 測試 quoteSummary（本益比 + 營收）
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Referer': 'https://finance.yahoo.com',
+            }
+            try:
+                url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/2330.TW"
+                resp = requests.get(url,
+                    params={"modules": "summaryDetail,incomeStatementHistoryQuarterly"},
+                    headers=headers, cookies=cookies, timeout=10)
+                raw = resp.text[:300]
+                try:
+                    data = resp.json()
+                    result = data.get('quoteSummary', {}).get('result', [{}])
+                    pe = result[0].get('summaryDetail', {}).get('trailingPE', {}).get('fmt', 'N/A') if result else 'N/A'
+                    stmts = result[0].get('incomeStatementHistoryQuarterly', {}).get('incomeStatementHistory', []) if result else []
+                    st.sidebar.success(f"✅ quoteSummary：PE={pe}, 季報筆數={len(stmts)}")
+                    if stmts:
+                        st.sidebar.write("第一季欄位：", list(stmts[0].keys()))
+                except Exception as e:
+                    st.sidebar.error(f"❌ quoteSummary JSON 解析失敗：{e}")
+                    st.sidebar.write(f"原始回應：{raw}")
+            except Exception as e:
+                st.sidebar.error(f"❌ quoteSummary 請求失敗：{e}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
