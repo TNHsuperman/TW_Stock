@@ -544,14 +544,11 @@ else:
             f"⚠️ {empty_cnt} 支無資料。Cookie 可能過期，請重新整理頁面後再試。"
         )
     elif not res_df.empty:
-        # enrich 必須在 st.rerun() 之前完成並存入 session state
-        # 若放在 rerun 後面，rerun 會中斷執行導致欄位永遠不會被加入
         res_df = enrich_results(res_df, status_text)
         status_text.text(f"🎉 完成！找到 {len(res_df)} 支符合條件標的。")
     else:
         status_text.text("🎉 完成！找到 0 支符合條件標的。")
 
-    # 確保 enrich 完成後才存入並觸發 rerun
     st.session_state['scan_results'] = res_df
     st.session_state['is_scanning']  = False
     st.rerun()
@@ -563,6 +560,22 @@ else:
 
 if not st.session_state['scan_results'].empty:
     df_raw = st.session_state['scan_results']
+
+    # 顯示目前 session 內的欄位（除錯用，確認 enrich 有無執行）
+    current_cols = list(df_raw.columns)
+    has_enrich = '本益比' in current_cols
+
+    col_btn1, col_btn2 = st.columns([3, 1])
+    with col_btn2:
+        if not has_enrich:
+            if st.button("📊 補充本益比/營收/題材", use_container_width=True):
+                status_ph = st.empty()
+                df_enriched = enrich_results(df_raw, status_ph)
+                st.session_state['scan_results'] = df_enriched
+                status_ph.empty()
+                st.rerun()
+        else:
+            st.caption(f"欄位：{current_cols}")
     selected_industry = st.selectbox(
         "🎯 篩選類股：",
         ["全部"] + sorted(df_raw["類股"].unique().tolist())
