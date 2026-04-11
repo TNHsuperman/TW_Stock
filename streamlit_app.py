@@ -524,23 +524,29 @@ if st.sidebar.button("🔧 診斷連線"):
             df_test = fetch_yf_history("2330.TW", days=5)
             st.sidebar.write("歷史資料：", "✅" if not df_test.empty else "❌")
             pe = fetch_yf_pe("2330.TW")
-            st.sidebar.write(f"本益比：{pe}")
+            st.sidebar.write(f"本益比(mis.twse)：{pe}")
 
-            # 測試各個月營收路徑
-            now    = datetime.now()
-            yr_roc = now.year - 1911
-            rev_urls = {
-                "zh/trading/historical": f"https://www.twse.com.tw/zh/trading/historical/t05st10.html?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
-                "fund/T05ST10":          f"https://www.twse.com.tw/fund/T05ST10?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
-                "pcversion/t05st10":     f"https://www.twse.com.tw/pcversion/zh/trading/historical/t05st10?response=json&date={yr_roc}{now.month:02d}01&stockNo=2330",
+            # 測試 Goodinfo
+            goodinfo_urls = {
+                "Goodinfo 個股基本":
+                    "https://goodinfo.tw/tw/StockInfo.asp?STOCK_ID=2330",
+                "Goodinfo 月營收":
+                    "https://goodinfo.tw/tw/ShowSaleMonChart.asp?STOCK_ID=2330",
             }
-            for name, url in rev_urls.items():
+            for name, url in goodinfo_urls.items():
                 try:
-                    r = requests.get(url, headers=HEADERS, timeout=8, verify=False)
-                    body = r.text[:100].replace('\n',' ')
-                    st.sidebar.caption(f"{name}: HTTP {r.status_code} | {body}")
+                    r = requests.get(url, headers={
+                        **HEADERS,
+                        'Accept': 'text/html,application/xhtml+xml',
+                        'Accept-Language': 'zh-TW,zh;q=0.9',
+                        'Referer': 'https://goodinfo.tw/tw/index.asp',
+                    }, timeout=10, verify=False)
+                    body = r.text[:150].replace('\n', ' ')
+                    st.sidebar.write(f"**{name}**")
+                    st.sidebar.caption(f"HTTP {r.status_code} | {len(r.text)} bytes | {body}")
                 except Exception as e:
-                    st.sidebar.caption(f"{name}: ❌ {str(e)[:50]}")
+                    st.sidebar.write(f"**{name}**")
+                    st.sidebar.caption(f"❌ {str(e)[:80]}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
