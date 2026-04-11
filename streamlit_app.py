@@ -76,7 +76,7 @@ def diagnose_api() -> dict:
     try:
         date_str = datetime.now().strftime('%Y%m01')
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo=2330&date={date_str}"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         data = resp.json()
         stat = data.get('stat', 'unknown')
         row_count = len(data.get('data', []))
@@ -89,7 +89,7 @@ def diagnose_api() -> dict:
         yr_roc = datetime.now().year - 1911
         mo = datetime.now().month
         url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={yr_roc}/{mo:02d}&stkno=6488&s=0,asc"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         data = resp.json()
         row_count = len(data.get('aaData', []))
         results['TPEX STOCK_DAY'] = f"✅ HTTP {resp.status_code}, rows={row_count}"
@@ -132,7 +132,7 @@ def fetch_twse_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
         url = (f"https://www.twse.com.tw/exchangeReport/STOCK_DAY"
                f"?response=json&stockNo={code}&date={date_str}")
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=12)
+            resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code}"
                 time.sleep(0.1)
@@ -191,7 +191,7 @@ def fetch_tpex_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
         url = (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
                f"st43_result.php?l=zh-tw&d={date_str}&stkno={code}&s=0,asc")
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=12)
+            resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code}"
                 time.sleep(0.1)
