@@ -18,7 +18,7 @@ import yfinance as yf
 # 1. 基礎設定
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股 30/45/60MA 策略選股儀表板 v6.0", layout="wide")
+st.set_page_config(page_title="台股 30/45/60MA 量價選股儀表板", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -76,14 +76,14 @@ def fetch_deep_info(ticker: str) -> dict:
     return res
 
 # ============================================================
-# 3. 技術分析掃描 (30/45/60 MA 策略 + 當日成交量)
+# 3. 技術分析掃描 (30/45/60 MA 策略 + 成交量變動)
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
     """
     1. 均線多頭: 30MA > 45MA > 60MA
     2. 乖離限制: 收盤價與 30MA 乖離 <= bias_limit
-    3. 紀錄當日成交量
+    3. 成交量變動: 計算今日與昨日之百分比
     """
     p2, p1 = int(time.time()), int((datetime.now() - timedelta(days=150)).timestamp())
     try:
@@ -95,10 +95,19 @@ def run_strategy_check(s, bias_limit, vol_limit):
         
         if len(c_series) < 65: return None
         
-        curr_vol = int(v_series.iloc[-1] / 1000) # 當日成交量 (張)
+        # 成交量計算
+        vol_today = v_series.iloc[-1]
+        vol_yesterday = v_series.iloc[-2]
+        
+        if vol_yesterday > 0:
+            vol_change_pct = ((vol_today - vol_yesterday) / vol_yesterday) * 100
+        else:
+            vol_change_pct = 0.0
+            
+        curr_vol_int = int(vol_today / 1000) # 今日成交量 (張)
         avg_vol_5d = v_series.tail(5).mean() / 1000 # 5日均量
         
-        # 門檻過濾
+        # 門檻過濾 (以5日均量為準)
         if avg_vol_5d < vol_limit: return None
         
         ma30 = c_series.rolling(30).mean().iloc[-1]
@@ -114,7 +123,8 @@ def run_strategy_check(s, bias_limit, vol_limit):
                 **s, 
                 "收盤": round(curr_price, 2), 
                 "乖離30MA(%)": round(bias_30, 2),
-                "成交量(張)": curr_vol
+                "成交量(張)": curr_vol_int,
+                "量變動(%)": f"{vol_change_pct:+.1f}%"
             }
     except: return None
     return None
@@ -127,7 +137,7 @@ st.sidebar.header("🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
-if st.button("🚀 開始全市場掃描 (30/45/60 MA)", use_container_width=True, disabled=st.session_state.is_scanning):
+if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
     st.session_state.is_scanning = True
     st.rerun()
 
@@ -154,7 +164,7 @@ if st.session_state.is_scanning:
 
     # 第一階段：技術過濾
     initial_hits = []
-    status.text(f"🔍 正在篩選符合技術面標的...")
+    status.text(f"🔍 正在篩選符合 30/45/60MA 趨勢之標的...")
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
@@ -191,10 +201,10 @@ if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results
     st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     
-    # 重新排列欄位並顯示
-    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "本益比", "營收月增", "營收年增", "industry"]
+    # 顯示欄位
+    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     st.dataframe(df[show_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"}), 
                  use_container_width=True, hide_index=True)
 else:
     if not st.session_state.is_scanning:
-        st.info("💡 準備就緒，點擊上方按鈕執行選股。")
+        st.info("💡 點擊按鈕執行選股。")
