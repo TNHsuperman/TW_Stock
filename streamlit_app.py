@@ -230,19 +230,41 @@ def fetch_and_analyze(ticker: str, market: str, strategy: str,
 
 def fetch_yf_pe(ticker: str) -> str:
     """
-    從 mis.twse.com.tw 即時報價取得本益比。
-    診斷確認欄位名稱為 'i'（本益比），'it' 為本益比（另一版本）。
+    從 Yahoo 台灣股市網頁爬取本益比。
+    URL: https://tw.stock.yahoo.com/quote/{ticker}
+    頁面上顯示「本益比」欄位，用 regex 擷取數值。
     """
-    code   = ticker.split('.')[0]
-    market = "tse" if ticker.endswith(".TW") else "otc"
-    url    = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{code}.tw&json=1&delay=0"
+    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
+    headers = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36'),
+        'Accept-Language': 'zh-TW,zh;q=0.9',
+        'Referer': 'https://tw.stock.yahoo.com/',
+    }
     try:
-        resp  = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        items = resp.json().get('msgArray', [])
-        if items:
-            pe = str(items[0].get('i', '')).strip()
-            if pe and pe not in ('-', '', '0', '—'):
-                return pe
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return "N/A"
+
+        # 用 regex 從 HTML 中擷取本益比數值
+        # 頁面結構：本益比</span><span ...>30.19</span>
+        import re
+        # 方法一：找「本益比」後面的數字
+        match = re.search(r'本益比[^<]*</[^>]+>\s*<[^>]+>([0-9]+\.?[0-9]*)', resp.text)
+        if match:
+            return match.group(1)
+
+        # 方法二：找 JSON 資料中的 pe 欄位
+        match = re.search(r'"pe"\s*:\s*([0-9]+\.?[0-9]*)', resp.text)
+        if match:
+            return match.group(1)
+
+        # 方法三：找 priceToEarnings
+        match = re.search(r'"priceToEarnings"\s*:\s*([0-9]+\.?[0-9]*)', resp.text)
+        if match:
+            return match.group(1)
+
     except Exception:
         pass
     return "N/A"
@@ -524,22 +546,9 @@ if st.sidebar.button("🔧 診斷連線"):
             df_test = fetch_yf_history("2330.TW", days=5)
             st.sidebar.write("歷史資料：", "✅" if not df_test.empty else "❌")
 
-            # 印出 mis.twse 本益比相關欄位的實際值（多支股票比較）
-            test_stocks = [("tse", "2330"), ("tse", "2317"), ("tse", "2412"), ("otc", "6488")]
-            for market, code in test_stocks:
-                try:
-                    resp  = requests.get(
-                        f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{code}.tw&json=1&delay=0",
-                        headers=HEADERS, timeout=8, verify=False)
-                    items = resp.json().get('msgArray', [])
-                    if items:
-                        d = items[0]
-                        st.sidebar.write(
-                            f"**{d.get('n',code)}** i={d.get('i','?')} "
-                            f"it={d.get('it','?')} z={d.get('z','?')} y={d.get('y','?')}"
-                        )
-                except Exception as e:
-                    st.sidebar.caption(f"{code}: {e}")
+            for t in ["2330.TW", "2317.TW", "2412.TW"]:
+                pe = fetch_yf_pe(t)
+                st.sidebar.write(f"{t} 本益比：{pe}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
