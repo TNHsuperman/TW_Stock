@@ -76,11 +76,15 @@ def get_stock_info_map():
 #   這樣就不會被當成機器人封鎖。
 # ============================================================
 
-@st.cache_data(ttl=3600)  # Cookie 快取 1 小時
+@st.cache_data(ttl=3600)
 def get_yf_cookie_and_crumb() -> tuple[dict, str]:
     """
     取得 Yahoo Finance 的 Cookie 和 Crumb。
-    Cookie 有效期約數小時，快取 1 小時確保不過期。
+    
+    Yahoo Finance 2024 年後改版，crumb 取得方式：
+    1. 先訪問 https://fc.yahoo.com 取得 Cookie
+    2. 再打 https://query1.finance.yahoo.com/v1/test/csrfToken
+       帶上 Cookie，回傳純文字 crumb（不是 JSON，不是 HTML）
     """
     session = requests.Session()
     session.headers.update({
@@ -88,41 +92,35 @@ def get_yf_cookie_and_crumb() -> tuple[dict, str]:
                        'AppleWebKit/537.36 (KHTML, like Gecko) '
                        'Chrome/124.0.0.0 Safari/537.36'),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Language': 'en-US,en;q=0.9',
     })
 
-    # 步驟 1：訪問 Yahoo Finance 首頁取得 Cookie
-    try:
-        resp = session.get('https://fc.yahoo.com', timeout=10)
-    except Exception:
-        pass
-    try:
-        resp = session.get('https://finance.yahoo.com', timeout=10)
-    except Exception:
-        pass
+    # 步驟 1：取得 Cookie
+    for url in ['https://fc.yahoo.com', 'https://finance.yahoo.com/quote/AAPL']:
+        try:
+            session.get(url, timeout=10, allow_redirects=True)
+        except Exception:
+            pass
+        time.sleep(0.3)
 
     cookies = dict(session.cookies)
 
-    # 步驟 2：用 Cookie 換取 Crumb
+    # 步驟 2：取得 Crumb（嘗試多個 endpoint）
     crumb = ""
-    try:
-        resp = session.get(
-            'https://query1.finance.yahoo.com/v1/test/csrfToken',
-            timeout=10
-        )
-        crumb = resp.text.strip()
-    except Exception:
-        pass
-
-    if not crumb:
+    crumb_urls = [
+        'https://query1.finance.yahoo.com/v1/test/csrfToken',
+        'https://query2.finance.yahoo.com/v1/test/csrfToken',
+    ]
+    for url in crumb_urls:
         try:
-            resp = session.get(
-                'https://query2.finance.yahoo.com/v1/test/csrfToken',
-                timeout=10
-            )
-            crumb = resp.text.strip()
+            resp = session.get(url, timeout=10)
+            text = resp.text.strip()
+            # 正確的 crumb 是純文字，長度約 10~20 字元，不含 HTML 標籤
+            if text and '<' not in text and len(text) < 50:
+                crumb = text
+                break
         except Exception:
-            pass
+            continue
 
     return cookies, crumb
 
@@ -311,9 +309,14 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
     with st.sidebar:
         with st.spinner("測試中..."):
+            get_yf_cookie_and_crumb.clear()  # 強制重新取得，不用快取
             cookies, crumb = get_yf_cookie_and_crumb()
             st.sidebar.write(f"Cookie 數量: {len(cookies)}")
-            st.sidebar.write(f"Crumb: {crumb[:20] + '...' if len(crumb) > 20 else crumb or '(空)'}")
+            st.sidebar.write(f"Cookie keys: {list(cookies.keys())}")
+            if crumb and '<' not in crumb:
+                st.sidebar.success(f"✅ Crumb: {crumb[:15]}...")
+            else:
+                st.sidebar.error(f"❌ Crumb 無效: {crumb[:50]}")
             df_test = fetch_yf_history("2330.TW", days=10)
             if df_test.empty:
                 st.sidebar.error("❌ 無法取得 2330.TW 資料")
