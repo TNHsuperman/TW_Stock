@@ -523,30 +523,23 @@ if st.sidebar.button("🔧 診斷連線"):
             cookies, _ = get_yf_cookie_and_crumb()
             df_test = fetch_yf_history("2330.TW", days=5)
             st.sidebar.write("歷史資料：", "✅" if not df_test.empty else "❌")
-            pe = fetch_yf_pe("2330.TW")
-            st.sidebar.write(f"本益比(mis.twse)：{pe}")
 
-            # 測試 Goodinfo
-            goodinfo_urls = {
-                "Goodinfo 個股基本":
-                    "https://goodinfo.tw/tw/StockInfo.asp?STOCK_ID=2330",
-                "Goodinfo 月營收":
-                    "https://goodinfo.tw/tw/ShowSaleMonChart.asp?STOCK_ID=2330",
-            }
-            for name, url in goodinfo_urls.items():
+            # 印出 mis.twse 本益比相關欄位的實際值（多支股票比較）
+            test_stocks = [("tse", "2330"), ("tse", "2317"), ("tse", "2412"), ("otc", "6488")]
+            for market, code in test_stocks:
                 try:
-                    r = requests.get(url, headers={
-                        **HEADERS,
-                        'Accept': 'text/html,application/xhtml+xml',
-                        'Accept-Language': 'zh-TW,zh;q=0.9',
-                        'Referer': 'https://goodinfo.tw/tw/index.asp',
-                    }, timeout=10, verify=False)
-                    body = r.text[:150].replace('\n', ' ')
-                    st.sidebar.write(f"**{name}**")
-                    st.sidebar.caption(f"HTTP {r.status_code} | {len(r.text)} bytes | {body}")
+                    resp  = requests.get(
+                        f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{code}.tw&json=1&delay=0",
+                        headers=HEADERS, timeout=8, verify=False)
+                    items = resp.json().get('msgArray', [])
+                    if items:
+                        d = items[0]
+                        st.sidebar.write(
+                            f"**{d.get('n',code)}** i={d.get('i','?')} "
+                            f"it={d.get('it','?')} z={d.get('z','?')} y={d.get('y','?')}"
+                        )
                 except Exception as e:
-                    st.sidebar.write(f"**{name}**")
-                    st.sidebar.caption(f"❌ {str(e)[:80]}")
+                    st.sidebar.caption(f"{code}: {e}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
