@@ -104,21 +104,24 @@ def diagnose_api() -> dict:
     except Exception as e:
         results['TWSE STOCK_DAY (http)'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
 
-    # 測試 TPEX
-    try:
-        yr_roc = datetime.now().year - 1911
-        mo = datetime.now().month
-        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={yr_roc}/{mo:02d}&stkno=6488&s=0,asc"
-        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        raw = resp.text[:200].strip()
+    # 測試 TPEX — 嘗試多個 endpoint
+    tpex_urls = {
+        'TPEX v1': f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={datetime.now().year - 1911}/{datetime.now().month:02d}&stkno=6488&s=0,asc",
+        'TPEX v2': f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={datetime.now().year - 1911}/{datetime.now().month:02d}&stkno=6488",
+        'TPEX v3': f"https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingInfo?d={datetime.now().year - 1911}/{datetime.now().month:02d}&stkno=6488&s=0,asc&o=json",
+    }
+    for name, url in tpex_urls.items():
         try:
-            data = resp.json()
-            rows = len(data.get('aaData', []))
-            results['TPEX STOCK_DAY'] = f"✅ HTTP {resp.status_code}, rows={rows}"
-        except Exception:
-            results['TPEX STOCK_DAY'] = f"⚠️ HTTP {resp.status_code}, body={repr(raw)}"
-    except Exception as e:
-        results['TPEX STOCK_DAY'] = f"❌ {type(e).__name__}: {str(e)[:120]}"
+            resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
+            raw = resp.text[:120].strip()
+            try:
+                data = resp.json()
+                rows = len(data.get('aaData', data.get('data', [])))
+                results[name] = f"✅ HTTP {resp.status_code}, rows={rows}"
+            except Exception:
+                results[name] = f"⚠️ HTTP {resp.status_code}, body={repr(raw[:80])}"
+        except Exception as e:
+            results[name] = f"❌ {type(e).__name__}: {str(e)[:80]}"
 
     # 測試 TWSE 另一個 endpoint
     try:
@@ -231,41 +234,69 @@ def fetch_twse_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
 
 
 def fetch_tpex_history(code: str, months: int = 4) -> tuple[pd.DataFrame, str]:
+    """
+    嘗試多個 TPEX endpoint，哪個有效用哪個。
+    """
     all_rows = []
     last_error = ""
 
     for i in range(months, -1, -1):
         target   = datetime.now().replace(day=1) - timedelta(days=i * 28)
         yr_roc   = target.year - 1911
-        date_str = f"{yr_roc}/{target.month:02d}"
-        url = (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
-               f"st43_result.php?l=zh-tw&d={date_str}&stkno={code}&s=0,asc")
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
-            if resp.status_code != 200:
-                last_error = f"HTTP {resp.status_code}"
-                time.sleep(0.1)
-                continue
-            data = resp.json()
-            for row in data.get('aaData', []):
+        mo       = target.month
+        date_str = f"{yr_roc}/{mo:02d}"
+
+        endpoints = [
+            # 舊版（有些 Cloud 環境可用）
+            f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={date_str}&stkno={code}&s=0,asc",
+            # 新版 API
+            f"https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingInfo?d={date_str}&stkno={code}&s=0,asc&o=json",
+        ]
+
+        got_data = False
+        for url in endpoints:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
+                if resp.status_code != 200 or not resp.text.strip():
+                    continue
+                # 嘗試解析 JSON
                 try:
-                    parts = str(row[0]).split('/')
-                    if len(parts) != 3:
-                        continue
-                    o = parse_price(row[2])
-                    h = parse_price(row[3])
-                    l = parse_price(row[4])
-                    c = parse_price(row[5])
-                    v = parse_price(row[1])
-                    if all(x is not None for x in [o, h, l, c, v]):
-                        all_rows.append({
-                            'Date':  f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
-                            'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
-                        })
+                    data = resp.json()
                 except Exception:
                     continue
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:60]}"
+
+                # 相容兩種格式的 key
+                raw_rows = data.get('aaData') or data.get('data') or []
+                if not raw_rows:
+                    continue
+
+                for row in raw_rows:
+                    try:
+                        # 判斷日期欄格式：民國年 "113/04/01" 或 "113.04.01"
+                        date_raw = str(row[0]).replace('.', '/')
+                        parts = date_raw.split('/')
+                        if len(parts) != 3:
+                            continue
+                        o = parse_price(row[2])
+                        h = parse_price(row[3])
+                        l = parse_price(row[4])
+                        c = parse_price(row[5])
+                        v = parse_price(row[1])
+                        if all(x is not None for x in [o, h, l, c, v]):
+                            all_rows.append({
+                                'Date':  f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
+                                'Open': o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
+                            })
+                    except Exception:
+                        continue
+                got_data = True
+                break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {str(e)[:60]}"
+                continue
+
+        if not got_data:
+            time.sleep(0.1)
         time.sleep(0.08)
 
     if not all_rows:
