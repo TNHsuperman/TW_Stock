@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
-import requests
 import numpy as np
+import yfinance as yf
+import requests
 from io import StringIO
 import urllib3
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
@@ -15,9 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="台股智慧選股儀表板（多執行緒版）", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板", layout="wide")
 
-# 初始化 Session State
 if 'scan_results' not in st.session_state:
     st.session_state['scan_results'] = pd.DataFrame()
 if 'is_scanning' not in st.session_state:
@@ -27,7 +26,7 @@ if 'selected_index' not in st.session_state:
 
 
 # ============================================================
-# 2. 股票清單抓取（同步，每日快取）
+# 2. 股票清單抓取
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -70,113 +69,34 @@ def get_stock_info_map():
 
 
 # ============================================================
-# 3. 多執行緒下載核心
+# 3. 單支股票下載 + 分析（在執行緒中執行）
 # ============================================================
 
-# Yahoo Finance CSV 下載網址模板（直接呼叫 API，不經 yfinance 封裝）
-YF_URL = (
-    "https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
-    "?period1={p1}&period2={p2}&interval=1d&events=history"
-)
-
-# 共用的請求標頭，模擬瀏覽器避免被 Yahoo 封鎖
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-def fetch_one(ticker: str, p1: int, p2: int) -> tuple:
+def fetch_and_analyze(ticker: str, strategy: str, min_vol: float) -> dict | None:
     """
-    下載單一股票的歷史日線 CSV 並解析為 DataFrame。
-    此函數會在獨立的執行緒中執行。
+    下載單支股票資料並立即執行策略分析。
+    此函數在獨立執行緒中執行，每支股票獨立處理。
 
-    參數：
-        ticker : Yahoo Finance 股票代碼（如 '2330.TW'）
-        p1/p2  : 資料起迄的 Unix timestamp
+    將下載與分析合併在同一函數的好處：
+    - 下載完立刻分析，不需等所有股票都下載完才開始
+    - 分析完丟棄原始資料，記憶體用量極低
 
-    回傳：
-        (ticker, DataFrame) 或 (ticker, None)（下載或解析失敗時）
-    """
-    url = YF_URL.format(ticker=ticker, p1=p1, p2=p2)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        if resp.status_code != 200:
-            # HTTP 非 200（如 404 找不到、429 被限速）視為失敗
-            return ticker, None
-
-        df = pd.read_csv(StringIO(resp.text), parse_dates=["Date"], index_col="Date")
-        df = df.apply(pd.to_numeric, errors='coerce')  # 非數值轉 NaN
-        df = df.dropna(subset=["Close"])
-        return ticker, df
-
-    except Exception:
-        return ticker, None
-
-
-def fetch_all_threaded(
-    tickers: list,
-    days: int = 160,
-    max_workers: int = 60
-) -> dict:
-    """
-    使用 ThreadPoolExecutor 並行下載所有股票的歷史資料。
-
-    為什麼用多執行緒而非 asyncio？
-    → Streamlit 本身有自己的 event loop，直接呼叫 asyncio.run() 會造成
-      「event loop is already running」衝突導致程式卡死。
-    → ThreadPoolExecutor 完全在同步環境運作，不會與 Streamlit 衝突，
-      對 I/O 密集型任務（網路下載）效果與 asyncio 相近。
-
-    參數：
-        tickers     : 股票代碼列表
-        days        : 下載天數（含假日）
-        max_workers : 最大同時執行緒數（預設 60）
-
-    回傳：
-        dict，key 為 ticker，value 為 DataFrame（失敗的不包含）
-    """
-    p2 = int(datetime.now().timestamp())
-    p1 = int((datetime.now() - timedelta(days=days)).timestamp())
-
-    results = {}
-
-    # ThreadPoolExecutor 自動管理執行緒池，離開 with 區塊後自動清理
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有下載任務，取得 future → ticker 的對應關係
-        future_to_ticker = {
-            executor.submit(fetch_one, t, p1, p2): t
-            for t in tickers
-        }
-        # as_completed 會在每個 future 完成時立即回傳（不等全部完成）
-        for future in as_completed(future_to_ticker):
-            try:
-                ticker, df = future.result()
-                if df is not None and not df.empty:
-                    results[ticker] = df
-            except Exception:
-                continue  # 單一執行緒失敗不影響其他
-
-    return results
-
-
-# ============================================================
-# 4. 技術指標計算與選股邏輯
-# ============================================================
-
-def analyze_ticker(ticker: str, df: pd.DataFrame, strategy: str, min_vol: float) -> dict | None:
-    """
-    對單一股票執行技術指標計算與策略篩選。
-
-    回傳符合條件的結果 dict，或 None（不符合）。
+    回傳符合條件的結果 dict，或 None（不符合 / 下載失敗）
     """
     try:
+        # 用 yfinance 下載單支，穩定性高
+        df = yf.download(ticker, period="150d", progress=False, auto_adjust=True)
+
+        # 處理 MultiIndex 欄位（yfinance 某些版本會產生）
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna(subset=['Close'])
+
         if len(df) < 60:
             return None
 
-        # 近 5 日平均成交量（張）低於門檻則跳過
+        # 近 5 日均量過低則跳過（Volume 為股，除 1000 換算為張）
         if (df['Volume'].tail(5).mean() / 1000) < min_vol:
             return None
 
@@ -185,20 +105,16 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, strategy: str, min_vol: float)
         m45 = float(df['Close'].rolling(45).mean().iloc[-1])
         m60 = float(df['Close'].rolling(60).mean().iloc[-1])
 
-        # 任一均線為 NaN 則跳過（資料頭部不足計算）
         if any(np.isnan(v) for v in [m30, m45, m60]):
             return None
 
-        # 對 30MA 乖離率（%）
         bias_30 = ((close - m30) / m30) * 100
 
         keep = False
         if strategy == "均線多頭回測":
-            # 多頭排列，且股價剛回測貼近 30MA（乖離 < 2%）
             if m30 > m45 > m60 and close > m30 and bias_30 < 2.0:
                 keep = True
         elif strategy == "均線糾結偵測":
-            # 三條均線極度靠近（壓縮蓄勢），乖離 < 2%
             ma_spread = (max(m30, m45, m60) - min(m30, m45, m60)) / min(m30, m45, m60)
             if ma_spread <= 0.02 and abs(bias_30) < 2.0:
                 keep = True
@@ -206,49 +122,63 @@ def analyze_ticker(ticker: str, df: pd.DataFrame, strategy: str, min_vol: float)
         if not keep:
             return None
 
-        return {"close": close, "bias_30": bias_30}
+        return {"ticker": ticker, "close": close, "bias_30": bias_30}
 
     except Exception:
         return None
 
 
 # ============================================================
-# 5. 掃描主流程
+# 4. 掃描主流程
 # ============================================================
 
 def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text):
     """
-    執行完整掃描流程：
-      1. 多執行緒並行下載所有股票歷史資料
-      2. 逐支股票執行技術分析與篩選
-      3. 回傳符合條件的 DataFrame
+    用 ThreadPoolExecutor 並行掃描全市場。
+
+    為什麼 max_workers=8？
+    - Streamlit Cloud 是共享容器，CPU / 網路資源有限
+    - yfinance 每次下載需建立 HTTPS 連線，太多並行會被 Yahoo 限速（429）
+    - 8 條執行緒在 Cloud 環境最穩定，速度約為單執行緒的 5~6 倍
+    - 本機執行可調高至 16~20
     """
+    MAX_WORKERS = 8  # ← 本機可調高至 16，Cloud 建議維持 8
     total = len(all_stocks)
-    status_text.text(f"⬇️  多執行緒下載 {total} 支股票資料中（最多 60 條同時連線）...")
-
-    # ── 步驟 1：並行下載 ──
-    all_data = fetch_all_threaded(all_stocks, days=160, max_workers=60)
-    downloaded = len(all_data)
-
-    status_text.text(f"✅  下載完成（成功 {downloaded} / {total} 支），開始分析...")
-    progress_bar.progress(0.5)  # 下載完成視為 50% 進度
-
-    # ── 步驟 2：逐支分析 ──
+    completed = 0
     results = []
-    for i, (ticker, df) in enumerate(all_data.items()):
-        result = analyze_ticker(ticker, df, strategy, min_vol)
-        if result:
-            stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
-            results.append({
-                "ID":      ticker,
-                "代碼":    ticker.split('.')[0],
-                "名稱":    stock_data["name"],
-                "類股":    stock_data["industry"],
-                "收盤":    round(result["close"], 2),
-                "乖離(%)": round(result["bias_30"], 2),
-            })
-        # 分析進度從 50% 跑到 100%
-        progress_bar.progress(0.5 + 0.5 * (i + 1) / max(downloaded, 1))
+
+    status_text.text(f"🔍 開始掃描 {total} 支股票（{MAX_WORKERS} 條執行緒並行）...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_ticker = {
+            executor.submit(fetch_and_analyze, t, strategy, min_vol): t
+            for t in all_stocks
+        }
+
+        # as_completed：每完成一支立即處理，不等全部跑完
+        for future in as_completed(future_to_ticker):
+            completed += 1
+
+            # 每 50 支更新一次進度，避免過於頻繁的 UI 刷新拖慢速度
+            if completed % 50 == 0 or completed == total:
+                progress_bar.progress(completed / total)
+                status_text.text(f"🔍 掃描進度：{completed} / {total}")
+
+            try:
+                result = future.result()
+                if result:
+                    ticker = result["ticker"]
+                    stock_data = info_map.get(ticker, {"name": "未知", "industry": "其他"})
+                    results.append({
+                        "ID":      ticker,
+                        "代碼":    ticker.split('.')[0],
+                        "名稱":    stock_data["name"],
+                        "類股":    stock_data["industry"],
+                        "收盤":    round(result["close"], 2),
+                        "乖離(%)": round(result["bias_30"], 2),
+                    })
+            except Exception:
+                continue
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
@@ -258,7 +188,7 @@ def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text)
 
 
 # ============================================================
-# 6. 側邊欄 UI
+# 5. 側邊欄 UI
 # ============================================================
 
 st.sidebar.header("⚙️ 策略參數設定")
@@ -278,15 +208,15 @@ min_volume = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "⚡ **多執行緒版**\n\n"
-    "使用 `ThreadPoolExecutor` 並行下載，\n"
-    "同時最多 60 條連線，\n"
-    "避免 Streamlit 的 asyncio 衝突問題。\n"
-    "全市場下載時間約 **20~40 秒**。"
+    "使用 `yfinance` 單支下載 ×\n"
+    "`ThreadPoolExecutor` 8 條並行，\n"
+    "相容 Streamlit Cloud 環境。\n\n"
+    "全市場約需 **3~5 分鐘**。"
 )
 
 
 # ============================================================
-# 7. 掃描按鈕與觸發邏輯
+# 6. 掃描按鈕與觸發邏輯
 # ============================================================
 
 if not st.session_state['is_scanning']:
@@ -312,7 +242,7 @@ else:
 
 
 # ============================================================
-# 8. 結果顯示：清單篩選、股票切換、K 線圖繪製
+# 7. 結果顯示：清單篩選、股票切換、K 線圖繪製
 # ============================================================
 
 if not st.session_state['scan_results'].empty:
@@ -359,17 +289,18 @@ if not st.session_state['scan_results'].empty:
         idx = min(st.session_state['selected_index'], len(df_filtered) - 1)
         row = df_filtered.iloc[idx]
 
-        # ── K 線圖：單支股票下載 ──
+        # ── K 線圖 ──
         with st.spinner(f'載入中... {row["名稱"]} ({row["ID"]})'):
+            df_p = yf.download(row['ID'], period="8mo", progress=False, auto_adjust=True)
 
-            # 單支股票複用 fetch_all_threaded（傳入只有一支的列表）
-            chart_data = fetch_all_threaded([row['ID']], days=240, max_workers=1)
-            df_p = chart_data.get(row['ID'])
+            if isinstance(df_p.columns, pd.MultiIndex):
+                df_p.columns = df_p.columns.get_level_values(0)
 
-            if df_p is None or df_p.empty:
+            df_p = df_p.dropna(subset=['Close'])
+
+            if df_p.empty:
                 st.error("無法載入該股票資料，請稍後再試。")
             else:
-                df_p = df_p.dropna(subset=['Close'])
                 df_p['Date_Str'] = df_p.index.strftime('%Y-%m-%d')
                 df_p['30MA'] = df_p['Close'].rolling(30).mean()
                 df_p['45MA'] = df_p['Close'].rolling(45).mean()
@@ -385,7 +316,6 @@ if not st.session_state['scan_results'].empty:
                     row_heights=row_heights
                 )
 
-                # K 線
                 fig.add_trace(go.Candlestick(
                     x=df_p['Date_Str'],
                     open=df_p['Open'], high=df_p['High'],
@@ -393,14 +323,12 @@ if not st.session_state['scan_results'].empty:
                     name="K線"
                 ), row=1, col=1)
 
-                # 均線
                 for ma, color in zip(['30MA', '45MA', '60MA'], ['#FFA500', '#2E8B57', '#4169E1']):
                     fig.add_trace(go.Scatter(
                         x=df_p['Date_Str'], y=df_p[ma],
                         line=dict(color=color, width=1.5), name=ma
                     ), row=1, col=1)
 
-                # 成交量
                 v_clrs = ['#ef5350' if c >= o else '#26a69a'
                           for c, o in zip(df_p['Close'], df_p['Open'])]
                 fig.add_trace(go.Bar(
@@ -408,7 +336,6 @@ if not st.session_state['scan_results'].empty:
                     marker_color=v_clrs, name="成交量"
                 ), row=2, col=1)
 
-                # RSI
                 if indicator_choice == "RSI (強弱指標)":
                     d = df_p['Close'].diff()
                     rsi = 100 - (100 / (
@@ -422,7 +349,6 @@ if not st.session_state['scan_results'].empty:
                     fig.add_hline(y=70, line_dash="dot", line_color="red",   row=3, col=1)
                     fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
-                # MACD
                 elif indicator_choice == "MACD (趨勢指標)":
                     m_s = df_p['Close'].ewm(span=12).mean() - df_p['Close'].ewm(span=26).mean()
                     h_s = m_s - m_s.ewm(span=9).mean()
@@ -450,4 +376,4 @@ if not st.session_state['scan_results'].empty:
         st.warning("目前篩選條件下無標的。")
 
 else:
-    st.info("💡 提示：點擊「開始全市場掃描」按鈕。多執行緒版下載速度約為原版的 3～5 倍。")
+    st.info("💡 提示：點擊「開始全市場掃描」按鈕。Streamlit Cloud 環境約需 3~5 分鐘完成掃描。")
