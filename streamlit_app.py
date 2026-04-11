@@ -60,11 +60,12 @@ def get_stock_info_map():
 
 
 # ============================================================
-# 3. 歷史資料抓取（強化版：多重備援日期）
+# 3. 核心：TWSE / TPEX 批次月報 API
+#    一次請求 → 全市場整月的每日資料
 # ============================================================
 
 def parse_price(s):
-    """安全轉換價格字串為 float，處理逗號與異常值。"""
+    """安全轉換價格字串，處理逗號、-- 等異常值。"""
     try:
         v = float(str(s).replace(',', '').strip())
         return v if v > 0 else None
@@ -72,68 +73,140 @@ def parse_price(s):
         return None
 
 
-def fetch_twse(code: str, months: int = 4) -> pd.DataFrame:
+@st.cache_data(ttl=3600)
+def get_twse_monthly_all(year: int, month: int) -> pd.DataFrame:
     """
-    抓取上市股票歷史日線。
-    改進：
-    - 不依賴固定欄位索引，改用欄位名稱對應
-    - 抓多一個月作為緩衝，避免月底剛好資料不足
-    - 加入重試機制
+    TWSE「每日收盤行情（全部）」API：
+    https://www.twse.com.tw/exchangeReport/MI_INDEX
+    一次回傳整月所有上市股票的每日成交資料。
+
+    回傳 DataFrame：index=Date, columns=MultiIndex(code, OHLCV)
+    這裡我們只取最後一個交易日的收盤與成交量，用於預篩。
     """
+    date_str = f"{year}{month:02d}01"
+    url = (f"https://www.twse.com.tw/exchangeReport/MI_INDEX"
+           f"?response=json&date={date_str}&type=ALLBUT0999")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        data = resp.json()
+        if data.get('stat') != 'OK':
+            return pd.DataFrame()
+
+        # MI_INDEX 回傳多張表，找含「證券代號」欄位的那張
+        for key in data:
+            if not isinstance(data.get(key), list):
+                continue
+            fields_key = key.replace('data', 'fields') if 'data' in key else None
+            if not fields_key or fields_key not in data:
+                continue
+            fields = data[fields_key]
+            if '證券代號' not in fields or '收盤價' not in fields:
+                continue
+
+            fi_code  = fields.index('證券代號')
+            fi_vol   = fields.index('成交股數') if '成交股數' in fields else None
+            fi_close = fields.index('收盤價')
+
+            rows = []
+            for row in data[key]:
+                try:
+                    code  = str(row[fi_code]).strip()
+                    close = parse_price(row[fi_close])
+                    vol   = parse_price(row[fi_vol]) if fi_vol is not None else None
+                    if len(code) == 4 and code.isdigit() and close:
+                        rows.append({
+                            'code':     code,
+                            'close':    close,
+                            'volume_k': (vol / 1000) if vol else 0,
+                        })
+                except Exception:
+                    continue
+            if rows:
+                return pd.DataFrame(rows).set_index('code')
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_tpex_monthly_all(year: int, month: int) -> pd.DataFrame:
+    """
+    TPEX 月成交資料（全部上櫃股票）。
+    """
+    yr_roc = year - 1911
+    url = (f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/"
+           f"stk_wn1430_result.php?l=zh-tw&d={yr_roc}/{month:02d}&se=AL")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        data = resp.json()
+        rows = []
+        for row in data.get('aaData', []):
+            try:
+                code  = str(row[0]).strip()
+                close = parse_price(row[2])
+                vol   = parse_price(row[8])
+                if len(code) == 4 and code.isdigit() and close:
+                    rows.append({'code': code, 'close': close, 'volume_k': vol or 0})
+            except Exception:
+                continue
+        if rows:
+            return pd.DataFrame(rows).set_index('code')
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+# ============================================================
+# 4. 個股歷史日線（逐月串接）
+# ============================================================
+
+def fetch_twse_history(code: str, months: int = 4) -> pd.DataFrame:
+    """抓取單支上市股票歷史日線，用欄位名稱解析確保正確性。"""
     all_rows = []
-    # 多抓一個月緩衝
-    for i in range(months + 1, -1, -1):
-        target = (datetime.now().replace(day=1) - timedelta(days=i * 28))
+    for i in range(months, -1, -1):
+        target   = datetime.now().replace(day=1) - timedelta(days=i * 28)
         date_str = target.strftime('%Y%m01')
         url = (f"https://www.twse.com.tw/exchangeReport/STOCK_DAY"
                f"?response=json&stockNo={code}&date={date_str}")
-        for attempt in range(2):  # 最多重試 1 次
+        for attempt in range(2):
             try:
                 resp = requests.get(url, headers=HEADERS, timeout=12)
                 if resp.status_code != 200:
                     break
                 data = resp.json()
-
-                # stat 可能是 'OK' 或 'No Data'
-                if data.get('stat') not in ('OK',):
+                if data.get('stat') != 'OK':
                     break
-
                 fields = data.get('fields', [])
-                rows   = data.get('data', [])
-                if not rows:
-                    break
-
-                # 嘗試用欄位名稱定位，找不到則用固定索引
-                idx_date   = fields.index('日期')   if '日期'   in fields else 0
-                idx_vol    = fields.index('成交股數') if '成交股數' in fields else 1
-                idx_open   = fields.index('開盤價') if '開盤價'  in fields else 3
-                idx_high   = fields.index('最高價') if '最高價'  in fields else 4
-                idx_low    = fields.index('最低價') if '最低價'  in fields else 5
-                idx_close  = fields.index('收盤價') if '收盤價'  in fields else 6
-
-                for row in rows:
+                # 用欄位名稱定位，找不到才用預設索引
+                idx = {
+                    'date':  fields.index('日期')   if '日期'   in fields else 0,
+                    'vol':   fields.index('成交股數') if '成交股數' in fields else 1,
+                    'open':  fields.index('開盤價') if '開盤價'  in fields else 3,
+                    'high':  fields.index('最高價') if '最高價'  in fields else 4,
+                    'low':   fields.index('最低價') if '最低價'  in fields else 5,
+                    'close': fields.index('收盤價') if '收盤價'  in fields else 6,
+                }
+                for row in data.get('data', []):
                     try:
-                        parts = str(row[idx_date]).split('/')
+                        parts = str(row[idx['date']]).split('/')
                         if len(parts) != 3:
                             continue
-                        date  = f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
-                        vol   = parse_price(row[idx_vol])
-                        open_ = parse_price(row[idx_open])
-                        high  = parse_price(row[idx_high])
-                        low   = parse_price(row[idx_low])
-                        close = parse_price(row[idx_close])
-                        if all(v is not None for v in [vol, open_, high, low, close]):
+                        o = parse_price(row[idx['open']])
+                        h = parse_price(row[idx['high']])
+                        l = parse_price(row[idx['low']])
+                        c = parse_price(row[idx['close']])
+                        v = parse_price(row[idx['vol']])
+                        if all(x is not None for x in [o, h, l, c, v]):
                             all_rows.append({
-                                'Date': date, 'Volume': vol,
-                                'Open': open_, 'High': high,
-                                'Low': low,    'Close': close,
+                                'Date':   f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
+                                'Open':  o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
                             })
                     except Exception:
                         continue
-                break  # 成功則跳出重試
+                break
             except Exception:
                 if attempt == 0:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
         time.sleep(0.08)
 
     if not all_rows:
@@ -143,12 +216,12 @@ def fetch_twse(code: str, months: int = 4) -> pd.DataFrame:
     return df.sort_values('Date').drop_duplicates('Date').set_index('Date')
 
 
-def fetch_tpex(code: str, months: int = 4) -> pd.DataFrame:
-    """抓取上櫃股票歷史日線（強化版）。"""
+def fetch_tpex_history(code: str, months: int = 4) -> pd.DataFrame:
+    """抓取單支上櫃股票歷史日線。"""
     all_rows = []
-    for i in range(months + 1, -1, -1):
-        target  = (datetime.now().replace(day=1) - timedelta(days=i * 28))
-        yr_roc  = target.year - 1911
+    for i in range(months, -1, -1):
+        target   = datetime.now().replace(day=1) - timedelta(days=i * 28)
+        yr_roc   = target.year - 1911
         date_str = f"{yr_roc}/{target.month:02d}"
         url = (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
                f"st43_result.php?l=zh-tw&d={date_str}&stkno={code}&s=0,asc")
@@ -158,33 +231,27 @@ def fetch_tpex(code: str, months: int = 4) -> pd.DataFrame:
                 if resp.status_code != 200:
                     break
                 data = resp.json()
-                aa = data.get('aaData', [])
-                if not aa:
-                    break
-                for row in aa:
+                for row in data.get('aaData', []):
                     try:
-                        # TPEX 欄位：日期,成交量,開盤,最高,最低,收盤,...
                         parts = str(row[0]).split('/')
                         if len(parts) != 3:
                             continue
-                        date  = f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}"
-                        vol   = parse_price(row[1])
-                        open_ = parse_price(row[2])
-                        high  = parse_price(row[3])
-                        low   = parse_price(row[4])
-                        close = parse_price(row[5])
-                        if all(v is not None for v in [vol, open_, high, low, close]):
+                        o = parse_price(row[2])
+                        h = parse_price(row[3])
+                        l = parse_price(row[4])
+                        c = parse_price(row[5])
+                        v = parse_price(row[1])
+                        if all(x is not None for x in [o, h, l, c, v]):
                             all_rows.append({
-                                'Date': date, 'Volume': vol,
-                                'Open': open_, 'High': high,
-                                'Low': low,    'Close': close,
+                                'Date':   f"{int(parts[0])+1911}-{parts[1]}-{parts[2]}",
+                                'Open':  o, 'High': h, 'Low': l, 'Close': c, 'Volume': v
                             })
                     except Exception:
                         continue
                 break
             except Exception:
                 if attempt == 0:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
         time.sleep(0.08)
 
     if not all_rows:
@@ -195,79 +262,7 @@ def fetch_tpex(code: str, months: int = 4) -> pd.DataFrame:
 
 
 def fetch_history(code: str, market: str, months: int = 4) -> pd.DataFrame:
-    if market == "TW":
-        return fetch_twse(code, months)
-    else:
-        return fetch_tpex(code, months)
-
-
-# ============================================================
-# 4. 快照預篩（一次拿全市場資料）
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def get_market_snapshot() -> pd.DataFrame:
-    """
-    用單一 API 取得全市場最新收盤與成交量，用於快速預篩。
-    改進：解析邏輯更嚴謹，並加入 TWSE 另一個更穩定的 endpoint。
-    """
-    rows = {}
-
-    # ── 上市：用 TWSE 個股日成交資訊總表（比 MI_INDEX 格式更單純）──
-    try:
-        today = datetime.now().strftime('%Y%m%d')
-        url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={today}&type=ALLBUT0999"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        data = resp.json()
-        if data.get('stat') == 'OK':
-            # MI_INDEX 有多個子表，找欄位包含「收盤價」的那張
-            for key in data:
-                if key.startswith('data') and isinstance(data[key], list):
-                    fields = data.get(key.replace('data', 'fields'), [])
-                    # 找收盤價欄位索引
-                    try:
-                        fi_code  = fields.index('證券代號')
-                        fi_vol   = fields.index('成交股數')
-                        fi_close = fields.index('收盤價')
-                    except ValueError:
-                        # 找不到欄位名稱，嘗試固定索引
-                        fi_code, fi_vol, fi_close = 0, 2, 8
-
-                    for row in data[key]:
-                        try:
-                            code  = str(row[fi_code]).strip()
-                            vol   = parse_price(row[fi_vol])
-                            close = parse_price(row[fi_close])
-                            if len(code) == 4 and code.isdigit() and vol and close:
-                                rows[code] = {"close": close, "volume_k": vol / 1000, "market": "TW"}
-                        except Exception:
-                            continue
-    except Exception:
-        pass
-
-    # ── 上櫃 ──
-    try:
-        yr = datetime.now().year - 1911
-        mo = datetime.now().month
-        url = (f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/"
-               f"stk_wn1430_result.php?l=zh-tw&d={yr}/{mo:02d}&se=AL")
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        data = resp.json()
-        for row in data.get('aaData', []):
-            try:
-                code  = str(row[0]).strip()
-                close = parse_price(row[2])
-                vol   = parse_price(row[8])  # 成交張數
-                if len(code) == 4 and code.isdigit() and close and vol:
-                    rows[code] = {"close": close, "volume_k": vol, "market": "TWO"}
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).T
+    return fetch_twse_history(code, months) if market == "TW" else fetch_tpex_history(code, months)
 
 
 # ============================================================
@@ -312,12 +307,25 @@ def fetch_and_analyze(code: str, market: str, strategy: str) -> dict | None:
 # ============================================================
 
 def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text):
-    # ── 第一階段：快照預篩 ──
-    status_text.text("⚡ 第一階段：取得全市場快照進行預篩...")
+    now = datetime.now()
+    stock_dict = {code: market for code, market in all_stocks}
+
+    # ── 第一階段：批次月報預篩 ──
+    status_text.text("⚡ 第一階段：抓取全市場月報進行預篩...")
     progress_bar.progress(0.03)
 
-    snapshot   = get_market_snapshot()
-    stock_dict = {code: market for code, market in all_stocks}
+    tw_snap  = get_twse_monthly_all(now.year, now.month)
+    two_snap = get_tpex_monthly_all(now.year, now.month)
+
+    # 若本月資料不足（月初），嘗試上個月
+    if tw_snap.empty:
+        prev = now.replace(day=1) - timedelta(days=1)
+        tw_snap = get_twse_monthly_all(prev.year, prev.month)
+    if two_snap.empty:
+        prev = now.replace(day=1) - timedelta(days=1)
+        two_snap = get_tpex_monthly_all(prev.year, prev.month)
+
+    snapshot = pd.concat([tw_snap, two_snap]) if not tw_snap.empty or not two_snap.empty else pd.DataFrame()
 
     if not snapshot.empty and 'volume_k' in snapshot.columns:
         snapshot['volume_k'] = pd.to_numeric(snapshot['volume_k'], errors='coerce').fillna(0)
@@ -328,9 +336,8 @@ def run_scan(all_stocks, info_map, strategy, min_vol, progress_bar, status_text)
             f"（成交量 ≥ {min_vol} 張）"
         )
     else:
-        # 快照失敗（非交易日 / API 異常），掃全部
         candidates = all_stocks
-        status_text.text(f"⚠️ 快照取得失敗，掃描全部 {len(candidates)} 支...")
+        status_text.text(f"⚠️ 月報預篩失敗，改為掃描全部 {len(candidates)} 支...")
 
     progress_bar.progress(0.08)
 
@@ -385,7 +392,7 @@ strategy_option  = st.sidebar.radio("選擇選股策略：", ("均線多頭回�
 indicator_choice = st.sidebar.selectbox("查看確認指標：", ["都不顯示", "RSI (強弱指標)", "MACD (趨勢指標)"])
 min_volume       = st.sidebar.slider("最小成交量 (張)", 0, 2000, 500, step=100)
 st.sidebar.markdown("---")
-st.sidebar.caption("📡 TWSE / TPEX 官方 API\n\n⚡ 兩階段：快照預篩 → 歷史精算")
+st.sidebar.caption("📡 TWSE / TPEX 官方 API\n\n⚡ 月報批次預篩 → 歷史日線精算")
 
 
 # ============================================================
@@ -500,4 +507,4 @@ if not st.session_state['scan_results'].empty:
     else:
         st.warning("目前篩選條件下無標的。")
 else:
-    st.info("💡 點擊「開始全市場掃描」按鈕。⚡ 兩階段掃描：快照預篩 → 歷史精算。")
+    st.info("💡 點擊「開始全市場掃描」按鈕。⚡ 月報批次預篩大幅縮短掃描時間。")
