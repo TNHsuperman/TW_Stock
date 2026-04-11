@@ -516,11 +516,26 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
             else:
                 st.sidebar.success(f"✅ 歷史資料：收盤 {df_test['Close'].iloc[-1]:.1f}")
 
-            pe = fetch_yf_pe("2330.TW")
-            st.sidebar.write(f"本益比（TWSE）：{pe}")
-
-            qoq, yoy = fetch_revenue_growth("2330.TW")
-            st.sidebar.write(f"月增率：{qoq}，年增率：{yoy}")
+            # 測試各個 TWSE 子網域
+            test_urls = {
+                "mis.twse.com.tw (本益比)":
+                    "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",
+                "www.twse.com.tw/rwd (月營收)":
+                    "https://www.twse.com.tw/rwd/zh/monthRevenue/t05st10?date=11401&stockNo=2330&response=json",
+                "mops.twse.com.tw (公開資訊觀測站)":
+                    "https://mops.twse.com.tw/mops/web/ajax_t05st10",
+                "isin.twse.com.tw (已知可用)":
+                    "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
+            }
+            for name, url in test_urls.items():
+                try:
+                    resp = requests.get(url, headers=HEADERS, timeout=8, verify=False)
+                    body = resp.text[:80].replace('\n', ' ')
+                    st.sidebar.write(f"**{name}**")
+                    st.sidebar.caption(f"HTTP {resp.status_code} | {body}")
+                except Exception as e:
+                    st.sidebar.write(f"**{name}**")
+                    st.sidebar.caption(f"❌ {str(e)[:60]}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
