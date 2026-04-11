@@ -500,18 +500,17 @@ else:
 
     if empty_cnt > len(all_stocks) * 0.8:
         status_text.warning(
-            f"⚠️ {empty_cnt} 支無資料。Cookie/Crumb 可能過期，"
-            "請重新整理頁面後再試。"
+            f"⚠️ {empty_cnt} 支無資料。Cookie 可能過期，請重新整理頁面後再試。"
         )
-    else:
-        if not res_df.empty:
-            try:
-                res_df = enrich_results(res_df, status_text)
-                st.write("✅ enrich 完成，欄位：", list(res_df.columns))  # 除錯用
-            except Exception as e:
-                st.error(f"enrich_results 發生錯誤：{e}")
+    elif not res_df.empty:
+        # enrich 必須在 st.rerun() 之前完成並存入 session state
+        # 若放在 rerun 後面，rerun 會中斷執行導致欄位永遠不會被加入
+        res_df = enrich_results(res_df, status_text)
         status_text.text(f"🎉 完成！找到 {len(res_df)} 支符合條件標的。")
+    else:
+        status_text.text("🎉 完成！找到 0 支符合條件標的。")
 
+    # 確保 enrich 完成後才存入並觸發 rerun
     st.session_state['scan_results'] = res_df
     st.session_state['is_scanning']  = False
     st.rerun()
