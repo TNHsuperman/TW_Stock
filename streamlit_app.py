@@ -21,15 +21,13 @@ st.set_page_config(page_title="台股智慧選股儀表板 v5.0", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 ]
 
 def get_headers():
     return {
         'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Referer': 'https://tw.stock.yahoo.com/'
     }
 
@@ -39,49 +37,37 @@ if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 
 # ============================================================
-# 2. 核心功能：本益比 (yfinance + 網頁爬取雙方案)
+# 2. 核心抓取功能
 # ============================================================
 
 def fetch_pe_ratio(ticker: str) -> str:
-    """ 
-    雙方案取本益比：
-    1. 優先嘗試解析 Yahoo 奇摩股市頁面文字
-    2. 備援嘗試 Google 搜尋快速結果
-    """
+    """ 雙方案取本益比 """
     code = ticker.split('.')[0]
-    # 方案 A: Yahoo 奇摩
-    try:
-        url = f"https://tw.stock.yahoo.com/quote/{code}"
-        resp = requests.get(url, headers=get_headers(), timeout=7)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # 尋找包含「本益比」字樣的元件
-        for el in soup.find_all(['span', 'div', 'li']):
-            if '本益比' in el.text and len(el.text) < 20:
-                # 通常數值在下一個兄弟節點或子節點
-                val = el.find_next_sibling() or el.parent.find_all(recursive=False)[-1]
-                txt = val.get_text(strip=True)
-                if re.match(r'^\d+\.?\d*$', txt):
-                    return txt
-    except: pass
-
-    # 方案 B: Google Search 靜態抓取 (快速且難擋)
+    # 方案 A: Google 快速提取 (極度穩定)
     try:
         g_url = f"https://www.google.com/search?q={code}+本益比"
         g_resp = requests.get(g_url, headers=get_headers(), timeout=5)
-        # 搜尋結果中常見格式: "本益比：15.2"
         match = re.search(r'本益比[:：]?\s*(\d+\.\d+)', g_resp.text)
         if match: return match.group(1)
     except: pass
     
+    # 方案 B: Yahoo 頁面匹配
+    try:
+        url = f"https://tw.stock.yahoo.com/quote/{code}"
+        resp = requests.get(url, headers=get_headers(), timeout=5)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        label = soup.find('span', string=re.compile("本益比"))
+        if label:
+            val = label.find_next_sibling('span')
+            if val: return val.get_text(strip=True)
+    except: pass
     return "N/A"
 
 def fetch_revenue_info(ticker: str) -> tuple[str, str]:
-    """ 修正營收：抓取百分比 """
     code = ticker.split('.')[0]
     url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=7)
+        resp = requests.get(url, headers=get_headers(), timeout=5)
         soup = BeautifulSoup(resp.text, 'html.parser')
         row = soup.select_one(r'li.List\(n\)')
         if row:
@@ -91,99 +77,122 @@ def fetch_revenue_info(ticker: str) -> tuple[str, str]:
     return "N/A", "N/A"
 
 def fetch_dynamic_themes(ticker: str, name: str) -> str:
-    """ 
-    動態題材分析：
-    抓取 Google News 標題並進行詞頻過濾
-    """
+    """ 動態題材分析 (從新聞摘要) """
     code = ticker.split('.')[0]
-    query = f"{name} {code} 題材 概念股"
-    url = f"https://www.google.com/search?q={query}&tbm=nws" # 強制搜尋新聞
+    query = f"{name} {code} 題材"
+    url = f"https://www.google.com/search?q={query}"
     try:
         resp = requests.get(url, headers=get_headers(), timeout=5)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        text = soup.get_text()
-        
-        # 產業關鍵字庫 (輔助過濾)
-        keywords = ["AI", "散熱", "半導體", "伺服器", "綠能", "重電", "軍工", "低軌衛星", 
-                    "矽光子", "車用", "生技", "機器人", "摺疊機", "面板", "封裝"]
-        
-        found = []
-        for kw in keywords:
-            if kw in text: found.append(kw)
-            
-        # 額外動態提取 2-4 字的名詞
-        dynamic = re.findall(r'[\u4e00-\u9fa5]{2,4}(?:題材|概念|供應鏈)', text)
-        for d in dynamic:
-            found.append(d.replace('題材','').replace('概念','').replace('供應鏈',''))
+        text = resp.text
+        # 常見產業關鍵字
+        keywords = ["AI", "散熱", "半導體", "伺服器", "重電", "矽光子", "車用", "生技", "機器人"]
+        found = [kw for kw in keywords if kw in text]
+        # 額外抓取
+        dynamic = re.findall(r'[\u4e00-\u9fa5]{2,4}(?:概念|題材)', text)
+        found += [d.replace('概念','').replace('題材','') for d in dynamic]
+        return "、".join(list(dict.fromkeys(found))[:3]) if found else "觀察中"
+    except: return ""
 
-        if found:
-            return "、".join(list(dict.fromkeys(found))[:3])
-    except: pass
-    return "熱門題材觀察中"
+@st.cache_data(ttl=86400)
+def get_stock_list():
+    data = []
+    urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
+            ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
+    for url, market in urls:
+        try:
+            r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
+            df = pd.read_html(StringIO(r.text))[0]
+            df.columns = df.iloc[0]
+            for _, row in df.iloc[1:].iterrows():
+                val = row['有價證券代號及名稱']
+                if val and '　' in str(val):
+                    code, name = val.split('　')
+                    if len(code) == 4 and code.isdigit():
+                        data.append({"ticker": f"{code}.{market}", "name": name, "industry": row['產業別'], "market": market, "code": code})
+        except: continue
+    return data
+
+def fetch_yf_history(ticker: str) -> pd.DataFrame:
+    p2, p1 = int(time.time()), int((datetime.now() - timedelta(days=150)).timestamp())
+    try:
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}", 
+                         params={"period1":p1, "period2":p2, "interval":"1d"}, headers=get_headers(), timeout=10)
+        json_data = r.json()['chart']['result'][0]
+        df = pd.DataFrame({
+            'Date': pd.to_datetime(json_data['timestamp'], unit='s').normalize(),
+            'Close': json_data['indicators']['quote'][0]['close'],
+            'Volume': json_data['indicators']['quote'][0]['volume']
+        }).dropna().set_index('Date')
+        return df
+    except: return pd.DataFrame()
 
 # ============================================================
-# 3. 掃描與並行處理邏輯
+# 3. UI 與 主邏輯
 # ============================================================
 
-def enrich_data_task(row: dict):
-    """ 同時補充本益比、營收與題材 """
-    t, n = row['_ticker'], row['名稱']
-    time.sleep(random.uniform(0.5, 1.2)) # 避免被封鎖
-    
-    pe = fetch_pe_ratio(t)
-    mom, yoy = fetch_revenue_info(t)
-    theme = fetch_dynamic_themes(t, n)
-    
-    return {
-        "_ticker": t,
-        "本益比": pe,
-        "營收月增": mom,
-        "營收年增": yoy,
-        "熱門題材": theme
-    }
-
-# ============================================================
-# 4. Streamlit UI 與 主邏輯
-# ============================================================
-
-st.sidebar.header("🚀 策略篩選參數")
+st.sidebar.header("⚙️ 參數設定")
 max_bias = st.sidebar.number_input("乖離率上限 (%)", 0.1, 10.0, 2.5)
 min_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
-if st.button("🔍 開始全市場智慧掃描", use_container_width=True):
+if st.button("🚀 開始智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
     st.session_state.is_scanning = True
     st.rerun()
 
 if st.session_state.is_scanning:
-    # --- 步驟 1: 抓取股票清單 (此處假設已有 get_stock_list 函數) ---
-    # ... (原有抓取清單邏輯)
+    status = st.empty()
+    bar = st.progress(0)
     
-    # --- 步驟 2: 技術面過濾 (ThreadPoolExecutor 15) ---
-    # ... (原有掃描邏輯，將符合條件的存入 initial_results)
+    status.text("📡 下載股票清單中...")
+    stocks = get_stock_list()
     
-    # 範例測試數據 (initial_results)
+    initial_results = [] # 確保初始化
+    status.text(f"🔍 技術面篩選中 (共 {len(stocks)} 支)...")
+    
+    with ThreadPoolExecutor(max_workers=15) as ex:
+        futures = {ex.submit(fetch_yf_history, s['ticker']): s for s in stocks}
+        for i, f in enumerate(as_completed(futures), 1):
+            if i % 100 == 0: bar.progress(i / len(stocks))
+            s = futures[f]
+            df = f.result()
+            if len(df) > 60:
+                if (df['Volume'].tail(5).mean() / 1000) >= min_vol:
+                    c = df['Close'].iloc[-1]
+                    ma30 = df['Close'].rolling(30).mean().iloc[-1]
+                    bias = ((c - ma30) / ma30) * 100
+                    if 0 < bias <= max_bias:
+                        initial_results.append({**s, "收盤": round(c, 2), "乖離(%)": round(bias, 2)})
+
     if initial_results:
-        status = st.empty()
-        final_results = []
-        status.text(f"📊 初步篩選出 {len(initial_results)} 支，正在分析基本面...")
-        
+        status.text(f"📊 初步篩選出 {len(initial_results)} 支，深度分析基本面與題材...")
+        final_data = []
         with ThreadPoolExecutor(max_workers=4) as ex:
-            futures = [ex.submit(enrich_data_task, r) for r in initial_results]
-            for i, f in enumerate(as_completed(futures), 1):
-                status.text(f"分析進度: {i} / {len(initial_results)}")
-                final_results.append(f.result())
+            enrich_futures = []
+            for r in initial_results:
+                def task(row):
+                    pe = fetch_pe_ratio(row['ticker'])
+                    mom, yoy = fetch_revenue_info(row['ticker'])
+                    theme = fetch_dynamic_themes(row['ticker'], row['name'])
+                    return {**row, "本益比": pe, "營收月增": mom, "營收年增": yoy, "熱門題材": theme}
+                enrich_futures.append(ex.submit(task, r))
+            
+            for j, f in enumerate(as_completed(enrich_futures), 1):
+                status.text(f"深度分析進度: {j} / {len(initial_results)}")
+                final_data.append(f.result())
         
-        # 合併數據並存入 session_state
-        res_df = pd.DataFrame(initial_results).merge(pd.DataFrame(final_results), on='_ticker')
-        st.session_state.scan_results = res_df
-        
+        st.session_state.scan_results = pd.DataFrame(final_data)
+    else:
+        st.session_state.scan_results = pd.DataFrame()
+        st.warning("查無標的")
+
     st.session_state.is_scanning = False
     st.rerun()
 
-# --- 顯示結果 ---
+# 顯示結果
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results
-    # 確保顯示順序與過濾
-    display_cols = ["代碼", "名稱", "市場", "類股", "收盤", "乖離(%)", "本益比", "營收月增", "營收年增", "熱門題材"]
-    st.success(f"✅ 掃描完成！符合條件標的：{len(df)} 支")
-    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+    st.subheader(f"✅ 找到 {len(df)} 支標的")
+    cols = ["code", "name", "market", "industry", "收盤", "乖離(%)", "本益比", "營收月增", "營收年增", "熱門題材"]
+    st.dataframe(df[cols].rename(columns={"code":"代碼","name":"名稱"}), use_container_width=True, hide_index=True)
+else:
+    if not st.session_state.is_scanning:
+        st.info("💡 請點擊按鈕開始掃描。")
