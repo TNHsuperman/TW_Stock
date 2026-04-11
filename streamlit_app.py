@@ -127,15 +127,10 @@ def get_yf_cookie_and_crumb() -> tuple[dict, str]:
 
 def fetch_yf_history(ticker: str, days: int = 130) -> pd.DataFrame:
     """
-    直接呼叫 Yahoo Finance v8 CSV API 下載歷史日線。
-    帶上 Cookie + Crumb 避免被封鎖。
-
-    相較於 yfinance 套件的優點：
-    - 不依賴套件版本，直接控制 HTTP 請求
-    - 可以共用 Cookie，減少被封鎖的機率
-    - 輕量，不需要初始化 Ticker 物件
+    直接呼叫 Yahoo Finance v8 API 下載歷史日線。
+    只需要 Cookie（A3/A1/A1S），不需要 Crumb 也能正常運作。
     """
-    cookies, crumb = get_yf_cookie_and_crumb()
+    cookies, _ = get_yf_cookie_and_crumb()  # 只取 Cookie，忽略 Crumb
 
     p2 = int(datetime.now().timestamp())
     p1 = int((datetime.now() - timedelta(days=days)).timestamp())
@@ -146,7 +141,6 @@ def fetch_yf_history(ticker: str, days: int = 130) -> pd.DataFrame:
         "period2":  p2,
         "interval": "1d",
         "events":   "history",
-        "crumb":    crumb,
     }
     headers = {
         'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -167,7 +161,7 @@ def fetch_yf_history(ticker: str, days: int = 130) -> pd.DataFrame:
         if not result:
             return pd.DataFrame()
 
-        r         = result[0]
+        r          = result[0]
         timestamps = r.get('timestamp', [])
         quote      = r.get('indicators', {}).get('quote', [{}])[0]
 
@@ -309,19 +303,21 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
     with st.sidebar:
         with st.spinner("測試中..."):
-            get_yf_cookie_and_crumb.clear()  # 強制重新取得，不用快取
+            get_yf_cookie_and_crumb.clear()
             cookies, crumb = get_yf_cookie_and_crumb()
-            st.sidebar.write(f"Cookie 數量: {len(cookies)}")
             st.sidebar.write(f"Cookie keys: {list(cookies.keys())}")
             if crumb and '<' not in crumb:
-                st.sidebar.success(f"✅ Crumb: {crumb[:15]}...")
+                st.sidebar.write(f"Crumb: ✅ {crumb[:15]}...")
             else:
-                st.sidebar.error(f"❌ Crumb 無效: {crumb[:50]}")
+                st.sidebar.write("Crumb: 不需要（Cookie 已足夠）")
             df_test = fetch_yf_history("2330.TW", days=10)
             if df_test.empty:
                 st.sidebar.error("❌ 無法取得 2330.TW 資料")
             else:
-                st.sidebar.success(f"✅ 2330.TW 成功，{len(df_test)} 筆，最新收盤：{df_test['Close'].iloc[-1]:.1f}")
+                st.sidebar.success(
+                    f"✅ 2330.TW 成功，{len(df_test)} 筆，"
+                    f"最新收盤：{df_test['Close'].iloc[-1]:.1f}"
+                )
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
