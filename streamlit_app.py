@@ -18,7 +18,7 @@ import yfinance as yf
 # 1. 基礎設定
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股 30/45/60MA 策略選股儀表板", layout="wide")
+st.set_page_config(page_title="台股 30/45/60MA 策略選股儀表板 v6.0", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -38,12 +38,12 @@ if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 
 # ============================================================
-# 2. 核心功能：深度資訊抓取 (PE/題材/營收)
+# 2. 核心功能：深度資訊抓取 (PE/營收)
 # ============================================================
 
-def fetch_deep_info(ticker: str, name: str) -> dict:
+def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
-    res = {"pe": "N/A", "is_hot": "否", "mom": "N/A", "yoy": "N/A"}
+    res = {"pe": "N/A", "mom": "N/A", "yoy": "N/A"}
     
     # --- A. 本益比 (yfinance + Google 備援) ---
     try:
@@ -52,21 +52,14 @@ def fetch_deep_info(ticker: str, name: str) -> dict:
         if pe: res["pe"] = f"{pe:.2f}"
     except: pass
 
-    try:
-        query = f"{code} {name} 本益比 熱門題材 概念股"
-        g_url = f"https://www.google.com/search?q={query}"
-        g_resp = requests.get(g_url, headers=get_headers(), timeout=5)
-        content = g_resp.text
-        
-        if res["pe"] == "N/A":
-            pe_match = re.search(r'本益比[:：]?\s*(\d+\.\d+)', content)
+    if res["pe"] == "N/A":
+        try:
+            query = f"{code} 本益比"
+            g_url = f"https://www.google.com/search?q={query}"
+            g_resp = requests.get(g_url, headers=get_headers(), timeout=5)
+            pe_match = re.search(r'本益比[:：]?\s*(\d+\.\d+)', g_resp.text)
             if pe_match: res["pe"] = pe_match.group(1)
-        
-        # 熱門題材判定 (放寬關鍵字判定)
-        hot_keywords = ["AI", "半導體", "伺服器", "散熱", "矽光子", "重電", "低軌衛星", "飆股", "領漲", "概念股", "強勢股"]
-        if any(kw in content for kw in hot_keywords):
-            res["is_hot"] = "是"
-    except: pass
+        except: pass
 
     # --- B. 營收百分比 ---
     try:
@@ -83,13 +76,14 @@ def fetch_deep_info(ticker: str, name: str) -> dict:
     return res
 
 # ============================================================
-# 3. 技術分析掃描 (修正乖離定義為 30MA)
+# 3. 技術分析掃描 (30/45/60 MA 策略 + 當日成交量)
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
     """
     1. 均線多頭: 30MA > 45MA > 60MA
     2. 乖離限制: 收盤價與 30MA 乖離 <= bias_limit
+    3. 紀錄當日成交量
     """
     p2, p1 = int(time.time()), int((datetime.now() - timedelta(days=150)).timestamp())
     try:
@@ -100,19 +94,28 @@ def run_strategy_check(s, bias_limit, vol_limit):
         v_series = pd.Series(data['indicators']['quote'][0]['volume'])
         
         if len(c_series) < 65: return None
-        if (v_series.tail(5).mean() / 1000) < vol_limit: return None
+        
+        curr_vol = int(v_series.iloc[-1] / 1000) # 當日成交量 (張)
+        avg_vol_5d = v_series.tail(5).mean() / 1000 # 5日均量
+        
+        # 門檻過濾
+        if avg_vol_5d < vol_limit: return None
         
         ma30 = c_series.rolling(30).mean().iloc[-1]
         ma45 = c_series.rolling(45).mean().iloc[-1]
         ma60 = c_series.rolling(60).mean().iloc[-1]
-        curr = c_series.iloc[-1]
+        curr_price = c_series.iloc[-1]
         
-        # 乖離率計算 (收盤價與 30MA 的距離)
-        bias_30 = ((curr - ma30) / ma30) * 100
+        # 乖離率計算
+        bias_30 = ((curr_price - ma30) / ma30) * 100
         
-        # 策略過濾
         if (ma30 > ma45 > ma60) and (0 < bias_30 <= bias_limit):
-            return {**s, "收盤": round(curr, 2), "乖離30MA(%)": round(bias_30, 2)}
+            return {
+                **s, 
+                "收盤": round(curr_price, 2), 
+                "乖離30MA(%)": round(bias_30, 2),
+                "成交量(張)": curr_vol
+            }
     except: return None
     return None
 
@@ -124,7 +127,7 @@ st.sidebar.header("🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
-if st.button("🔍 開始全市場智慧掃描 (30/45/60 多頭排列)", use_container_width=True, disabled=st.session_state.is_scanning):
+if st.button("🚀 開始全市場掃描 (30/45/60 MA)", use_container_width=True, disabled=st.session_state.is_scanning):
     st.session_state.is_scanning = True
     st.rerun()
 
@@ -149,9 +152,9 @@ if st.session_state.is_scanning:
                         stocks_list.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
     except: pass
 
-    # 技術過濾
+    # 第一階段：技術過濾
     initial_hits = []
-    status.text(f"🔍 正在篩選均線趨勢與 30MA 乖離標的...")
+    status.text(f"🔍 正在篩選符合技術面標的...")
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
@@ -159,21 +162,26 @@ if st.session_state.is_scanning:
             res = f.result()
             if res: initial_hits.append(res)
             
-    # 分析基本面
+    # 第二階段：基本面分析
     if initial_hits:
-        status.text(f"📊 找到 {len(initial_hits)} 支，深度分析 PE 與題材熱度...")
+        status.text(f"📊 找到 {len(initial_hits)} 支標的，補充本益比與營收數據...")
         final_list = []
         with ThreadPoolExecutor(max_workers=5) as ex:
-            f_deep = {ex.submit(fetch_deep_info, r['ticker'], r['name']): r for r in initial_hits}
+            f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"深度分析進度: {j} / {len(initial_hits)}")
+                status.text(f"數據分析進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
-                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "熱門題材": deep_res["is_hot"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+                final_list.append({
+                    **f_deep[f], 
+                    "本益比": deep_res["pe"], 
+                    "營收月增": deep_res["mom"], 
+                    "營收年增": deep_res["yoy"]
+                })
         
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
-        st.warning("查無標的。")
+        st.warning("查無符合條件標的。")
 
     st.session_state.is_scanning = False
     st.rerun()
@@ -181,11 +189,12 @@ if st.session_state.is_scanning:
 # --- 結果顯示 ---
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results
-    st.subheader(f"✅ 掃描完成！符合條件標的：{len(df)} 支")
+    st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     
-    cols = ["code", "name", "收盤", "乖離30MA(%)", "本益比", "營收月增", "營收年增", "熱門題材", "industry"]
-    st.dataframe(df[cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"}), 
+    # 重新排列欄位並顯示
+    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "本益比", "營收月增", "營收年增", "industry"]
+    st.dataframe(df[show_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"}), 
                  use_container_width=True, hide_index=True)
 else:
     if not st.session_state.is_scanning:
-        st.info("💡 準備就緒，點擊按鈕執行選股。")
+        st.info("💡 準備就緒，點擊上方按鈕執行選股。")
