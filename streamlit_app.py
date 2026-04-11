@@ -230,85 +230,85 @@ def fetch_and_analyze(ticker: str, market: str, strategy: str,
 
 def fetch_yf_pe(ticker: str) -> str:
     """
-    從 Yahoo Finance quote endpoint 取得台股本益比。
-    v10 quoteSummary 對台股資料稀疏，改用 v8 chart metadata。
+    從 TWSE/TPEX 個股即時報價 API 取得本益比。
+    這個 endpoint 與歷史資料 API 不同，實測在 Streamlit Cloud 可用。
     """
-    cookies, _ = get_yf_cookie_and_crumb()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://finance.yahoo.com',
-    }
-    # 方法一：用 /v7/finance/quote 直接拿 trailingPE
-    try:
-        resp = requests.get(
-            "https://query1.finance.yahoo.com/v7/finance/quote",
-            params={"symbols": ticker, "fields": "trailingPE,epsTrailingTwelveMonths,regularMarketPrice"},
-            headers=headers, cookies=cookies, timeout=10
-        )
-        result = resp.json().get('quoteResponse', {}).get('result', [])
-        if result:
-            pe = result[0].get('trailingPE')
-            if pe:
-                return f"{pe:.1f}"
-    except Exception:
-        pass
+    code   = ticker.split('.')[0]
+    market = "TW" if ticker.endswith(".TW") else "TWO"
 
-    # 方法二：用股價 / EPS 自己算
+    if market == "TW":
+        # TWSE 即時行情 API（包含本益比）
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{code}.tw&json=1&delay=0"
+    else:
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_{code}.tw&json=1&delay=0"
+
     try:
-        resp = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/" + ticker,
-            params={"interval": "1d", "range": "1d"},
-            headers=headers, cookies=cookies, timeout=10
-        )
+        resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
         data = resp.json()
-        meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
-        price = meta.get('regularMarketPrice', 0)
-        eps   = meta.get('epsTrailingTwelveMonths', 0)
-        if price and eps and eps > 0:
-            return f"{price/eps:.1f}"
+        items = data.get('msgArray', [])
+        if items:
+            pe = items[0].get('pe', '')
+            return pe if pe and pe != '-' else "N/A"
     except Exception:
         pass
-
     return "N/A"
 
 
 def fetch_revenue_growth(ticker: str) -> tuple[str, str]:
     """
-    台股營收資料 Yahoo Finance 幾乎沒有，
-    改從 Yahoo Finance /v10/finance/quoteSummary 的
-    earningsTrend 模組取得營收成長率估計值。
-    若無資料則回傳 N/A。
+    從 TWSE/TPEX 月營收 API 取得最新月營收，計算月增率與年增率。
+    endpoint: https://www.twse.com.tw/rwd/zh/monthRevenue/t05st10
+    這個 endpoint 實測在 Streamlit Cloud 不會被封鎖。
     """
-    cookies, _ = get_yf_cookie_and_crumb()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://finance.yahoo.com',
-    }
-    try:
-        resp = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
-            params={"modules": "earningsTrend"},
-            headers=headers, cookies=cookies, timeout=10
-        )
-        data   = resp.json()
-        result = data.get('quoteSummary', {}).get('result', [])
-        if not result:
-            return "N/A", "N/A"
+    code   = ticker.split('.')[0]
+    market = "TW" if ticker.endswith(".TW") else "TWO"
+    now    = datetime.now()
 
-        trends = result[0].get('earningsTrend', {}).get('trend', [])
-        # trend 包含 0q(本季)、+1q(下季)、0y(本年)、+1y(明年) 等預估
-        qoq, yoy = "N/A", "N/A"
-        for t in trends:
-            period = t.get('period', '')
-            growth = t.get('revenueEstimate', {}).get('growth', {}).get('fmt', None)
-            if period == '0q' and growth:
-                qoq = growth
-            if period == '0y' and growth:
-                yoy = growth
-        return qoq, yoy
+    # 嘗試本月和上個月（月初時本月資料可能未出）
+    for delta in [0, 1]:
+        target = now.replace(day=1) - timedelta(days=delta * 28)
+        yr_roc = target.year - 1911
+        month  = target.month
 
-    except Exception:
-        return "N/A", "N/A"
+        if market == "TW":
+            url = "https://www.twse.com.tw/rwd/zh/monthRevenue/t05st10"
+            params = {"date": f"{yr_roc}{month:02d}01", "stockNo": code,
+                      "response": "json"}
+        else:
+            url = "https://www.tpex.org.tw/web/stock/financial/revenue/monthly_rev_result.php"
+            params = {"d": f"{yr_roc}/{month:02d}", "stkno": code, "l": "zh-tw"}
+
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS,
+                                timeout=10, verify=False)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+
+            if market == "TW":
+                rows = data.get('data', [])
+                if not rows or len(rows) < 1:
+                    continue
+                # TWSE 月營收欄位：當月營收, 上月營收, 去年同月營收, 月增率, 年增率
+                row = rows[0]
+                mom = row[4] if len(row) > 4 else "N/A"  # 月增率(%)
+                yoy = row[5] if len(row) > 5 else "N/A"  # 年增率(%)
+                if mom and mom != '--':
+                    return f"{float(mom):+.1f}%", f"{float(yoy):+.1f}%"
+            else:
+                rows = data.get('aaData', [])
+                if not rows:
+                    continue
+                row = rows[0]
+                mom = row[4] if len(row) > 4 else "N/A"
+                yoy = row[5] if len(row) > 5 else "N/A"
+                if mom and mom != '--':
+                    return f"{float(str(mom).replace(',','')):+.1f}%", \
+                           f"{float(str(yoy).replace(',','')):+.1f}%"
+        except Exception:
+            continue
+
+    return "N/A", "N/A"
 
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -517,10 +517,10 @@ if st.sidebar.button("🔧 診斷 Yahoo Finance 連線"):
                 st.sidebar.success(f"✅ 歷史資料：收盤 {df_test['Close'].iloc[-1]:.1f}")
 
             pe = fetch_yf_pe("2330.TW")
-            st.sidebar.write(f"本益比：{pe}")
+            st.sidebar.write(f"本益比（TWSE）：{pe}")
 
             qoq, yoy = fetch_revenue_growth("2330.TW")
-            st.sidebar.write(f"營收季增：{qoq}，年增：{yoy}")
+            st.sidebar.write(f"月增率：{qoq}，年增率：{yoy}")
 
 st.sidebar.caption("📡 資料來源：Yahoo Finance v8 API（Cookie/Crumb 驗證）")
 
