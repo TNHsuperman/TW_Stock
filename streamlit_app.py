@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.1", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.2", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -141,7 +141,7 @@ def draw_k_line(ticker, name):
     return fig
 
 def get_stock_news(ticker):
-    """強化版：解析新聞並優化顯示內容"""
+    """深度解析新聞內容，防止標題抓取失敗"""
     try:
         yt = yf.Ticker(ticker)
         raw_news = yt.news
@@ -151,22 +151,30 @@ def get_stock_news(ticker):
         neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "裁員", "崩", "淡季", "壓力"]
         
         results = []
-        for n in raw_news[:8]: # 增加到 8 則
-            # 強化標題解析：確保從不同欄位抓取
-            title = n.get('title') or n.get('summary') or "（無法讀取新聞標題）"
-            link = n.get('link') or "#"
-            publisher = n.get('publisher', '財經新聞')
+        for n in raw_news:
+            # 遍歷所有可能的標題位置
+            title = n.get('title')
+            if not title and 'content' in n:
+                title = n['content'].get('title')
+            if not title:
+                title = n.get('summary') or n.get('text')
             
-            # 時間轉換
-            pub_time = n.get('providerPublishTime')
+            # 如果還是沒有標題，跳過此則
+            if not title: continue
+
+            link = n.get('link') or "#"
+            publisher = n.get('publisher') or n.get('source') or '財經新聞'
+            
+            pub_time = n.get('providerPublishTime') or n.get('pubDate')
             time_str = ""
             if pub_time:
-                dt_obj = datetime.fromtimestamp(pub_time, tz=timezone(timedelta(hours=8)))
-                time_str = dt_obj.strftime("%m/%d %H:%M")
+                try:
+                    dt_obj = datetime.fromtimestamp(pub_time, tz=timezone(timedelta(hours=8)))
+                    time_str = dt_obj.strftime("%m/%d %H:%M")
+                except: pass
 
             sentiment = "💡 資訊"
             color = "#888888"
-            
             if any(w in title for w in pos_words):
                 sentiment = "📈 利多"
                 color = "#ef5350"
@@ -175,14 +183,10 @@ def get_stock_news(ticker):
                 color = "#26a69a"
                 
             results.append({
-                "title": title, 
-                "link": link, 
-                "sentiment": sentiment, 
-                "color": color, 
-                "publisher": publisher,
-                "time": time_str
+                "title": title, "link": link, "sentiment": sentiment, 
+                "color": color, "publisher": publisher, "time": time_str
             })
-        return results
+        return results[:8] # 最多回傳 8 則
     except: return None
 
 # ============================================================
@@ -280,7 +284,7 @@ if not st.session_state.scan_results.empty:
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖與切換區 (修正新聞顯示問題)
+    # 6. K線圖與切換區 (穩定新聞顯示版本)
     # ============================================================
     st.divider()
     
@@ -306,21 +310,21 @@ if not st.session_state.scan_results.empty:
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
     
-    # 修正版：新聞分析區塊
+    # 強化解析後的新聞分析區塊
     st.subheader(f"📰 {current_stock['name']} 即時新聞與市場情緒")
     news_list = get_stock_news(current_stock['ticker'])
     
     if news_list:
         for n in news_list:
             st.markdown(f"""
-            <div style="padding:12px; border-bottom:1px solid #444; background-color:rgba(255,255,255,0.03); margin-bottom:5px; border-radius:8px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                    <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:2px 8px; border-radius:15px; font-size:12px;">
+            <div style="padding:15px; border-bottom:1px solid #444; background-color:rgba(255,255,255,0.02); margin-bottom:8px; border-radius:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:3px 10px; border-radius:15px; font-size:12px;">
                         {n['sentiment']}
                     </span>
-                    <span style="color:#888; font-size:12px;">{n['publisher']} | {n['time']}</span>
+                    <span style="color:#aaa; font-size:12px;">{n['publisher']} | {n['time']}</span>
                 </div>
-                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:16px; font-weight:500;">
+                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">
                     {n['title']}
                 </a>
             </div>
