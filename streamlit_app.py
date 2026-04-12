@@ -31,12 +31,12 @@ if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 
 # ============================================================
-# 2. 數據抓取與快取邏輯
+# 2. 數據清洗與深度資訊抓取
 # ============================================================
 
 @st.cache_data(ttl=86400)
-def get_all_stock_list():
-    """獲取全市場股票清單 (上市與上櫃)"""
+def get_stock_market_list():
+    """抓取上市上櫃清單並快取，避免重複請求"""
     stocks = []
     try:
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
@@ -49,11 +49,10 @@ def get_all_stock_list():
                 val = str(row['有價證券代號及名稱'])
                 if '　' in val:
                     code, name = val.split('　')
-                    # 只抓取 4 位數的普通股代碼
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
-    except Exception as e:
-        st.error(f"獲取股票清單失敗: {e}")
+    except:
+        pass
     return stocks
 
 def clean_percent(text):
@@ -90,12 +89,13 @@ def fetch_deep_info(ticker: str) -> dict:
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
-    # 設定抓取 200 天數據，確保長假期間均線計算依然準確
+    # 增加至 200 天確保均線計算完整
     p2, p1 = int(time.time()), int((datetime.now() - timedelta(days=200)).timestamp())
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
                          params={"period1":p1, "period2":p2, "interval":"1d"}, headers=get_headers(), timeout=10)
         data = r.json()['chart']['result'][0]
+        # 加入前值填充與去空值
         c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
         v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
         
@@ -104,20 +104,18 @@ def run_strategy_check(s, bias_limit, vol_limit):
         vol_today = v_series.iloc[-1]
         vol_yesterday = v_series.iloc[-2]
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-        curr_vol_int = int(vol_today / 1000) # 轉換為「張」
+        curr_vol_int = int(vol_today / 1000)
         avg_vol_5d = v_series.tail(5).mean() / 1000
         
-        # 篩選：5日均量必須達到設定門檻
         if avg_vol_5d < vol_limit: return None
         
-        # 計算技術指標
         ma30 = c_series.rolling(30).mean().iloc[-1]
         ma45 = c_series.rolling(45).mean().iloc[-1]
         ma60 = c_series.rolling(60).mean().iloc[-1]
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
         
-        # 策略條件：多頭排列且乖離在設定範圍內
+        # 條件：多頭排列且乖離在設定範圍內
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {
                 **s, 
@@ -145,13 +143,11 @@ if st.session_state.is_scanning:
     status = st.empty()
     bar = st.progress(0)
     
-    # 獲取快取清單
-    stocks_list = get_all_stock_list()
-    
+    # 獲取清單
+    stocks_list = get_stock_market_list()
+
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場 {len(stocks_list)} 支標的...")
-    
-    # 第一階段：併發執行技術篩選
+    status.text(f"🔍 正在掃描全市場...")
     with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
@@ -159,72 +155,76 @@ if st.session_state.is_scanning:
             res = f.result()
             if res: initial_hits.append(res)
             
-    # 第二階段：針對入選標的抓取深度資訊
     if initial_hits:
-        status.text(f"📊 正在抓取篩選出 {len(initial_hits)} 支標的的財報數據...")
+        status.text(f"📊 正在抓取財報數據...")
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"數據更新中: {j} / {len(initial_hits)}")
+                status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
-        st.warning("查無符合條件之標的。")
+        st.warning("查無條件標的。")
 
     st.session_state.is_scanning = False
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示與下載按鈕
+# 5. 結果顯示與下載功能
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
     
-    # UI 頂部：資訊顯示與下載按鈕
-    st.divider()
-    res_col1, res_col2 = st.columns([3, 1])
-    with res_col1:
-        st.success(f"✅ 掃描完成！找到 {len(df)} 支符合「多頭且乖離小」標的")
-    with res_col2:
-        # 下載按鈕邏輯
-        csv_data = df.to_csv(index=False).encode('utf-8-sig') # 使用 utf-8-sig 讓 Excel 開啟不亂碼
+    # --- 新增下載區塊 ---
+    col_msg, col_dl = st.columns([3, 1])
+    with col_msg:
+        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
+    with col_dl:
+        # 下載 CSV 功能 (utf-8-sig 確保 Excel 不亂碼)
+        csv = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="📥 下載選股結果 (CSV)",
-            data=csv_data,
-            file_name=f'TW_Stock_Scan_{datetime.now().strftime("%Y%m%d")}.csv',
+            label="📥 下載選股清單 (CSV)",
+            data=csv,
+            file_name=f'tw_stock_scan_{datetime.now().strftime("%Y%m%d")}.csv',
             mime='text/csv',
             use_container_width=True
         )
+    
+    # 欄位重新命名與篩選
+    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營營收年增", "industry"]
+    # 修正原本 code 裡可能遺漏的欄位
+    available_cols = [c for c in show_cols if c in df.columns]
+    df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
-    # 欄位重新命名與格式化顯示
-    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
-    df_display = df[show_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
-
-    # 台灣股市配色慣例
+    # 台灣股市配色習慣 (正值紅、負值綠)
     def color_tw_style(val):
         if pd.isna(val): return ''
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
+    # 使用 st.dataframe 的強大配置
     st.dataframe(
-        df_display.style.map(color_tw_style, subset=['量變動(%)', '營收月增', '營收年增']),
+        df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
         use_container_width=True,
         hide_index=True,
         column_config={
             "代碼": st.column_config.TextColumn("代碼"),
             "名稱": st.column_config.TextColumn("名稱"),
             "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
+            
+            # --- ProgressColumn ---
             "乖離30MA(%)": st.column_config.ProgressColumn(
                 "30MA 乖離",
-                help=f"條狀越短代表股價越靠近支撐線。上限設定為 {user_bias}%",
+                help=f"數值越小代表越貼近支撐。上限為 {user_bias}%",
                 format="%.2f%%",
                 min_value=0,
                 max_value=user_bias,
             ),
+            
             "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
             "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
             "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
@@ -234,7 +234,8 @@ if not st.session_state.scan_results.empty:
         }
     )
     
-    st.caption(f"💡 數據產出時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註2：下載清單包含所有抓取到的原始欄位，方便您後續進 Excel 分析。")
 else:
     if not st.session_state.is_scanning:
-        st.info("💡 調整左側參數後，點擊「開始智慧掃描」按鈕來進行分析。")
+        st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
