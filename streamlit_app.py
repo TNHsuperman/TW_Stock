@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.0", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.1", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -102,7 +102,8 @@ def run_strategy_check(s, bias_limit, vol_limit):
         if len(c_series) < 65: return None
         
         vol_today = v_series.iloc[-1]
-        vol_change = ((vol_today - v_series.iloc[-2]) / v_series.iloc[-2]) * 100 if len(v_series)>1 else 0
+        vol_yesterday = v_series.iloc[-2]
+        vol_change = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
         curr_vol_int = int(vol_today / 1000)
         avg_vol_5d = v_series.tail(5).mean() / 1000
         if avg_vol_5d < vol_limit: return None
@@ -140,19 +141,29 @@ def draw_k_line(ticker, name):
     return fig
 
 def get_stock_news(ticker):
-    """抓取股票相關新聞並進行簡單利多利空分析"""
+    """強化版：解析新聞並優化顯示內容"""
     try:
         yt = yf.Ticker(ticker)
-        news = yt.news[:5] # 抓取最新 5 則
-        if not news: return None
+        raw_news = yt.news
+        if not raw_news: return None
         
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲"]
-        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "裁員", "崩"]
+        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "缺貨", "訂單"]
+        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "裁員", "崩", "淡季", "壓力"]
         
         results = []
-        for n in news:
-            title = n.get('title', '')
-            link = n.get('link', '')
+        for n in raw_news[:8]: # 增加到 8 則
+            # 強化標題解析：確保從不同欄位抓取
+            title = n.get('title') or n.get('summary') or "（無法讀取新聞標題）"
+            link = n.get('link') or "#"
+            publisher = n.get('publisher', '財經新聞')
+            
+            # 時間轉換
+            pub_time = n.get('providerPublishTime')
+            time_str = ""
+            if pub_time:
+                dt_obj = datetime.fromtimestamp(pub_time, tz=timezone(timedelta(hours=8)))
+                time_str = dt_obj.strftime("%m/%d %H:%M")
+
             sentiment = "💡 資訊"
             color = "#888888"
             
@@ -163,7 +174,14 @@ def get_stock_news(ticker):
                 sentiment = "📉 利空"
                 color = "#26a69a"
                 
-            results.append({"title": title, "link": link, "sentiment": sentiment, "color": color})
+            results.append({
+                "title": title, 
+                "link": link, 
+                "sentiment": sentiment, 
+                "color": color, 
+                "publisher": publisher,
+                "time": time_str
+            })
         return results
     except: return None
 
@@ -262,7 +280,7 @@ if not st.session_state.scan_results.empty:
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖與切換區 (新增新聞功能)
+    # 6. K線圖與切換區 (修正新聞顯示問題)
     # ============================================================
     st.divider()
     
@@ -288,18 +306,23 @@ if not st.session_state.scan_results.empty:
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
     
-    # 新增：新聞分析區塊
-    st.subheader(f"📰 {current_stock['name']} 即時新聞分析")
+    # 修正版：新聞分析區塊
+    st.subheader(f"📰 {current_stock['name']} 即時新聞與市場情緒")
     news_list = get_stock_news(current_stock['ticker'])
     
     if news_list:
         for n in news_list:
             st.markdown(f"""
-            <div style="padding:10px; border-bottom:1px solid #444;">
-                <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:2px 6px; border-radius:4px; margin-right:10px;">
-                    {n['sentiment']}
-                </span>
-                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ddd; font-size:16px;">{n['title']}</a>
+            <div style="padding:12px; border-bottom:1px solid #444; background-color:rgba(255,255,255,0.03); margin-bottom:5px; border-radius:8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                    <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:2px 8px; border-radius:15px; font-size:12px;">
+                        {n['sentiment']}
+                    </span>
+                    <span style="color:#888; font-size:12px;">{n['publisher']} | {n['time']}</span>
+                </div>
+                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:16px; font-weight:500;">
+                    {n['title']}
+                </a>
             </div>
             """, unsafe_allow_html=True)
     else:
