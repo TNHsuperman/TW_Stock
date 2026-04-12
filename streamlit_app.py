@@ -17,19 +17,18 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v10.0", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v10.1", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 ]
 
 def get_headers():
     return {
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8',
         'Referer': 'https://tw.stock.yahoo.com/',
         'Connection': 'keep-alive'
     }
@@ -89,32 +88,8 @@ def fetch_deep_info(ticker: str) -> dict:
     return res
 
 # ============================================================
-# 3. 分析與繪圖功能
+# 3. 繪圖與新聞功能
 # ============================================================
-
-def run_strategy_check(s, bias_limit, vol_limit):
-    now_ts = int(get_tw_now().timestamp())
-    start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
-    try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
-                         params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
-        data = r.json()['chart']['result'][0]
-        c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
-        v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
-        if len(c_series) < 65: return None
-        vol_today = v_series.iloc[-1]
-        curr_vol_int = int(vol_today / 1000)
-        avg_vol_5d = v_series.tail(5).mean() / 1000
-        if avg_vol_5d < vol_limit: return None
-        ma30 = c_series.rolling(30).mean().iloc[-1]
-        ma45 = c_series.rolling(45).mean().iloc[-1]
-        ma60 = c_series.rolling(60).mean().iloc[-1]
-        curr_price = c_series.iloc[-1]
-        bias_30 = ((curr_price - ma30) / ma30) * 100
-        if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
-            return {**s, "收盤": round(curr_price, 2), "乖離30MA(%)": round(bias_30, 2), "成交量(張)": curr_vol_int, "量變動(%)": round(((vol_today-v_series.iloc[-2])/v_series.iloc[-2])*100, 2)}
-    except: return None
-    return None
 
 def draw_k_line(ticker, name):
     yt = yf.Ticker(ticker)
@@ -142,7 +117,7 @@ def get_tw_stock_news(code):
         resp = requests.get(news_url, headers=get_headers(), timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
         news_links = soup.find_all('a', href=True)
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單"]
+        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "亮眼"]
         neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
         results = []
         seen = set()
@@ -153,14 +128,14 @@ def get_tw_stock_news(code):
                 if len(title) < 8 or title in seen: continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
                 sentiment, color = ("📈 利多", "#ef5350") if any(w in title for w in pos_words) else (("📉 利空", "#26a69a") if any(w in title for w in neg_words) else ("💡 資訊", "#888888"))
-                results.append({"title": title, "link": full_link, "sentiment": sentiment, "color": color})
+                results.append({"title": title, "link": full_link, "sentiment": sentiment, "color": color, "publisher": "Yahoo股市"})
                 seen.add(title)
                 if len(results) >= 8: break
         return results
     except: return None
 
 # ============================================================
-# 4. Streamlit UI 與 掃描邏輯
+# 4. 掃描與分析
 # ============================================================
 
 st.sidebar.header("🎯 策略設定")
@@ -176,55 +151,79 @@ if st.session_state.is_scanning:
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
+    
+    def check_logic(s):
+        now_ts = int(get_tw_now().timestamp())
+        start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
+        try:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
+            data = r.json()['chart']['result'][0]
+            c = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
+            v = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
+            if len(c) < 65 or (v.tail(5).mean()/1000) < user_vol: return None
+            m30, m45, m60 = c.rolling(30).mean().iloc[-1], c.rolling(45).mean().iloc[-1], c.rolling(60).mean().iloc[-1]
+            bias = ((c.iloc[-1] - m30) / m30) * 100
+            if (m30 > m45 > m60) and (0 <= bias <= user_bias):
+                return {**s, "收盤": round(c.iloc[-1], 2), "乖離30MA(%)": round(bias, 2), "成交量(張)": int(v.iloc[-1]/1000), "量變動(%)": round(((v.iloc[-1]-v.iloc[-2])/v.iloc[-2])*100, 2)}
+        except: pass
+        return None
+
     with ThreadPoolExecutor(max_workers=30) as ex:
-        futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
+        futures = {ex.submit(check_logic, s): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
             if i % 100 == 0: bar.progress(i / len(stocks_list))
             res = f.result()
             if res: initial_hits.append(res)
+    
     if initial_hits:
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for f in as_completed(f_deep):
-                deep_res = f.result()
-                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+                d = f.result()
+                final_list.append({**f_deep[f], "本益比": d["pe"], "營收月增": d["mom"], "營收年增": d["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
         st.session_state.current_idx = 0
     st.session_state.is_scanning = False
     st.rerun()
 
 # ============================================================
-# 5. 表格呈現與【點擊聯動】功能
+# 5. 表格與點擊聯動 (修正後的關鍵部分)
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
     col_msg, col_dl = st.columns([3, 1])
-    with col_msg: st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
+    with col_msg: st.success(f"✅ 找到 {len(df)} 支標的")
     with col_dl:
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(label="📥 下載清單 (CSV)", data=csv, file_name=f'tw_stock_{get_tw_now().strftime("%Y%m%d")}.csv', use_container_width=True)
-    
+        st.download_button(label="📥 下載清單 (CSV)", data=df.to_csv(index=False).encode('utf-8-sig'), file_name='stock.csv', use_container_width=True)
+
+    # 為了支援 on_select，我們不使用 .style (Styler)，直接傳入 DataFrame
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     df_display = df[show_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
-    # 表格顯示 (開啟單列選取模式)
+    # 點擊表格事件
     event = st.dataframe(
-        df_display.style.map(lambda x: f'color: {"#ef5350" if x > 0 else "#26a69a" if x < 0 else "white"}; font-weight: bold', subset=['量變動(%)', '營收月增', '營收年增']),
-        use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single_row",
-        column_config={"乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", format="%.2f%%", min_value=0, max_value=user_bias)}
+        df_display, # 直接傳入，不加 .style.map
+        use_container_width=True, 
+        hide_index=True, 
+        on_select="rerun", 
+        selection_mode="single_row",
+        column_config={
+            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", format="%.2f%%", min_value=0, max_value=user_bias),
+            "量變動(%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "營收月增": st.column_config.NumberColumn(format="%.1f%%"),
+            "營收年增": st.column_config.NumberColumn(format="%.1f%%"),
+        }
     )
 
-    # 處理表格點擊事件
     if event and event.selection.rows:
         st.session_state.current_idx = event.selection.rows[0]
 
-    st.caption(f"💡 註1：點擊表格任一列可切換下方K線圖；進度條上限為 {user_bias}%。")
-    st.caption(f"💡 註2：營收與量變動正值顯示紅色。更新時間：{get_tw_now().strftime('%H:%M:%S')} (台灣)")
+    st.caption(f"💡 註：點擊表格任一列可切換 K線與新聞。更新時間：{get_tw_now().strftime('%H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖、迴圈切換與新聞
+    # 6. K線圖與迴圈切換
     # ============================================================
     st.divider()
     total = len(df)
@@ -246,13 +245,13 @@ if not st.session_state.scan_results.empty:
     k_fig = draw_k_line(current['ticker'], current['name'])
     if k_fig: st.plotly_chart(k_fig, use_container_width=True)
     
-    st.subheader(f"📰 {current['name']} 即時新聞")
-    news = get_tw_stock_news(current['code'])
-    if news:
-        for n in news:
+    st.subheader(f"📰 {current['name']} 即時中文新聞")
+    news_list = get_tw_stock_news(current['code'])
+    if news_list:
+        for n in news_list:
             st.markdown(f'<div style="padding:12px; border-bottom:1px solid #444; background:rgba(255,255,255,0.02); border-radius:10px; margin-bottom:8px;">'
                         f'<span style="color:{n["color"]}; font-weight:bold; border:1px solid {n["color"]}; padding:2px 8px; border-radius:15px; font-size:12px;">{n["sentiment"]}</span> '
+                        f'<span style="color:#aaa; font-size:12px;"> {n["publisher"]}</span><br>'
                         f'<a href="{n["link"]}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:16px;">{n["title"]}</a></div>', unsafe_allow_html=True)
-    else: st.warning("⚠️ 暫無新聞數據。")
 else:
     if not st.session_state.is_scanning: st.info("💡 調整參數後開始掃描。")
