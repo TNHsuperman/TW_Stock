@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.2", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.5", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -87,7 +87,7 @@ def fetch_deep_info(ticker: str) -> dict:
     return res
 
 # ============================================================
-# 3. 技術分析、繪圖與新聞抓取邏輯
+# 3. 技術分析、繪圖與中文新聞抓取
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
@@ -136,58 +136,55 @@ def draw_k_line(ticker, name):
     fig.add_trace(go.Scatter(x=df.index, y=df['MA45'], line=dict(color='blue', width=1.5), name='45MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color=colors), row=2, col=1)
-    fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖", xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
+    fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖", xaxis_rangeslider_visible=False, height=600, template='plotly_dark', margin=dict(t=50, b=50))
     fig.update_xaxes(type='category') 
     return fig
 
-def get_stock_news(ticker):
-    """深度解析新聞內容，防止標題抓取失敗"""
+def get_tw_stock_news(code):
+    """直接抓取台灣 Yahoo 股市新聞，確保純中文且連結有效"""
     try:
-        yt = yf.Ticker(ticker)
-        raw_news = yt.news
-        if not raw_news: return None
+        news_url = f"https://tw.stock.yahoo.com/quote/{code}/news"
+        resp = requests.get(news_url, headers=get_headers(), timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "缺貨", "訂單"]
-        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "裁員", "崩", "淡季", "壓力"]
+        # Yahoo 股市新聞列表的常見標籤結構
+        items = soup.select('li.List\(n\)')
+        if not items:
+            return None
+            
+        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
+        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
         
         results = []
-        for n in raw_news:
-            # 遍歷所有可能的標題位置
-            title = n.get('title')
-            if not title and 'content' in n:
-                title = n['content'].get('title')
-            if not title:
-                title = n.get('summary') or n.get('text')
+        for item in items[:8]:
+            title_tag = item.select_one('h3')
+            link_tag = item.select_one('a')
+            source_tag = item.select_one('span.C\(\$c-fuji-gray-l\)') # 來源與時間
             
-            # 如果還是沒有標題，跳過此則
-            if not title: continue
-
-            link = n.get('link') or "#"
-            publisher = n.get('publisher') or n.get('source') or '財經新聞'
-            
-            pub_time = n.get('providerPublishTime') or n.get('pubDate')
-            time_str = ""
-            if pub_time:
-                try:
-                    dt_obj = datetime.fromtimestamp(pub_time, tz=timezone(timedelta(hours=8)))
-                    time_str = dt_obj.strftime("%m/%d %H:%M")
-                except: pass
-
-            sentiment = "💡 資訊"
-            color = "#888888"
-            if any(w in title for w in pos_words):
-                sentiment = "📈 利多"
-                color = "#ef5350"
-            elif any(w in title for w in neg_words):
-                sentiment = "📉 利空"
-                color = "#26a69a"
+            if title_tag and link_tag:
+                title = title_tag.get_text(strip=True)
+                link = link_tag.get('href', '#')
+                if not link.startswith('http'):
+                    link = "https://tw.stock.yahoo.com" + link
                 
-            results.append({
-                "title": title, "link": link, "sentiment": sentiment, 
-                "color": color, "publisher": publisher, "time": time_str
-            })
-        return results[:8] # 最多回傳 8 則
-    except: return None
+                source_text = source_tag.get_text(strip=True) if source_tag else "財經新聞"
+                
+                sentiment = "💡 資訊"
+                color = "#888888"
+                if any(w in title for w in pos_words):
+                    sentiment = "📈 利多"
+                    color = "#ef5350"
+                elif any(w in title for w in neg_words):
+                    sentiment = "📉 利空"
+                    color = "#26a69a"
+                
+                results.append({
+                    "title": title, "link": link, "sentiment": sentiment, 
+                    "color": color, "publisher": source_text
+                })
+        return results
+    except Exception as e:
+        return None
 
 # ============================================================
 # 4. Streamlit UI 介面
@@ -223,8 +220,12 @@ if st.session_state.is_scanning:
             for j, f in enumerate(as_completed(f_deep), 1):
                 status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
-                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
-        st.session_state.scan_results = pd.DataFrame(final_list)
+                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+        # 修正欄位命名統一
+        df_temp = pd.DataFrame(final_list)
+        if "營營收月增" in df_temp.columns:
+            df_temp = df_temp.rename(columns={"營營收月增": "營收月增"})
+        st.session_state.scan_results = df_temp
     else:
         st.session_state.scan_results = pd.DataFrame()
         st.warning("查無條件標的。")
@@ -284,7 +285,7 @@ if not st.session_state.scan_results.empty:
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖與切換區 (穩定新聞顯示版本)
+    # 6. K線圖與中文新聞區
     # ============================================================
     st.divider()
     
@@ -310,9 +311,9 @@ if not st.session_state.scan_results.empty:
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
     
-    # 強化解析後的新聞分析區塊
-    st.subheader(f"📰 {current_stock['name']} 即時新聞與市場情緒")
-    news_list = get_stock_news(current_stock['ticker'])
+    # 中文新聞區塊
+    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與利多利空")
+    news_list = get_tw_stock_news(current_stock['code'])
     
     if news_list:
         for n in news_list:
@@ -322,7 +323,7 @@ if not st.session_state.scan_results.empty:
                     <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:3px 10px; border-radius:15px; font-size:12px;">
                         {n['sentiment']}
                     </span>
-                    <span style="color:#aaa; font-size:12px;">{n['publisher']} | {n['time']}</span>
+                    <span style="color:#aaa; font-size:12px;">{n['publisher']}</span>
                 </div>
                 <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">
                     {n['title']}
@@ -330,7 +331,7 @@ if not st.session_state.scan_results.empty:
             </div>
             """, unsafe_allow_html=True)
     else:
-        st.info("暫無此標的之近期相關新聞。")
+        st.info("目前該標的暫無即時中文新聞。")
 
 else:
     if not st.session_state.is_scanning:
