@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v8.1", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v8.2", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -121,32 +121,35 @@ def run_strategy_check(s, bias_limit, vol_limit):
 def draw_k_line(ticker, name):
     yt = yf.Ticker(ticker)
     df = yt.history(period="1y") 
-    if df.empty: return None
+    if df.empty or len(df) < 60: return None
     
     df['MA30'] = df['Close'].rolling(30).mean()
     df['MA45'] = df['Close'].rolling(45).mean()
     df['MA60'] = df['Close'].rolling(60).mean()
     
-    # 僅取最後 180 筆交易日
     df = df.tail(180).copy()
-    # 轉為字串日期，並在繪圖時使用 category 軸，可移除非交易日空隙
+    # 修正重點：為了防止 KeyError，先計算配色再轉換 index 格式
+    colors = ['#ef5350' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#26a69a' for i in range(len(df))]
+    
+    # 轉換 index 為字串以移除非交易日空隙
     df.index = df.index.strftime('%Y-%m-%d')
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
     
+    # K線圖
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], 
                                  name='K線', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
     
+    # 均線圖
     fig.add_trace(go.Scatter(x=df.index, y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA45'], line=dict(color='blue', width=1.5), name='45MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
     
-    # 成交量配色
-    colors = ['#ef5350' if df['Close'][i] >= df['Open'][i] else '#26a69a' for i in range(len(df))]
+    # 成交量
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color=colors), row=2, col=1)
     
     fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖", xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
-    fig.update_xaxes(type='category') # 移除非交易日
+    fig.update_xaxes(type='category') 
     return fig
 
 # ============================================================
@@ -159,7 +162,7 @@ user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
 if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
     st.session_state.is_scanning = True
-    st.session_state.current_idx = 0 # 重置索引
+    st.session_state.current_idx = 0 
     st.rerun()
 
 if st.session_state.is_scanning:
@@ -192,7 +195,7 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (完全復原原本表格邏輯)
+# 5. 結果顯示
 # ============================================================
 
 if not st.session_state.scan_results.empty:
@@ -206,20 +209,17 @@ if not st.session_state.scan_results.empty:
         tw_date = get_tw_now().strftime("%Y%m%d")
         st.download_button(label="📥 下載選股清單 (CSV)", data=csv, file_name=f'tw_stock_scan_{tw_date}.csv', mime='text/csv', use_container_width=True)
     
-    # 欄位與命名
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
-    # 配色邏輯
     def color_tw_style(val):
         if pd.isna(val): return ''
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
-    # 表格呈現 (復原原本配置)
     st.dataframe(
-        df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
+        df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營營收年增'] if c in df_display.columns]),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -242,20 +242,18 @@ if not st.session_state.scan_results.empty:
         }
     )
     
-    # 註解區
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖切換區 (新增於註解下方)
+    # 6. K線圖切換區
     # ============================================================
     st.divider()
     
     total_found = len(df)
     c_idx = st.session_state.current_idx
     
-    # 切換按鈕
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
         if st.button("⬅️ 上一支", use_container_width=True) and c_idx > 0:
@@ -268,13 +266,12 @@ if not st.session_state.scan_results.empty:
             st.session_state.current_idx += 1
             st.rerun()
     
-    # 繪圖
     current_stock = df.iloc[c_idx]
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
     else:
-        st.error("無法載入 K 線數據。")
+        st.warning("該標的 K 線數據不足或抓取失敗。")
 
 else:
     if not st.session_state.is_scanning:
