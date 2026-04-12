@@ -5,7 +5,7 @@ import requests
 from io import StringIO
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 import random
 import time
@@ -15,7 +15,7 @@ import yfinance as yf
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v7.2", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v7.3", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -29,6 +29,11 @@ if 'scan_results' not in st.session_state:
     st.session_state['scan_results'] = pd.DataFrame()
 if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
+
+# 獲取台灣時間的 Helper Function
+def get_tw_now():
+    # 強制轉換為 UTC+8
+    return datetime.now(timezone(timedelta(hours=8)))
 
 # ============================================================
 # 2. 數據清洗與深度資訊抓取
@@ -89,10 +94,12 @@ def fetch_deep_info(ticker: str) -> dict:
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
-    p2, p1 = int(time.time()), int((datetime.now() - timedelta(days=200)).timestamp())
+    # 使用台灣目前時間計算 timestamp
+    now_ts = int(get_tw_now().timestamp())
+    start_ts = int((get_tw_now() - timedelta(days=200)).timestamp())
     try:
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
-                         params={"period1":p1, "period2":p2, "interval":"1d"}, headers=get_headers(), timeout=10)
+                         params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
         data = r.json()['chart']['result'][0]
         c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
         v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
@@ -113,7 +120,6 @@ def run_strategy_check(s, bias_limit, vol_limit):
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
         
-        # 條件：多頭排列且乖離在設定範圍內
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {
                 **s, 
@@ -180,15 +186,16 @@ if not st.session_state.scan_results.empty:
         st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
+        # 下載檔名也改用台灣日期格式
+        tw_date = get_tw_now().strftime("%Y%m%d")
         st.download_button(
             label="📥 下載選股清單 (CSV)",
             data=csv,
-            file_name=f'tw_stock_scan_{datetime.now().strftime("%Y%m%d")}.csv',
+            file_name=f'tw_stock_scan_{tw_date}.csv',
             mime='text/csv',
             use_container_width=True
         )
     
-    # 定義顯示與重新命名
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
@@ -225,7 +232,8 @@ if not st.session_state.scan_results.empty:
     # 補回原本的註解
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
-    st.caption(f"💡 數據更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。")
+    # 使用正確的台灣時間格式
+    st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 else:
     if not st.session_state.is_scanning:
         st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
