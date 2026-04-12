@@ -200,8 +200,8 @@ if not st.session_state.scan_results.empty:
             ),
             
             "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
-            "營收月增": st.column_config.NumberColumn("月增", format="%.1f%%"),
-            "營收年增": st.column_config.NumberColumn("年增", format="%.1f%%"),
+            "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
+            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
             "本益比": st.column_config.NumberColumn("PE", format="%.1f"),
             "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
             "類股": st.column_config.TextColumn("產業別")
