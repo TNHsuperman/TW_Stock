@@ -109,7 +109,7 @@ def run_strategy_check(s, bias_limit, vol_limit):
 # ============================================================
 
 st.sidebar.header("🎯 策略設定")
-user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 5.0, step=0.1)
+user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
 if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
