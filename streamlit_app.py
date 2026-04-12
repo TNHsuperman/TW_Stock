@@ -19,21 +19,24 @@ from urllib3.util.retry import Retry
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.7", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.8", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/126.0.0.0'
 ]
 
-# 建立具備重試機制的全局 Session 以穩定抓取數據
+# 建立更強大的重試機制與連線池
 def get_robust_session():
     session = requests.Session()
+    # 針對 API 常見錯誤代碼進行自動重試
     retry = Retry(
-        total=3,  # 自動重試 3 次
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504]
+        total=5, 
+        backoff_factor=1, # 失敗後等待時間會隨次數增加 (1s, 2s, 4s...)
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
     session.mount('http://', adapter)
@@ -47,6 +50,8 @@ def get_headers():
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
         'Referer': 'https://tw.stock.yahoo.com/',
         'Connection': 'keep-alive'
     }
@@ -93,9 +98,10 @@ def clean_percent(text):
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    # 增加隨機微幅延遲避免過快被 Yahoo 封鎖
+    time.sleep(random.uniform(0.1, 0.3))
     try:
         yt = yf.Ticker(ticker)
-        # 增加一個微小的延遲，避免 API 頻繁請求被阻擋
         pe = yt.info.get('trailingPE')
         if pe: res["pe"] = float(pe)
     except: pass
@@ -117,21 +123,27 @@ def fetch_deep_info(ticker: str) -> dict:
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
+    # 隨機延遲，防止多個執行緒同時發出請求被伺服器拒絕
+    time.sleep(random.uniform(0.01, 0.2))
     now_ts = int(get_tw_now().timestamp())
     start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
     try:
-        # 使用具備重試機制的 session
         r = session.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
                          params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, 
-                         headers=get_headers(), timeout=10)
+                         headers=get_headers(), timeout=12)
         
         json_data = r.json()
         if 'chart' not in json_data or json_data['chart']['result'] is None:
             return None
             
-        data = json_data['chart']['result'][0]
-        c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
-        v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
+        res_data = json_data['chart']['result'][0]
+        close_data = res_data['indicators']['quote'][0].get('close')
+        vol_data = res_data['indicators']['quote'][0].get('volume')
+        
+        if not close_data or not vol_data: return None
+        
+        c_series = pd.Series(close_data).ffill().dropna()
+        v_series = pd.Series(vol_data).ffill().dropna()
         
         if len(c_series) < 65: return None
         
@@ -151,7 +163,7 @@ def run_strategy_check(s, bias_limit, vol_limit):
         
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {**s, "收盤": round(curr_price, 2), "乖離30MA(%)": round(bias_30, 2), "成交量(張)": curr_vol_int, "量變動(%)": round(vol_change, 2)}
-    except:
+    except Exception:
         return None
     return None
 
@@ -227,23 +239,28 @@ if st.session_state.is_scanning:
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場 (共 {len(stocks_list)} 檔)...")
     
-    # 使用 20 個線程以兼顧速度與穩定性
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    total_stocks = len(stocks_list)
+    status.text(f"🔍 正在初始化全市場掃描 (共 {total_stocks} 檔)...")
+    
+    # 使用較為保守的執行緒數量 (15)，降低被封鎖機率，確保結果一致性
+    with ThreadPoolExecutor(max_workers=15) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
-            if i % 50 == 0: bar.progress(i / len(stocks_list))
+            if i % 20 == 0: 
+                bar.progress(i / total_stocks)
+                status.text(f"🔍 已掃描 {i} / {total_stocks} 檔...")
             res = f.result()
             if res: initial_hits.append(res)
             
     if initial_hits:
-        status.text(f"📊 正在抓取財報數據 (命中 {len(initial_hits)} 檔)...")
+        status.text(f"📊 命中 {len(initial_hits)} 檔，正在抓取財務深度數據...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        # 財報數據抓取也改為分批處理，增加穩定度
+        with ThreadPoolExecutor(max_workers=8) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"進度: {j} / {len(initial_hits)}")
+                status.text(f"深度進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
@@ -303,7 +320,6 @@ if not st.session_state.scan_results.empty:
     total_found = len(df)
     c_idx = st.session_state.current_idx
     
-    # 防止 index 溢出（如果掃描結果變少）
     if c_idx >= total_found:
         c_idx = 0
         st.session_state.current_idx = 0
