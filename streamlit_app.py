@@ -113,6 +113,7 @@ def run_strategy_check(s, bias_limit, vol_limit):
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
         
+        # 條件：多頭排列且乖離在設定範圍內
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {
                 **s, 
@@ -187,10 +188,8 @@ if not st.session_state.scan_results.empty:
             use_container_width=True
         )
     
-    # 定義顯示順序與對應名稱 (修正欄位拼字)
+    # 定義顯示與重新命名
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
-    
-    # 確保只取 DataFrame 裡有的欄位
     available_cols = [c for c in show_cols if c in df.columns]
     df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
@@ -209,20 +208,24 @@ if not st.session_state.scan_results.empty:
             "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
             "乖離30MA(%)": st.column_config.ProgressColumn(
                 "30MA 乖離",
-                help=f"數值越小代表越貼近支撐。上限為 {user_bias}%",
+                help=f"數值越小(越接近0%)代表股價越貼近支撐線。目前上限設定為 {user_bias}%",
                 format="%.2f%%",
                 min_value=0,
                 max_value=user_bias,
             ),
             "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
             "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
-            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"), # 這裡已補回並修正
+            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
             "本益比": st.column_config.NumberColumn("PE", format="%.1f"),
             "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
             "類股": st.column_config.TextColumn("產業別")
         }
     )
-    st.caption(f"💡 數據產出時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。下載按鈕可匯出完整選股數據。")
+    
+    # 補回原本的註解
+    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
+    st.caption(f"💡 數據更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。")
 else:
     if not st.session_state.is_scanning:
         st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
