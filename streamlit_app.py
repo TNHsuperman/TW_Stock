@@ -208,7 +208,8 @@ if not st.session_state.scan_results.empty:
         }
     )
     
-    st.caption(f"💡 註：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
 else:
     if not st.session_state.is_scanning:
         st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
