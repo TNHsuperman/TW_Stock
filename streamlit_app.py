@@ -329,6 +329,14 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
 
+/* ── 隱藏 sidebar collapse 按鈕（keyboard_double_arrow tooltip 來源）── */
+[data-testid="stSidebarCollapseButton"] {
+    display: none !important;
+}
+[data-testid="collapsedControl"] {
+    display: none !important;
+}
+
 /* ── 全域底色 ── */
 html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
     background-color: #050d1a !important;
