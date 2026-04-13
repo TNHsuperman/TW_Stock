@@ -290,12 +290,9 @@ def draw_k_line(ticker, name):
             font=dict(size=11, color="#a0c4d8"),
         ),
         margin=dict(l=12, r=12, t=48, b=12),
-        xaxis=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
-        yaxis=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
-        xaxis2=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
-        yaxis2=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
     )
-    fig.update_xaxes(type='category')
+    fig.update_xaxes(type='category', gridcolor='#0ff1', showgrid=True, zeroline=False)
+    fig.update_yaxes(gridcolor='#0ff1', showgrid=True, zeroline=False)
     return fig
 
 def get_tw_stock_news(code):
