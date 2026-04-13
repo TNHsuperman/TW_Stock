@@ -288,8 +288,8 @@ def draw_k_line(ticker, name):
         ),
         margin=dict(l=12, r=12, t=48, b=12),
     )
-    fig.update_xaxes(type='category', gridcolor='#ffffff10', showgrid=True, zeroline=False)
-    fig.update_yaxes(gridcolor='#ffffff10', showgrid=True, zeroline=False)
+    fig.update_xaxes(type='category', gridcolor='rgba(255,255,255,0.06)', showgrid=True, zeroline=False)
+    fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)', showgrid=True, zeroline=False)
     return fig
 
 def get_tw_stock_news(code):
