@@ -44,6 +44,10 @@ if 'current_idx' not in st.session_state:
 # 記錄上一次點擊的列，用來偵測「是否真的換了一列」
 if 'last_selected_row' not in st.session_state:
     st.session_state['last_selected_row'] = None
+# 標記這次 rerun 是否由「上一支/下一支」按鈕觸發
+# 若是按鈕觸發，應忽略表格的 selection 事件，避免互蓋
+if 'nav_triggered' not in st.session_state:
+    st.session_state['nav_triggered'] = False
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
@@ -288,14 +292,18 @@ if not st.session_state.scan_results.empty:
     )
 
     # ── ★ 核心修正：點擊列 → 同步更新 current_idx ──────────────
-    # on_select="rerun" 已觸發重跑；此處直接更新 session_state 即可
-    if event and "selection" in event and event["selection"]["rows"]:
-        clicked_row = event["selection"]["rows"][0]
-        # 只有真正換了列才更新（避免同列重複觸發不必要的 state 更動）
-        if st.session_state.last_selected_row != clicked_row:
-            st.session_state.current_idx      = clicked_row
-            st.session_state.last_selected_row = clicked_row
-            # on_select="rerun" 已觸發重跑，不需再呼叫 st.rerun()
+    # nav_triggered=True 代表這次 rerun 由按鈕發起，
+    # 表格殘留的 selection 不應蓋掉按鈕設定的 current_idx
+    if st.session_state.nav_triggered:
+        # 消費掉這個旗標，下一次 rerun 恢復正常
+        st.session_state.nav_triggered = False
+    else:
+        # 由表格點擊觸發：讀取選取列並更新
+        if event and "selection" in event and event["selection"]["rows"]:
+            clicked_row = event["selection"]["rows"][0]
+            if st.session_state.last_selected_row != clicked_row:
+                st.session_state.current_idx       = clicked_row
+                st.session_state.last_selected_row = clicked_row
 
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
@@ -310,10 +318,10 @@ if not st.session_state.scan_results.empty:
 
     with btn_col1:
         if st.button("⬅️ 上一支", use_container_width=True):
-            # 先讀目前值，再計算新值，最後一次性寫入並 rerun
             new_idx = (st.session_state.current_idx - 1) % total_found
-            st.session_state.current_idx      = new_idx
-            st.session_state.last_selected_row = new_idx
+            st.session_state.current_idx       = new_idx
+            st.session_state.last_selected_row = None  # ★ 清除，防止 selection 蓋回
+            st.session_state.nav_triggered     = True  # ★ 標記為按鈕觸發
             st.rerun()
 
     with btn_col2:
@@ -329,8 +337,9 @@ if not st.session_state.scan_results.empty:
     with btn_col3:
         if st.button("下一支 ➡️", use_container_width=True):
             new_idx = (st.session_state.current_idx + 1) % total_found
-            st.session_state.current_idx      = new_idx
-            st.session_state.last_selected_row = new_idx
+            st.session_state.current_idx       = new_idx
+            st.session_state.last_selected_row = None  # ★ 清除，防止 selection 蓋回
+            st.session_state.nav_triggered     = True  # ★ 標記為按鈕觸發
             st.rerun()
 
     # ── K 線圖 ────────────────────────────────────────────────
