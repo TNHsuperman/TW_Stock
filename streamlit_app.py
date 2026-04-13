@@ -489,9 +489,11 @@ st.markdown(f"""
   <div style="display:flex;align-items:center;gap:20px;position:relative;">
     <div style="width:52px;height:52px;border:1px solid rgba(0,255,180,0.3);
       border-radius:4px;display:flex;align-items:center;justify-content:center;
-      font-size:26px;background:linear-gradient(135deg,rgba(0,100,60,0.4),rgba(0,50,30,0.6));
+      background:linear-gradient(135deg,rgba(0,100,60,0.4),rgba(0,50,30,0.6));
       box-shadow:0 0 20px rgba(0,255,180,0.15),inset 0 0 15px rgba(0,255,180,0.05);
-      flex-shrink:0;">💰</div>
+      flex-shrink:0; overflow:hidden; padding:8px;">
+      <img src="https://cdn-icons-png.flaticon.com/512/5501/5501377.png" style="width:100%; height:100%; object-fit:contain;">
+    </div>
     <div style="flex:1;">
       <div style="font-family:Orbitron,monospace;font-size:20px;font-weight:700;
         color:#00ffc0;letter-spacing:5px;text-shadow:0 0 30px rgba(0,255,180,0.5);
