@@ -44,6 +44,9 @@ if 'current_idx' not in st.session_state:
 # 記錄上一次點擊的列，用來偵測「是否真的換了一列」
 if 'last_selected_row' not in st.session_state:
     st.session_state['last_selected_row'] = None
+# 每次按鈕切換時改變 key，強制 Streamlit 重建表格 widget → selection 自動清空
+if 'table_key' not in st.session_state:
+    st.session_state['table_key'] = 0
 
 
 def get_tw_now():
@@ -273,6 +276,7 @@ if not st.session_state.scan_results.empty:
         hide_index=True,
         on_select="rerun",          # 點擊任一列時觸發 rerun
         selection_mode="single-row",
+        key=f"stock_table_{st.session_state.table_key}",  # ★ key 改變時表格重建，selection 清空
         column_config={
             "代碼":        st.column_config.TextColumn("代碼"),
             "名稱":        st.column_config.TextColumn("名稱"),
@@ -313,7 +317,8 @@ if not st.session_state.scan_results.empty:
         if st.button("⬅️ 上一支", use_container_width=True):
             new_idx = (st.session_state.current_idx - 1) % total_found
             st.session_state.current_idx       = new_idx
-            st.session_state.last_selected_row = new_idx  # ★ 與 current_idx 同步，封鎖舊 selection
+            st.session_state.last_selected_row = None          # 表格重建後無選取
+            st.session_state.table_key        += 1             # ★ 強制重建表格，清除打勾
             st.rerun()
 
     with btn_col2:
@@ -330,7 +335,8 @@ if not st.session_state.scan_results.empty:
         if st.button("下一支 ➡️", use_container_width=True):
             new_idx = (st.session_state.current_idx + 1) % total_found
             st.session_state.current_idx       = new_idx
-            st.session_state.last_selected_row = new_idx  # ★ 與 current_idx 同步，封鎖舊 selection
+            st.session_state.last_selected_row = None          # 表格重建後無選取
+            st.session_state.table_key        += 1             # ★ 強制重建表格，清除打勾
             st.rerun()
 
     # ── K 線圖 ────────────────────────────────────────────────
