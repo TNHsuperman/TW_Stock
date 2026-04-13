@@ -275,24 +275,21 @@ def draw_k_line(ticker, name):
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
     fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=colors), row=2, col=1)
     fig.update_layout(
-        title=dict(
-            text=f"<b>{name}</b>  <span style='color:#4a7a8a;font-size:14px;'>({ticker})</span>",
-            font=dict(family="Share Tech Mono, monospace", size=16, color="#00ffc8"),
-        ),
+        title=f"{name} ({ticker})",
         xaxis_rangeslider_visible=False,
         height=620,
         template='plotly_dark',
         paper_bgcolor='#050d1a',
         plot_bgcolor='#070f1f',
-        font=dict(family="Share Tech Mono, monospace", color="#7a9aaa"),
+        font=dict(color="#7a9aaa"),
         legend=dict(
-            bgcolor='#0a1628', bordercolor='#0ff2', borderwidth=1,
+            bgcolor='#0a1628', bordercolor='#1a3a4a', borderwidth=1,
             font=dict(size=11, color="#a0c4d8"),
         ),
         margin=dict(l=12, r=12, t=48, b=12),
     )
-    fig.update_xaxes(type='category', gridcolor='#0ff1', showgrid=True, zeroline=False)
-    fig.update_yaxes(gridcolor='#0ff1', showgrid=True, zeroline=False)
+    fig.update_xaxes(type='category', gridcolor='#ffffff10', showgrid=True, zeroline=False)
+    fig.update_yaxes(gridcolor='#ffffff10', showgrid=True, zeroline=False)
     return fig
 
 def get_tw_stock_news(code):
