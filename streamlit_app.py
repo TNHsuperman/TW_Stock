@@ -162,6 +162,33 @@ def calc_ma_signals(history_map: dict, stock_map: list,
     return hits
 
 
+def clean_percent(text):
+    if not text or text == "N/A": return np.nan
+    try: return float(text.replace('%', '').replace(',', ''))
+    except: return np.nan
+
+def fetch_deep_info(ticker: str) -> dict:
+    code = ticker.split('.')[0]
+    res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    try:
+        yt = yf.Ticker(ticker)
+        pe = yt.info.get('trailingPE')
+        if pe: res["pe"] = float(pe)
+    except: pass
+    try:
+        rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
+        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
+        soup = BeautifulSoup(rev_resp.text, 'html.parser')
+        row = soup.select_one(r'li.List\(n\)')
+        if row:
+            percents = [s.get_text(strip=True) for s in row.find_all('span') if '%' in s.get_text()]
+            if len(percents) >= 2:
+                res["mom"] = clean_percent(percents[0])
+                res["yoy"] = clean_percent(percents[1])
+    except: pass
+    return res
+
+
 @st.cache_data(ttl=3600)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
     """抓 K 線用歷史資料（含 OHLCV），最多 6 個月，來自官方 API。"""
