@@ -495,11 +495,17 @@ st.sidebar.markdown("""
     color:#00ffc8;
     letter-spacing:3px;
     padding:8px 0 12px;
-    border-bottom:1px solid #00ffc830;
-    margin-bottom:12px;
-">⚙ STRATEGY CONFIG</div>
+    border-bottom:1px solid rgba(0,255,200,0.2);
+    margin-bottom:16px;
+">⚙ &nbsp;STRATEGY CONFIG</div>
+<div style="
+    font-family:'Noto Sans TC',sans-serif;
+    font-size:16px;
+    font-weight:700;
+    color:#c8d8e8;
+    margin-bottom:8px;
+">🎯 &nbsp;策略設定</div>
 """, unsafe_allow_html=True)
-st.sidebar.markdown("### 🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol  = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
