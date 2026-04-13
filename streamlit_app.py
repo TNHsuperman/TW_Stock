@@ -476,62 +476,62 @@ p, li, .stMarkdown { font-family: 'Noto Sans TC', sans-serif !important; }
 
 # ── 頁頭 Banner ───────────────────────────────────────────────
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
-st.markdown(f'''
-<div style='background:linear-gradient(135deg,#02080f 0%,#04121e 50%,#02080f 100%);
+st.markdown(f"""
+<div style="background:linear-gradient(135deg,#02080f 0%,#04121e 50%,#02080f 100%);
   border-bottom:1px solid rgba(0,200,140,0.2);padding:24px 36px 20px;
-  margin-bottom:12px;position:relative;overflow:hidden;'>
-  <div style='position:absolute;top:0;left:0;right:0;height:1px;
-    background:linear-gradient(90deg,transparent,#00ffc0 30%,#38a8e8 70%,transparent);opacity:0.6;'></div>
-  <div style='position:absolute;right:-60px;top:-60px;width:200px;height:200px;
-    border:1px solid rgba(0,200,140,0.06);border-radius:50%;'></div>
-  <div style='position:absolute;right:-30px;top:-30px;width:140px;height:140px;
-    border:1px solid rgba(0,200,140,0.08);border-radius:50%;'></div>
-  <div style='display:flex;align-items:center;gap:20px;position:relative;'>
-    <div style='width:52px;height:52px;border:1px solid rgba(0,255,180,0.3);
+  margin-bottom:12px;position:relative;overflow:hidden;">
+  <div style="position:absolute;top:0;left:0;right:0;height:1px;
+    background:linear-gradient(90deg,transparent,#00ffc0 30%,#38a8e8 70%,transparent);opacity:0.6;"></div>
+  <div style="position:absolute;right:-60px;top:-60px;width:200px;height:200px;
+    border:1px solid rgba(0,200,140,0.06);border-radius:50%;"></div>
+  <div style="position:absolute;right:-30px;top:-30px;width:140px;height:140px;
+    border:1px solid rgba(0,200,140,0.08);border-radius:50%;"></div>
+  <div style="display:flex;align-items:center;gap:20px;position:relative;">
+    <div style="width:52px;height:52px;border:1px solid rgba(0,255,180,0.3);
       border-radius:4px;display:flex;align-items:center;justify-content:center;
       font-size:26px;background:linear-gradient(135deg,rgba(0,100,60,0.4),rgba(0,50,30,0.6));
       box-shadow:0 0 20px rgba(0,255,180,0.15),inset 0 0 15px rgba(0,255,180,0.05);
-      flex-shrink:0;'>📈</div>
-    <div style='flex:1;'>
-      <div style='font-family:Orbitron,monospace;font-size:20px;font-weight:700;
+      flex-shrink:0;">📈</div>
+    <div style="flex:1;">
+      <div style="font-family:Orbitron,monospace;font-size:20px;font-weight:700;
         color:#00ffc0;letter-spacing:5px;text-shadow:0 0 30px rgba(0,255,180,0.5);
-        line-height:1.2;margin-bottom:5px;'>台股智慧選股系統</div>
-      <div style='display:flex;align-items:center;gap:16px;'>
-        <span style='font-family:Share Tech Mono,monospace;font-size:10px;
-          color:#2a6a5a;letter-spacing:2px;'>TAIWAN STOCK SCANNER</span>
-        <span style='width:1px;height:10px;background:rgba(0,200,140,0.2);'></span>
-        <span style='font-family:Share Tech Mono,monospace;font-size:10px;
-          color:#2a6a5a;letter-spacing:2px;'>MA STRATEGY ENGINE v9.9</span>
+        line-height:1.2;margin-bottom:5px;">台股智慧選股系統</div>
+      <div style="display:flex;align-items:center;gap:16px;">
+        <span style="font-family:Share Tech Mono,monospace;font-size:10px;
+          color:#2a6a5a;letter-spacing:2px;">TAIWAN STOCK SCANNER</span>
+        <span style="width:1px;height:10px;background:rgba(0,200,140,0.2);"></span>
+        <span style="font-family:Share Tech Mono,monospace;font-size:10px;
+          color:#2a6a5a;letter-spacing:2px;">MA STRATEGY ENGINE v9.9</span>
       </div>
     </div>
-    <div style='text-align:right;flex-shrink:0;'>
-      <div style='font-family:Share Tech Mono,monospace;font-size:9px;
-        color:#1a5040;letter-spacing:2px;margin-bottom:6px;'>ACTIVE STRATEGY</div>
-      <div style='font-family:Orbitron,monospace;font-size:11px;color:#00ffc0;
+    <div style="text-align:right;flex-shrink:0;">
+      <div style="font-family:Share Tech Mono,monospace;font-size:9px;
+        color:#1a5040;letter-spacing:2px;margin-bottom:6px;">ACTIVE STRATEGY</div>
+      <div style="font-family:Orbitron,monospace;font-size:11px;color:#00ffc0;
         letter-spacing:2px;border:1px solid rgba(0,255,180,0.2);padding:4px 12px;
-        border-radius:2px;background:rgba(0,100,60,0.15);'>MA30 › MA45 › MA60</div>
-      <div style='font-family:Share Tech Mono,monospace;font-size:9px;
-        color:#1a5040;letter-spacing:1px;margin-top:5px;'>{_now_str} &nbsp;TWN +08:00</div>
+        border-radius:2px;background:rgba(0,100,60,0.15);">MA30 › MA45 › MA60</div>
+      <div style="font-family:Share Tech Mono,monospace;font-size:9px;
+        color:#1a5040;letter-spacing:1px;margin-top:5px;">{_now_str} &nbsp;TWN +08:00</div>
     </div>
   </div>
-  <div style='margin-top:16px;padding-top:12px;border-top:1px solid rgba(0,200,140,0.08);
-    display:flex;gap:32px;'>
-    <div style='font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;'>
-      <span style='color:#2a7a5a;'>◆</span> &nbsp;上市 TWSE &nbsp;+&nbsp; 上櫃 TPEX 全市場掃描</div>
-    <div style='font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;'>
-      <span style='color:#2a7a5a;'>◆</span> &nbsp;均線多頭排列 · 乖離率過濾 · 成交量門檻</div>
-    <div style='font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;'>
-      <span style='color:#2a7a5a;'>◆</span> &nbsp;PE 本益比 · 月增率 · 年增率 財務篩選</div>
+  <div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(0,200,140,0.08);
+    display:flex;gap:32px;">
+    <div style="font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;">
+      <span style="color:#2a7a5a;">◆</span> &nbsp;上市 TWSE &nbsp;+&nbsp; 上櫃 TPEX 全市場掃描</div>
+    <div style="font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;">
+      <span style="color:#2a7a5a;">◆</span> &nbsp;均線多頭排列 · 乖離率過濾 · 成交量門檻</div>
+    <div style="font-family:Share Tech Mono,monospace;font-size:10px;color:#1a5040;letter-spacing:1px;">
+      <span style="color:#2a7a5a;">◆</span> &nbsp;PE 本益比 · 月增率 · 年增率 財務篩選</div>
   </div>
 </div>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ── Sidebar 美化 ──────────────────────────────────────────────
 st.sidebar.markdown("""
-<div style='padding: 8px 0 20px;'>
+<div style="padding: 8px 0 20px;">
   <!-- 頂部 logo 區 -->
-  <div style='
-    font-family:'Orbitron",monospace;
+  <div style="
+    font-family:Orbitron,monospace;
     font-size:11px; font-weight:700;
     color:#00c890; letter-spacing:4px;
     padding-bottom:14px;
@@ -540,25 +540,25 @@ st.sidebar.markdown("""
   ">⚙ &nbsp;STRATEGY CONFIG</div>
 
   <!-- 策略說明 badge -->
-  <div style='
+  <div style="
     background:rgba(0,80,50,0.2);
     border:1px solid rgba(0,200,140,0.15);
     border-radius:2px;
     padding:10px 12px;
     margin-bottom:18px;
   '>
-    <div style='font-family:'Share Tech Mono",monospace; font-size:9px;
+    <div style="font-family:Share Tech Mono,monospace; font-size:9px;
       color:#1a6050; letter-spacing:2px; margin-bottom:6px;">SIGNAL CONDITION</div>
-    <div style='font-family:'Share Tech Mono",monospace; font-size:11px; color:#00c890;">
+    <div style="font-family:Share Tech Mono,monospace; font-size:11px; color:#00c890;">
       MA30 &gt; MA45 &gt; MA60
     </div>
-    <div style='font-family:'Share Tech Mono",monospace; font-size:9px;
+    <div style="font-family:Share Tech Mono,monospace; font-size:9px;
       color:#1a6050; letter-spacing:1px; margin-top:4px;">
       BULLISH ALIGNMENT · BIAS FILTER
     </div>
   </div>
 
-  <div style='font-family:'Noto Sans TC",sans-serif;
+  <div style="font-family:Noto Sans TC,sans-serif;
     font-size:13px; font-weight:500; color:#70a0b0;
     letter-spacing:2px; margin-bottom:4px;">
     📐 &nbsp;參數設定
@@ -653,11 +653,11 @@ if not st.session_state.scan_results.empty:
         padding:14px 18px;
         border-top: 2px solid #00c890;
       ">
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;
           color:#1a6050;letter-spacing:2px;margin-bottom:6px;">SIGNALS FOUND</div>
-        <div style="font-family:"Orbitron",monospace;font-size:26px;
+        <div style="font-family:Orbitron,monospace;font-size:26px;
           font-weight:700;color:#00ffc0;text-shadow:0 0 15px rgba(0,255,180,0.4);">{len(df)}</div>
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;color:#1a6050;margin-top:3px;">支符合條件標的</div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;color:#1a6050;margin-top:3px;">支符合條件標的</div>
       </div>
       <div style="
         background:linear-gradient(135deg,rgba(0,40,80,0.3),rgba(0,20,50,0.5));
@@ -665,11 +665,11 @@ if not st.session_state.scan_results.empty:
         padding:14px 18px;
         border-top: 2px solid #38a8e8;
       ">
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;
           color:#1a4060;letter-spacing:2px;margin-bottom:6px;">STRATEGY</div>
-        <div style="font-family:"Orbitron",monospace;font-size:13px;
+        <div style="font-family:Orbitron,monospace;font-size:13px;
           font-weight:600;color:#38a8e8;margin-top:4px;">MA BULL</div>
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;color:#1a4060;margin-top:3px;">30 › 45 › 60 均線排列</div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;color:#1a4060;margin-top:3px;">30 › 45 › 60 均線排列</div>
       </div>
       <div style="
         background:linear-gradient(135deg,rgba(60,30,0,0.3),rgba(40,20,0,0.5));
@@ -677,11 +677,11 @@ if not st.session_state.scan_results.empty:
         padding:14px 18px;
         border-top: 2px solid #c8900a;
       ">
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;
           color:#504010;letter-spacing:2px;margin-bottom:6px;">BIAS LIMIT</div>
-        <div style="font-family:"Orbitron",monospace;font-size:26px;
+        <div style="font-family:Orbitron,monospace;font-size:26px;
           font-weight:700;color:#e0a020;">{user_bias}<span style="font-size:14px;">%</span></div>
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;color:#504010;margin-top:3px;">30MA 乖離上限</div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;color:#504010;margin-top:3px;">30MA 乖離上限</div>
       </div>
       <div style="
         background:linear-gradient(135deg,rgba(40,0,60,0.3),rgba(20,0,40,0.5));
@@ -689,11 +689,11 @@ if not st.session_state.scan_results.empty:
         padding:14px 18px;
         border-top: 2px solid #7840c0;
       ">
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;
           color:#302050;letter-spacing:2px;margin-bottom:6px;">SCAN TIME</div>
-        <div style="font-family:"Orbitron",monospace;font-size:13px;
+        <div style="font-family:Orbitron,monospace;font-size:13px;
           font-weight:600;color:#a070e0;margin-top:4px;">{get_tw_now().strftime("%H:%M")}</div>
-        <div style="font-family:"Share Tech Mono",monospace;font-size:9px;color:#302050;margin-top:3px;">{get_tw_now().strftime("%Y-%m-%d")} TWN</div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:9px;color:#302050;margin-top:3px;">{get_tw_now().strftime("%Y-%m-%d")} TWN</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -757,7 +757,7 @@ if not st.session_state.scan_results.empty:
             st.session_state.last_selected_row = clicked_row
 
     st.markdown(f"""
-    <div style="font-family:"Share Tech Mono",monospace; font-size:11px;
+    <div style="font-family:Share Tech Mono,monospace; font-size:11px;
         color:#2a4a5a; padding:6px 4px; letter-spacing:0.5px; line-height:2;">
         ▸ 進度條滿格 = 乖離率接近上限 ({user_bias}%)，越短代表越貼近 30MA
         &nbsp;&nbsp;▸ 紅字 = 正增長 / 綠字 = 負增長
@@ -770,18 +770,18 @@ if not st.session_state.scan_results.empty:
     # ============================================================
     # ── K 線圖標題列 ─────────────────────────────────────────────
     st.markdown("""
-    <div style='
+    <div style="
         display:flex; align-items:center; gap:12px;
         padding: 14px 0 10px;
         border-top: 1px solid rgba(0,200,140,0.12);
         margin-top:8px;
-    '>
-        <div style='width:3px; height:20px; background:linear-gradient(180deg,#00ffc0,#38a8e8);
-            border-radius:2px; flex-shrink:0;'></div>
-        <div style='font-family:'Orbitron",monospace; font-size:11px; font-weight:600;
+    ">
+        <div style="width:3px; height:20px; background:linear-gradient(180deg,#00ffc0,#38a8e8);
+            border-radius:2px; flex-shrink:0;"></div>
+        <div style="font-family:Orbitron,monospace; font-size:11px; font-weight:600;
             color:#00c890; letter-spacing:3px;">K-LINE CHART</div>
-        <div style='flex:1; height:1px; background:rgba(0,200,140,0.08);'></div>
-        <div style='font-family:'Share Tech Mono",monospace; font-size:9px;
+        <div style="flex:1; height:1px; background:rgba(0,200,140,0.08);"></div>
+        <div style="font-family:Share Tech Mono,monospace; font-size:9px;
             color:#1a5040; letter-spacing:2px;">MA30 · MA45 · MA60</div>
     </div>
     """, unsafe_allow_html=True)
@@ -801,7 +801,7 @@ if not st.session_state.scan_results.empty:
         st.markdown(f"""
         <div style="
             text-align:center;
-            font-family:"Share Tech Mono",monospace;
+            font-family:Share Tech Mono,monospace;
             padding: 8px 0;
         ">
             <span style="color:#4a7a8a; font-size:11px; letter-spacing:2px;">
@@ -836,7 +836,7 @@ if not st.session_state.scan_results.empty:
     # ── 新聞 ──────────────────────────────────────────────────
     st.markdown(f"""
     <div style="
-        font-family:"Share Tech Mono",monospace;
+        font-family:Share Tech Mono,monospace;
         font-size:13px; color:#4db8ff; letter-spacing:3px;
         padding: 16px 0 8px;
         border-top: 1px solid #4db8ff20;
@@ -866,15 +866,15 @@ if not st.session_state.scan_results.empty:
                         color:{n['color']};
                         border:1px solid {n['color']}40;
                         padding:3px 12px; border-radius:1px;
-                        font-family:"Share Tech Mono",monospace;
+                        font-family:Share Tech Mono,monospace;
                         font-size:11px; letter-spacing:1px;
                     ">{n['sentiment']}</span>
-                    <span style="font-family:"Share Tech Mono",monospace;
+                    <span style="font-family:Share Tech Mono,monospace;
                         color:#1a4050; font-size:10px; letter-spacing:1px;">{n['publisher']}</span>
                 </div>
                 <a href="{n['link']}" target="_blank" style="
                     text-decoration:none; color:#c0d8e8;
-                    font-family:"Noto Sans TC",sans-serif;
+                    font-family:Noto Sans TC,sans-serif;
                     font-size:15px; font-weight:400; line-height:1.6;
                     letter-spacing:0.5px;
                 ">{n['title']}</a>
@@ -886,57 +886,29 @@ if not st.session_state.scan_results.empty:
 else:
     if not st.session_state.is_scanning:
         st.markdown("""
-        <div style='text-align:center; padding: 70px 20px 80px; position:relative; overflow:hidden;'>
-          <!-- 背景裝飾同心圓 -->
-          <div style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:320px;height:320px;border:1px solid rgba(0,200,140,0.04);border-radius:50%;'></div>
-          <div style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:220px;height:220px;border:1px solid rgba(0,200,140,0.06);border-radius:50%;'></div>
-          <div style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:130px;height:130px;border:1px solid rgba(0,200,140,0.08);border-radius:50%;'></div>
-
-          <div style='position:relative;'>
-            <!-- Icon -->
-            <div style='
-              font-size:48px; margin-bottom:24px;
-              filter:drop-shadow(0 0 24px rgba(0,255,180,0.5));
-            '>📈</div>
-
-            <!-- 主標 -->
-            <div style='
-              font-family:'Orbitron",monospace;
-              font-size:22px; font-weight:700;
-              color:#00ffc0; letter-spacing:6px;
-              text-shadow:0 0 30px rgba(0,255,180,0.4);
-              margin-bottom:10px;
-            ">READY TO SCAN</div>
-
-            <!-- 分隔線 -->
-            <div style='
-              width:120px; height:1px; margin:0 auto 20px;
-              background:linear-gradient(90deg,transparent,#00ffc040,transparent);
-            '></div>
-
-            <!-- 策略描述 -->
-            <div style='
-              font-family:'Share Tech Mono",monospace;
-              font-size:12px; color:#1a6050; letter-spacing:3px; margin-bottom:8px;
-            ">均線多頭排列策略</div>
-            <div style='
-              font-family:'Orbitron",monospace;
-              font-size:13px; font-weight:600;
-              color:#006040; letter-spacing:2px; margin-bottom:24px;
-            ">MA30 › MA45 › MA60</div>
-
-            <!-- 指引 -->
-            <div style='
-              display:inline-block;
-              background:rgba(0,50,30,0.3);
-              border:1px solid rgba(0,200,140,0.1);
-              border-radius:2px; padding:10px 24px;
-              font-family:'Share Tech Mono",monospace;
-              font-size:11px; color:#1a5040; letter-spacing:1px;
-            ">← 調整左側參數後點擊掃描按鈕開始</div>
+        <div style="text-align:center;padding:70px 20px 80px;position:relative;overflow:hidden;">
+          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+            width:320px;height:320px;border:1px solid rgba(0,200,140,0.04);border-radius:50%;"></div>
+          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+            width:220px;height:220px;border:1px solid rgba(0,200,140,0.06);border-radius:50%;"></div>
+          <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+            width:130px;height:130px;border:1px solid rgba(0,200,140,0.08);border-radius:50%;"></div>
+          <div style="position:relative;">
+            <div style="font-size:48px;margin-bottom:24px;
+              filter:drop-shadow(0 0 24px rgba(0,255,180,0.5));">📈</div>
+            <div style="font-family:Orbitron,monospace;font-size:22px;font-weight:700;
+              color:#00ffc0;letter-spacing:6px;text-shadow:0 0 30px rgba(0,255,180,0.4);
+              margin-bottom:10px;">READY TO SCAN</div>
+            <div style="width:120px;height:1px;margin:0 auto 20px;
+              background:linear-gradient(90deg,transparent,rgba(0,255,192,0.25),transparent);"></div>
+            <div style="font-family:Share Tech Mono,monospace;font-size:12px;
+              color:#1a6050;letter-spacing:3px;margin-bottom:8px;">均線多頭排列策略</div>
+            <div style="font-family:Orbitron,monospace;font-size:13px;font-weight:600;
+              color:#006040;letter-spacing:2px;margin-bottom:24px;">MA30 › MA45 › MA60</div>
+            <div style="display:inline-block;background:rgba(0,50,30,0.3);
+              border:1px solid rgba(0,200,140,0.1);border-radius:2px;padding:10px 24px;
+              font-family:Share Tech Mono,monospace;font-size:11px;
+              color:#1a5040;letter-spacing:1px;">← 調整左側參數後點擊掃描按鈕開始</div>
           </div>
         </div>
         """, unsafe_allow_html=True)
