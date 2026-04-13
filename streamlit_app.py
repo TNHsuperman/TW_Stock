@@ -4,6 +4,8 @@ import numpy as np
 import requests
 from io import StringIO
 import urllib3
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
@@ -17,7 +19,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.7", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.8", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -33,6 +35,15 @@ def get_headers():
         'Referer': 'https://tw.stock.yahoo.com/',
         'Connection': 'keep-alive'
     }
+
+# 建立具備重試機制的 Session
+def get_session():
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
 if 'scan_results' not in st.session_state:
     st.session_state['scan_results'] = pd.DataFrame()
@@ -51,11 +62,12 @@ def get_tw_now():
 @st.cache_data(ttl=86400)
 def get_stock_market_list():
     stocks = []
+    session = get_session()
     try:
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
-            r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
+            r = session.get(url, headers=get_headers(), timeout=15, verify=False)
             df_isin = pd.read_html(StringIO(r.text))[0]
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
@@ -64,7 +76,8 @@ def get_stock_market_list():
                     code, name = val.split('　')
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
-    except: pass
+    except Exception as e:
+        st.error(f"獲取市場清單失敗: {e}")
     return stocks
 
 def clean_percent(text):
@@ -75,14 +88,18 @@ def clean_percent(text):
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    session = get_session()
+    # 抓取本益比 (yf 抓不到時嘗試 Yahoo 網頁)
     try:
         yt = yf.Ticker(ticker)
         pe = yt.info.get('trailingPE')
         if pe: res["pe"] = float(pe)
     except: pass
+    
+    # 抓取營收
     try:
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
-        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
+        rev_resp = session.get(rev_url, headers=get_headers(), timeout=10)
         soup = BeautifulSoup(rev_resp.text, 'html.parser')
         row = soup.select_one(r'li.List\(n\)')
         if row:
@@ -100,12 +117,24 @@ def fetch_deep_info(ticker: str) -> dict:
 def run_strategy_check(s, bias_limit, vol_limit):
     now_ts = int(get_tw_now().timestamp())
     start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
+    session = get_session()
     try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
+        # 增加微小隨機延遲避免併發被擋
+        time.sleep(random.uniform(0.05, 0.2))
+        r = session.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
                          params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
-        data = r.json()['chart']['result'][0]
-        c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
-        v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
+        
+        json_data = r.json()
+        if not json_data['chart']['result']: return None
+        
+        data = json_data['chart']['result'][0]
+        c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill()
+        v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill()
+        
+        # 清除 NaN
+        c_series = c_series.dropna()
+        v_series = v_series.dropna()
+
         if len(c_series) < 65: return None
         
         vol_today = v_series.iloc[-1]
@@ -113,6 +142,7 @@ def run_strategy_check(s, bias_limit, vol_limit):
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
         curr_vol_int = int(vol_today / 1000)
         avg_vol_5d = v_series.tail(5).mean() / 1000
+        
         if avg_vol_5d < vol_limit: return None
         
         ma30 = c_series.rolling(30).mean().iloc[-1]
@@ -148,9 +178,10 @@ def draw_k_line(ticker, name):
     return fig
 
 def get_tw_stock_news(code):
+    session = get_session()
     try:
         news_url = f"https://tw.stock.yahoo.com/quote/{code}/news"
-        resp = requests.get(news_url, headers=get_headers(), timeout=10)
+        resp = session.get(news_url, headers=get_headers(), timeout=10)
         if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'html.parser')
         news_links = soup.find_all('a', href=True)
@@ -160,7 +191,7 @@ def get_tw_stock_news(code):
         seen_titles = set()
         for link in news_links:
             href = link.get('href')
-            if '/news/' in href and 'tw.stock.yahoo.com' in href or href.startswith('/news/'):
+            if '/news/' in href and ('tw.stock.yahoo.com' in href or href.startswith('/news/')):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles: continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
@@ -196,26 +227,31 @@ if st.session_state.is_scanning:
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場...")
-    with ThreadPoolExecutor(max_workers=30) as ex:
+    
+    # 第一階段：技術指標篩選 (調降 worker 數量增加穩定性)
+    status.text(f"🔍 正在掃描全市場個股技術面 (共 {len(stocks_list)} 支)...")
+    with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
-            if i % 100 == 0: bar.progress(i / len(stocks_list))
+            if i % 50 == 0: bar.progress(i / len(stocks_list))
             res = f.result()
             if res: initial_hits.append(res)
+            
     if initial_hits:
-        status.text(f"📊 正在抓取財報數據...")
+        # 第二階段：深度財報抓取
+        status.text(f"📊 正在抓取篩選出之 {len(initial_hits)} 支標的的財報數據...")
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"進度: {j} / {len(initial_hits)}")
+                status.text(f"深度抓取進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
-        st.warning("查無條件標的。")
+        st.warning("查無符合條件之標的。")
+        
     st.session_state.is_scanning = False
     st.rerun()
 
@@ -231,7 +267,7 @@ if not st.session_state.scan_results.empty:
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
         tw_date = get_tw_now().strftime("%Y%m%d")
-        st.download_button(label="📥 下載選股清單 (CSV)", data=csv, file_name=f'tw_stock_scan_{tw_date}.csv', mime='text/csv', use_container_width=True)
+        st.download_button(label="📥 下載清單 (CSV)", data=csv, file_name=f'tw_stock_{tw_date}.csv', mime='text/csv', use_container_width=True)
     
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
@@ -258,8 +294,6 @@ if not st.session_state.scan_results.empty:
             "類股": st.column_config.TextColumn("產業別")
         }
     )
-    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
-    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
@@ -271,14 +305,12 @@ if not st.session_state.scan_results.empty:
     
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
-        # 修正：首尾輪迴邏輯 (如果當前是 0，跳到最後一個)
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state.current_idx = (c_idx - 1) % total_found
             st.rerun()
     with btn_col2:
         st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
     with btn_col3:
-        # 修正：首尾輪迴邏輯 (如果當前是最後一個，跳回 0)
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state.current_idx = (c_idx + 1) % total_found
             st.rerun()
@@ -287,7 +319,7 @@ if not st.session_state.scan_results.empty:
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig: st.plotly_chart(k_fig, use_container_width=True)
     
-    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
+    st.subheader(f"📰 {current_stock['name']} 即時中文新聞")
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
         for n in news_list:
@@ -300,6 +332,6 @@ if not st.session_state.scan_results.empty:
                 <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">{n['title']}</a>
             </div>
             """, unsafe_allow_html=True)
-    else: st.warning("⚠️ 無法獲取即時新聞。")
+    else: st.warning("⚠️ 目前無相關新聞。")
 else:
     if not st.session_state.is_scanning: st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
