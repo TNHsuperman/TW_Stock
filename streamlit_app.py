@@ -76,228 +76,91 @@ def get_stock_market_list():
     return stocks
 
 # ============================================================
-# 2-A. 批次取得今日全市場行情（TWSE + TPEX）
+# 2-A. yfinance 批次下載（核心加速）
 # ============================================================
 
-@st.cache_data(ttl=1800)  # 快取 30 分鐘，避免重複打 API
-def get_today_quote_batch() -> dict:
+@st.cache_data(ttl=3600)
+def download_batch_history(tickers: tuple) -> dict:
     """
-    一次拿回上市＋上櫃所有股票今日收盤價與成交量。
-    回傳 dict: { "2330": {"close": 910.0, "volume": 45000, "market": "TW"}, ... }
-    非交易日或抓取失敗則回傳空 dict。
+    用 yfinance.download() 一次下載多支股票的歷史資料。
+    比逐支請求快 10 倍以上，且不容易被限流。
+    回傳 dict: { "2330.TW": DataFrame(close, volume), ... }
     """
+    if not tickers:
+        return {}
+    ticker_str = " ".join(tickers)
+    try:
+        raw = yf.download(
+            ticker_str,
+            period="4mo",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        return {}
+
     result = {}
-    today = get_tw_now().strftime("%Y%m%d")
-
-    # ── 上市（TWSE）──
-    try:
-        url_twse = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={today}&type=ALL"
-        r = requests.get(url_twse, headers=get_headers(), timeout=15)
-        j = r.json()
-        # 表格 9 = 個股行情（欄位：證券代號/名稱/成交股數/收盤 ...）
-        for table in j.get("tables", []):
-            fields = table.get("fields", [])
-            if "收盤價" in fields and "成交股數" in fields:
-                ci = fields.index("收盤價")
-                vi = fields.index("成交股數")
-                ni = fields.index("證券代號")
-                for row in table.get("data", []):
-                    code = row[ni].strip()
-                    if not (len(code) == 4 and code.isdigit()):
-                        continue
-                    try:
-                        close  = float(row[ci].replace(",", ""))
-                        volume = int(row[vi].replace(",", "")) // 1000  # 股→張
-                        result[code] = {"close": close, "volume": volume, "market": "TW"}
-                    except: pass
-    except: pass
-
-    # ── 上櫃（TPEX）──
-    try:
-        d = get_tw_now()
-        roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
-        url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc_date}&se=AL"
-        r = requests.get(url_tpex, headers=get_headers(), timeout=15)
-        j = r.json()
-        for row in j.get("aaData", []):
-            # row: [代號, 名稱, 收盤, 漲跌, 開盤, 最高, 最低, 成交股數, ...]
+    # 單支時 columns 是 [Open,High,Low,Close,Volume]；多支時是 MultiIndex
+    if len(tickers) == 1:
+        tk = tickers[0]
+        try:
+            df = raw[["Close", "Volume"]].dropna()
+            df.columns = ["close", "volume"]
+            df["volume"] = (df["volume"] / 1000).astype(int)
+            result[tk] = df.reset_index(drop=True)
+        except Exception:
+            pass
+    else:
+        for tk in tickers:
             try:
-                code   = str(row[0]).strip()
-                if not (len(code) == 4 and code.isdigit()): continue
-                close  = float(str(row[2]).replace(",", ""))
-                volume = int(str(row[7]).replace(",", "")) // 1000  # 股→張
-                result[code] = {"close": close, "volume": volume, "market": "TWO"}
-            except: pass
-    except: pass
-
+                df = raw[tk][["Close", "Volume"]].dropna()
+                df.columns = ["close", "volume"]
+                df["volume"] = (df["volume"] / 1000).astype(int)
+                result[tk] = df.reset_index(drop=True)
+            except Exception:
+                pass
     return result
 
 
-@st.cache_data(ttl=86400)
-def get_twse_history_batch(code: str) -> pd.DataFrame:
+def calc_ma_signals(history_map: dict, stock_map: list,
+                    bias_limit: float, vol_limit: int) -> list:
     """
-    從 TWSE 抓單支上市股票近 3 個月逐日收盤，不限流、穩定。
-    回傳 DataFrame columns: [date, close, volume(張)]
+    純 CPU 計算：對已下載好的歷史資料做均線條件判斷，不發任何網路請求。
     """
-    rows = []
-    now = get_tw_now()
-    # 抓最近 3 個月（每月一次請求，共 3 次）
-    for delta_month in range(3):
-        d = now - timedelta(days=30 * delta_month)
-        yyyymm = f"{d.year}{d.month:02d}01"
-        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm}&stockNo={code}"
-        try:
-            r = requests.get(url, headers=get_headers(), timeout=10)
-            j = r.json()
-            for row in j.get("data", []):
-                try:
-                    # row: [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 成交筆數]
-                    close  = float(str(row[6]).replace(",", ""))
-                    volume = int(str(row[1]).replace(",", "")) // 1000
-                    rows.append({"close": close, "volume": volume})
-                except: pass
-        except: pass
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows[::-1])  # 最新在前 → 反轉為舊→新
-
-
-@st.cache_data(ttl=86400)
-def get_tpex_history_batch(code: str) -> pd.DataFrame:
-    """
-    從 TPEX 抓單支上櫃股票近 3 個月逐日收盤。
-    """
-    rows = []
-    now = get_tw_now()
-    for delta_month in range(3):
-        d = now - timedelta(days=30 * delta_month)
-        roc_ym = f"{d.year - 1911}/{d.month:02d}"
-        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
-        try:
-            r = requests.get(url, headers=get_headers(), timeout=10)
-            j = r.json()
-            for row in j.get("aaData", []):
-                try:
-                    close  = float(str(row[6]).replace(",", ""))
-                    volume = int(str(row[1]).replace(",", "")) // 1000
-                    rows.append({"close": close, "volume": volume})
-                except: pass
-        except: pass
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows[::-1])
-
-
-def check_ma_condition(code: str, market: str, today_close: float,
-                       today_vol: int, bias_limit: float) -> dict | None:
-    """
-    用官方 API 歷史資料判斷均線條件，完全不依賴 Yahoo Finance。
-    """
-    df_h = get_twse_history_batch(code) if market == "TW" else get_tpex_history_batch(code)
-    if df_h.empty or len(df_h) < 62:
-        return None
-
-    closes  = df_h["close"]
-    volumes = df_h["volume"]
-
-    ma30 = closes.rolling(30).mean().iloc[-1]
-    ma45 = closes.rolling(45).mean().iloc[-1]
-    ma60 = closes.rolling(60).mean().iloc[-1]
-
-    curr_price = today_close if today_close else closes.iloc[-1]
-    bias_30    = ((curr_price - ma30) / ma30) * 100
-
-    if not ((ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit)):
-        return None
-
-    vol_yesterday = float(volumes.iloc[-2])
-    vol_change    = ((today_vol - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
-
-    ticker = f"{code}.{market}"
-    return {
-        "ticker": ticker,
-        "收盤": round(curr_price, 2),
-        "乖離30MA(%)": round(bias_30, 2),
-        "成交量(張)": int(today_vol),
-        "量變動(%)": round(vol_change, 2),
-    }
-
-
-def clean_percent(text):
-    if not text or text == "N/A": return np.nan
-    try: return float(text.replace('%', '').replace(',', ''))
-    except: return np.nan
-
-def fetch_deep_info(ticker: str) -> dict:
-    code = ticker.split('.')[0]
-    res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
-    try:
-        yt = yf.Ticker(ticker)
-        pe = yt.info.get('trailingPE')
-        if pe: res["pe"] = float(pe)
-    except: pass
-    try:
-        rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
-        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
-        soup = BeautifulSoup(rev_resp.text, 'html.parser')
-        row = soup.select_one(r'li.List\(n\)')
-        if row:
-            percents = [s.get_text(strip=True) for s in row.find_all('span') if '%' in s.get_text()]
-            if len(percents) >= 2:
-                res["mom"] = clean_percent(percents[0])
-                res["yoy"] = clean_percent(percents[1])
-    except: pass
-    return res
-
-# ============================================================
-# 3. 技術分析、繪圖與中文新聞抓取
-# ============================================================
-
-def run_strategy_check(s, bias_limit, vol_limit):
-    now_ts = int(get_tw_now().timestamp())
-    start_ts = int((get_tw_now() - timedelta(days=250)).timestamp())
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}"
-    params = {"period1": start_ts, "period2": now_ts, "interval": "1d"}
-
-    # ★ 最多重試 3 次，每次失敗後等待再重試，解決限流與 timeout 造成的結果不穩定
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params, headers=get_headers(), timeout=20)
-            # 被限流時 Yahoo 回傳 429，等待後重試
-            if r.status_code == 429:
-                time.sleep(2 + attempt * 2)
-                continue
-            data = r.json()['chart']['result'][0]
-            c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
-            v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
-            if len(c_series) < 65: return None
-
-            vol_today     = v_series.iloc[-1]
-            vol_yesterday = v_series.iloc[-2]
-            vol_change    = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-            curr_vol_int  = int(vol_today / 1000)
-            avg_vol_5d    = v_series.tail(5).mean() / 1000
-            if avg_vol_5d < vol_limit: return None
-
-            ma30  = c_series.rolling(30).mean().iloc[-1]
-            ma45  = c_series.rolling(45).mean().iloc[-1]
-            ma60  = c_series.rolling(60).mean().iloc[-1]
-            curr_price = c_series.iloc[-1]
-            bias_30 = ((curr_price - ma30) / ma30) * 100
-
-            if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
-                return {**s,
-                        "收盤": round(curr_price, 2),
-                        "乖離30MA(%)": round(bias_30, 2),
-                        "成交量(張)": curr_vol_int,
-                        "量變動(%)": round(vol_change, 2)}
-            return None  # 條件不符，不需重試
-        except requests.exceptions.Timeout:
-            time.sleep(1 + attempt)   # timeout 時稍等再重試
+    hits = []
+    for s in stock_map:
+        tk = s["ticker"]
+        df = history_map.get(tk)
+        if df is None or len(df) < 65:
             continue
-        except Exception:
-            return None               # 其他錯誤（格式異常等）直接放棄
-    return None
+        closes  = df["close"]
+        volumes = df["volume"]
+
+        avg_vol_5d = volumes.tail(5).mean()
+        if avg_vol_5d < vol_limit:
+            continue
+
+        ma30 = closes.rolling(30).mean().iloc[-1]
+        ma45 = closes.rolling(45).mean().iloc[-1]
+        ma60 = closes.rolling(60).mean().iloc[-1]
+        curr_price    = float(closes.iloc[-1])
+        vol_today     = int(volumes.iloc[-1])
+        vol_yesterday = float(volumes.iloc[-2])
+        bias_30       = ((curr_price - ma30) / ma30) * 100
+        vol_change    = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
+
+        if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
+            hits.append({**s,
+                "收盤":        round(curr_price, 2),
+                "乖離30MA(%)": round(bias_30, 2),
+                "成交量(張)":  vol_today,
+                "量變動(%)":   round(vol_change, 2),
+            })
+    return hits
+
 
 @st.cache_data(ttl=3600)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
@@ -434,80 +297,53 @@ if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disab
 if st.session_state.is_scanning:
     status = st.empty()
     bar    = st.progress(0)
+    BATCH  = 200   # 每次 yfinance.download() 的股票數，太大會超時
 
-    # ── Step 1：批次抓今日全市場行情（一次 API，約 1~2 秒）──
-    status.text("📡 Step 1/3：取得全市場今日行情...")
-    bar.progress(0.05)
-    stock_map   = get_stock_market_list()           # [{ticker, name, industry, code}, ...]
-    today_quote = get_today_quote_batch()           # {code: {close, volume, market}}
+    # ── Step 1：取得股票清單 ──────────────────────────────────
+    status.text("📋 Step 1/3：載入股票清單...")
+    bar.progress(0.03)
+    stock_map = get_stock_market_list()
+    all_tickers = [s["ticker"] for s in stock_map]
+    total_tickers = len(all_tickers)
 
-    if not today_quote:
-        st.warning("⚠️ 今日行情尚未更新（可能為非交易日），將改用 Yahoo Finance 歷史末筆資料繼續掃描。")
+    # ── Step 2：分批批次下載歷史資料 ─────────────────────────
+    history_map = {}
+    batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
+    for bi, batch in enumerate(batches):
+        status.text(f"📥 Step 2/3：批次下載歷史資料 {bi+1}/{len(batches)}（每批 {BATCH} 支）...")
+        bar.progress(0.03 + 0.72 * (bi / len(batches)))
+        batch_data = download_batch_history(tuple(batch))
+        history_map.update(batch_data)
 
-    # ── Step 2：成交量初篩（純 CPU，毫秒級）──
-    status.text("🔍 Step 2/3：成交量初篩...")
-    bar.progress(0.10)
-    candidates = []
-    for s in stock_map:
-        code = s["code"]
-        q    = today_quote.get(code)
-        if q:
-            if q["volume"] >= user_vol:          # 通過成交量門檻
-                candidates.append({**s, "_close": q["close"], "_volume": q["volume"]})
-        else:
-            # 批次 API 沒有資料（非交易日 or 新股）→ 仍列入候選，後續由 Yahoo 補
-            candidates.append({**s, "_close": None, "_volume": None})
+    bar.progress(0.75)
+    status.text(f"✅ 已下載 {len(history_map)} 支股票資料，計算均線中...")
 
-    status.text(f"🔍 Step 2/3：初篩通過 {len(candidates)} 支，開始均線計算...")
-
-    # ── Step 3：對初篩股票抓歷史 K 線並做均線條件判斷 ──
-    initial_hits = []
-    total_c = len(candidates)
-
-    def _check(s):
-        code   = s["code"]
-        market = "TW" if s["ticker"].endswith(".TW") else "TWO"
-        close  = s["_close"]
-        vol    = s["_volume"] if s["_volume"] else 0
-        res    = check_ma_condition(code, market, close or 0, vol, user_bias)
-        if res:
-            return {**s, **res}
-        return None
-
-    with ThreadPoolExecutor(max_workers=50) as ex:  # 官方 API 無限流，可大幅提高並發
-        futures = {ex.submit(_check, s): s for s in candidates}
-        for i, f in enumerate(as_completed(futures), 1):
-            bar.progress(0.10 + 0.75 * i / total_c)
-            if i % 50 == 0:
-                status.text(f"📊 Step 3/3：均線計算中... {i}/{total_c}")
-            res = f.result()
-            if res:
-                initial_hits.append(res)
-
-    bar.progress(0.85)
+    # ── Step 3：純 CPU 均線篩選（毫秒級）────────────────────
+    initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
+    bar.progress(0.80)
 
     if initial_hits:
-        # ── Step 4：抓財報數據（只對符合條件的股票）──
+        # ── Step 4：抓財報數據（只對符合條件的股票）──────────
         status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                bar.progress(0.85 + 0.14 * j / len(initial_hits))
+                bar.progress(0.80 + 0.19 * j / len(initial_hits))
                 deep_res = f.result()
                 base     = f_deep[f]
                 final_list.append({
-                    "ticker":    base["ticker"],
-                    "code":      base["code"],
-                    "name":      base["name"],
-                    "industry":  base["industry"],
-                    "收盤":      base["收盤"],
+                    "ticker":      base["ticker"],
+                    "code":        base["code"],
+                    "name":        base["name"],
+                    "industry":    base["industry"],
+                    "收盤":        base["收盤"],
                     "乖離30MA(%)": base["乖離30MA(%)"],
                     "成交量(張)":  base["成交量(張)"],
                     "量變動(%)":   base["量變動(%)"],
-                    "本益比":    deep_res["pe"],
-                    "營收月增":  deep_res["mom"],
-                    "營收年增":  deep_res["yoy"],
+                    "本益比":      deep_res["pe"],
+                    "營收月增":    deep_res["mom"],
+                    "營收年增":    deep_res["yoy"],
                 })
         bar.progress(1.0)
         st.session_state.scan_results = pd.DataFrame(final_list)
