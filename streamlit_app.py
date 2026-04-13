@@ -4,8 +4,6 @@ import numpy as np
 import requests
 from io import StringIO
 import urllib3
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
@@ -16,14 +14,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ============================================================
-# 1. 基礎設定與環境初始化 (修正 SSL 報錯)
+# 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v10.3", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v10.4", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
 def get_headers():
@@ -46,7 +45,7 @@ def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
 # ============================================================
-# 2. 數據清洗與深度資訊抓取 (修正 SSL 驗證)
+# 2. 數據清洗與深度資訊抓取
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -56,7 +55,6 @@ def get_stock_market_list():
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
-            # 關鍵修正：verify=False 解決憑證失敗
             r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
             r.encoding = 'big5'
             df_isin = pd.read_html(StringIO(r.text))[0]
@@ -67,8 +65,7 @@ def get_stock_market_list():
                     code, name = val.split('　')
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
-    except Exception as e:
-        st.error(f"獲取市場清單失敗: {e}")
+    except: pass
     return stocks
 
 def clean_percent(text):
@@ -79,8 +76,15 @@ def clean_percent(text):
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    # 抓取本益比 (yf.info 較容易被擋，增加 try-except 保護)
     try:
-        # 營收抓取 (verify=False)
+        yt = yf.Ticker(ticker)
+        # 優先嘗試 fast_info 提升速度與穩定度
+        pe = yt.info.get('trailingPE') or yt.fast_info.get('trailingPE')
+        if pe: res["pe"] = round(float(pe), 2)
+    except: pass
+    # 抓取營收
+    try:
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10, verify=False)
         soup = BeautifulSoup(rev_resp.text, 'html.parser')
@@ -90,34 +94,25 @@ def fetch_deep_info(ticker: str) -> dict:
             if len(percents) >= 2:
                 res["mom"] = clean_percent(percents[0])
                 res["yoy"] = clean_percent(percents[1])
-        # PE 抓取
-        yt = yf.Ticker(ticker)
-        pe = yt.info.get('trailingPE')
-        if pe: res["pe"] = float(pe)
     except: pass
     return res
 
 # ============================================================
-# 3. 技術分析核心 (優化穩定性)
+# 3. 技術分析、繪圖與中文新聞抓取
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
     now_ts = int(get_tw_now().timestamp())
     start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
     try:
-        # 微延遲防止被 Yahoo 封鎖，維持掃描數量穩定
-        time.sleep(random.uniform(0.05, 0.15))
+        # 降低併發壓力避免支數變動
+        time.sleep(random.uniform(0.1, 0.3))
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
                          params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, 
                          headers=get_headers(), timeout=10, verify=False)
-        
-        json_data = r.json()
-        if not json_data['chart']['result']: return None
-        
-        data = json_data['chart']['result'][0]
+        data = r.json()['chart']['result'][0]
         c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
         v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
-
         if len(c_series) < 65: return None
         
         vol_today = v_series.iloc[-1]
@@ -125,7 +120,6 @@ def run_strategy_check(s, bias_limit, vol_limit):
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
         curr_vol_int = int(vol_today / 1000)
         avg_vol_5d = v_series.tail(5).mean() / 1000
-        
         if avg_vol_5d < vol_limit: return None
         
         ma30 = c_series.rolling(30).mean().iloc[-1]
@@ -139,10 +133,6 @@ def run_strategy_check(s, bias_limit, vol_limit):
     except: return None
     return None
 
-# ============================================================
-# 4. 圖表與新聞 (還原原始功能與繪圖設定)
-# ============================================================
-
 def draw_k_line(ticker, name):
     yt = yf.Ticker(ticker)
     df = yt.history(period="1y") 
@@ -151,7 +141,6 @@ def draw_k_line(ticker, name):
     df['MA45'] = df['Close'].rolling(45).mean()
     df['MA60'] = df['Close'].rolling(60).mean()
     df = df.tail(180).copy()
-    # 原始顏色設定
     colors = ['#ef5350' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#26a69a' for i in range(len(df))]
     df.index = df.index.strftime('%Y-%m-%d')
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
@@ -191,69 +180,63 @@ def get_tw_stock_news(code):
     except: return None
 
 # ============================================================
-# 5. Streamlit UI 介面 (還原表格樣式與功能)
+# 4. Streamlit UI 介面
 # ============================================================
 
 st.sidebar.header("🎯 策略設定")
 with st.sidebar.form("setting_form"):
     user_bias = st.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
     user_vol = st.slider("最小成交量 (張)", 0, 3000, 500)
-    submit_scan = st.form_submit_button("🚀 開始智慧掃描", use_container_width=True)
+    submit_scan = st.form_submit_button("🚀 開始全市場智慧掃描", use_container_width=True)
 
 if submit_scan:
     st.session_state.is_scanning = True
     st.session_state.current_idx = 0 
-    
     status = st.empty()
     bar = st.progress(0)
-    
-    status.text("讀取市場清單中...")
     stocks_list = get_stock_market_list()
-    
-    if stocks_list:
-        initial_hits = []
-        status.text(f"🔍 掃描全市場個股技術面 (共 {len(stocks_list)} 支)...")
-        # 調低併發數至 10，徹底解決支數變動問題
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
-            for i, f in enumerate(as_completed(futures), 1):
-                if i % 100 == 0: bar.progress(i / len(stocks_list))
-                res = f.result()
-                if res: initial_hits.append(res)
-                
-        if initial_hits:
-            status.text(f"📊 抓取 {len(initial_hits)} 支標的深度數據...")
-            final_list = []
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
-                for j, f in enumerate(as_completed(f_deep), 1):
-                    try:
-                        deep_res = f.result()
-                        final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
-                    except: continue
-            st.session_state.scan_results = pd.DataFrame(final_list)
-            status.success(f"✅ 掃描完成！找到 {len(final_list)} 支標的")
-        else:
-            st.session_state.scan_results = pd.DataFrame()
-            status.error("查無符合標的。")
+    initial_hits = []
+    status.text(f"🔍 正在掃描全市場 (共 {len(stocks_list)} 支)...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
+        for i, f in enumerate(as_completed(futures), 1):
+            if i % 100 == 0: bar.progress(i / len(stocks_list))
+            res = f.result()
+            if res: initial_hits.append(res)
+    if initial_hits:
+        status.text(f"📊 正在抓取財務數據 (共 {len(initial_hits)} 支)...")
+        final_list = []
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
+            for j, f in enumerate(as_completed(f_deep), 1):
+                status.text(f"深度抓取進度: {j} / {len(initial_hits)}")
+                deep_res = f.result()
+                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+        st.session_state.scan_results = pd.DataFrame(final_list)
+    else:
+        st.session_state.scan_results = pd.DataFrame()
+        st.warning("查無條件標的。")
     st.session_state.is_scanning = False
+    st.rerun()
 
 # ============================================================
-# 6. 表格呈現 (還原原始彩色樣式與欄位設定)
+# 5. 結果顯示 (還原原始顯示方式與表格設定)
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
     col_msg, col_dl = st.columns([3, 1])
+    with col_msg:
+        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(label="📥 下載清單 (CSV)", data=csv, file_name=f'tw_scan.csv', use_container_width=True)
+        tw_date = get_tw_now().strftime("%Y%m%d")
+        st.download_button(label="📥 下載選股清單 (CSV)", data=csv, file_name=f'tw_stock_scan_{tw_date}.csv', mime='text/csv', use_container_width=True)
     
     show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
-    # 還原原始紅綠顏色定義
     def color_tw_style(val):
         if pd.isna(val): return ''
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
@@ -263,37 +246,45 @@ if not st.session_state.scan_results.empty:
         df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
         use_container_width=True, hide_index=True,
         column_config={
+            "代碼": st.column_config.TextColumn("代碼"),
+            "名稱": st.column_config.TextColumn("名稱"),
             "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", format="%.2f%%", min_value=0, max_value=user_bias),
+            "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
+            "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
+            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
+            "本益比": st.column_config.NumberColumn("PE", format="%.2f"),
             "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
-            "本益比": st.column_config.NumberColumn("PE", format="%.1f")
+            "類股": st.column_config.TextColumn("產業別")
         }
     )
+    st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
-    # 翻頁邏輯
+    # ============================================================
+    # 6. K線圖與【迴圈切換】邏輯
+    # ============================================================
     st.divider()
     total_found = len(df)
     c_idx = st.session_state.current_idx
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     
-    if btn_col1.button("⬅️ 上一支"):
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
+    if btn_col1.button("⬅️ 上一支", use_container_width=True):
         st.session_state.current_idx = (c_idx - 1) % total_found
         st.rerun()
     with btn_col2:
         st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
-    if btn_col3.button("下一支 ➡️"):
+    if btn_col3.button("下一支 ➡️", use_container_width=True):
         st.session_state.current_idx = (c_idx + 1) % total_found
         st.rerun()
     
-    # 畫圖與新聞
     current_stock = df.iloc[st.session_state.current_idx]
     fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if fig: st.plotly_chart(fig, use_container_width=True)
     
     st.subheader(f"📰 {current_stock['name']} 即時中文新聞")
-    news = get_tw_stock_news(current_stock['code'])
-    if news:
-        for n in news:
+    news_list = get_tw_stock_news(current_stock['code'])
+    if news_list:
+        for n in news_list:
             st.markdown(f"""
             <div style="padding:15px; border-bottom:1px solid #444; background-color:rgba(255,255,255,0.02); margin-bottom:8px; border-radius:10px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -304,4 +295,4 @@ if not st.session_state.scan_results.empty:
             </div>
             """, unsafe_allow_html=True)
 else:
-    st.info("💡 調整參數後，點擊「開始智慧掃描」。")
+    if not st.session_state.is_scanning: st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
