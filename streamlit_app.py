@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v10.4", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.7", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -56,7 +56,6 @@ def get_stock_market_list():
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
             r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
-            r.encoding = 'big5'
             df_isin = pd.read_html(StringIO(r.text))[0]
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
@@ -76,17 +75,14 @@ def clean_percent(text):
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
-    # 抓取本益比 (yf.info 較容易被擋，增加 try-except 保護)
     try:
         yt = yf.Ticker(ticker)
-        # 優先嘗試 fast_info 提升速度與穩定度
-        pe = yt.info.get('trailingPE') or yt.fast_info.get('trailingPE')
-        if pe: res["pe"] = round(float(pe), 2)
+        pe = yt.info.get('trailingPE')
+        if pe: res["pe"] = float(pe)
     except: pass
-    # 抓取營收
     try:
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
-        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10, verify=False)
+        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup = BeautifulSoup(rev_resp.text, 'html.parser')
         row = soup.select_one(r'li.List\(n\)')
         if row:
@@ -105,11 +101,8 @@ def run_strategy_check(s, bias_limit, vol_limit):
     now_ts = int(get_tw_now().timestamp())
     start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
     try:
-        # 降低併發壓力避免支數變動
-        time.sleep(random.uniform(0.1, 0.3))
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
-                         params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, 
-                         headers=get_headers(), timeout=10, verify=False)
+                         params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
         data = r.json()['chart']['result'][0]
         c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
         v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
@@ -157,22 +150,28 @@ def draw_k_line(ticker, name):
 def get_tw_stock_news(code):
     try:
         news_url = f"https://tw.stock.yahoo.com/quote/{code}/news"
-        resp = requests.get(news_url, headers=get_headers(), timeout=10, verify=False)
+        resp = requests.get(news_url, headers=get_headers(), timeout=10)
+        if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'html.parser')
         news_links = soup.find_all('a', href=True)
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "漲"]
-        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減"]
+        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
+        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
         results = []
         seen_titles = set()
         for link in news_links:
             href = link.get('href')
-            if '/news/' in href:
+            if '/news/' in href and 'tw.stock.yahoo.com' in href or href.startswith('/news/'):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles: continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
-                sentiment = "💡 資訊"; color = "#888888"
-                if any(w in title for w in pos_words): sentiment = "📈 利多"; color = "#ef5350"
-                elif any(w in title for w in neg_words): sentiment = "📉 利空"; color = "#26a69a"
+                sentiment = "💡 資訊"
+                color = "#888888"
+                if any(w in title for w in pos_words):
+                    sentiment = "📈 利多"
+                    color = "#ef5350"
+                elif any(w in title for w in neg_words):
+                    sentiment = "📉 利空"
+                    color = "#26a69a"
                 results.append({"title": title, "link": full_link, "sentiment": sentiment, "color": color, "publisher": "Yahoo股市"})
                 seen_titles.add(title)
                 if len(results) >= 8: break
@@ -184,32 +183,33 @@ def get_tw_stock_news(code):
 # ============================================================
 
 st.sidebar.header("🎯 策略設定")
-with st.sidebar.form("setting_form"):
-    user_bias = st.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
-    user_vol = st.slider("最小成交量 (張)", 0, 3000, 500)
-    submit_scan = st.form_submit_button("🚀 開始全市場智慧掃描", use_container_width=True)
+user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
+user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
-if submit_scan:
+if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
     st.session_state.is_scanning = True
     st.session_state.current_idx = 0 
+    st.rerun()
+
+if st.session_state.is_scanning:
     status = st.empty()
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場 (共 {len(stocks_list)} 支)...")
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    status.text(f"🔍 正在掃描全市場...")
+    with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
             if i % 100 == 0: bar.progress(i / len(stocks_list))
             res = f.result()
             if res: initial_hits.append(res)
     if initial_hits:
-        status.text(f"📊 正在抓取財務數據 (共 {len(initial_hits)} 支)...")
+        status.text(f"📊 正在抓取財報數據...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"深度抓取進度: {j} / {len(initial_hits)}")
+                status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
@@ -220,7 +220,7 @@ if submit_scan:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (還原原始顯示方式與表格設定)
+# 5. 結果顯示 (維持原始表格呈現)
 # ============================================================
 
 if not st.session_state.scan_results.empty:
@@ -249,15 +249,17 @@ if not st.session_state.scan_results.empty:
             "代碼": st.column_config.TextColumn("代碼"),
             "名稱": st.column_config.TextColumn("名稱"),
             "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
-            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", format="%.2f%%", min_value=0, max_value=user_bias),
+            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", help=f"上限設定為 {user_bias}%", format="%.2f%%", min_value=0, max_value=user_bias),
             "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
             "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
             "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
-            "本益比": st.column_config.NumberColumn("PE", format="%.2f"),
+            "本益比": st.column_config.NumberColumn("PE", format="%.1f"),
             "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
             "類股": st.column_config.TextColumn("產業別")
         }
     )
+    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
@@ -268,20 +270,24 @@ if not st.session_state.scan_results.empty:
     c_idx = st.session_state.current_idx
     
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
-    if btn_col1.button("⬅️ 上一支", use_container_width=True):
-        st.session_state.current_idx = (c_idx - 1) % total_found
-        st.rerun()
+    with btn_col1:
+        # 修正：首尾輪迴邏輯 (如果當前是 0，跳到最後一個)
+        if st.button("⬅️ 上一支", use_container_width=True):
+            st.session_state.current_idx = (c_idx - 1) % total_found
+            st.rerun()
     with btn_col2:
         st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
-    if btn_col3.button("下一支 ➡️", use_container_width=True):
-        st.session_state.current_idx = (c_idx + 1) % total_found
-        st.rerun()
+    with btn_col3:
+        # 修正：首尾輪迴邏輯 (如果當前是最後一個，跳回 0)
+        if st.button("下一支 ➡️", use_container_width=True):
+            st.session_state.current_idx = (c_idx + 1) % total_found
+            st.rerun()
     
-    current_stock = df.iloc[st.session_state.current_idx]
-    fig = draw_k_line(current_stock['ticker'], current_stock['name'])
-    if fig: st.plotly_chart(fig, use_container_width=True)
+    current_stock = df.iloc[c_idx]
+    k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
+    if k_fig: st.plotly_chart(k_fig, use_container_width=True)
     
-    st.subheader(f"📰 {current_stock['name']} 即時中文新聞")
+    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
         for n in news_list:
@@ -291,8 +297,9 @@ if not st.session_state.scan_results.empty:
                     <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:3px 10px; border-radius:15px; font-size:12px;">{n['sentiment']}</span>
                     <span style="color:#aaa; font-size:12px;">{n['publisher']}</span>
                 </div>
-                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500;">{n['title']}</a>
+                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">{n['title']}</a>
             </div>
             """, unsafe_allow_html=True)
+    else: st.warning("⚠️ 無法獲取即時新聞。")
 else:
     if not st.session_state.is_scanning: st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
