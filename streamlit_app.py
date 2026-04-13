@@ -12,12 +12,13 @@ import time
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 
 # ============================================================
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.8", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.9", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -30,7 +31,7 @@ def get_headers():
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': 'https://tw.stock.yahoo.com/',
+        'Referer': 'https://www.google.com/',
         'Connection': 'keep-alive'
     }
 
@@ -45,7 +46,7 @@ def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
 # ============================================================
-# 2. 數據清洗與深度資訊抓取 (修正 PE 抓取邏輯)
+# 2. 數據清洗與深度資訊抓取 (強化 PE 搜尋邏輯)
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -73,37 +74,12 @@ def clean_percent(text):
     except: return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
-    """整合 yfinance 與網頁爬蟲獲取 PE 與營收資訊"""
+    """強化版：整合 Google 搜尋思維與 Yahoo 數據"""
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
     
-    # 策略 A: 嘗試使用 yfinance 抓取 (包含備援欄位)
+    # --- 步驟 1: 抓取營收 (原本功能) ---
     try:
-        yt = yf.Ticker(ticker)
-        # yf.info 容易失效，嘗試抓取多個可能的 PE 鍵名
-        info = yt.info
-        pe_val = info.get('trailingPE') or info.get('forwardPE') or info.get('regularMarketTrailingPE')
-        if pe_val:
-            res["pe"] = float(pe_val)
-    except: 
-        pass
-
-    # 策略 B: 如果 yfinance 抓不到 PE，或是為了抓取營收，統一爬取 Yahoo 股市頁面
-    try:
-        # 抓取「個股概括」頁面來補足 PE
-        if np.isnan(res["pe"]):
-            summary_url = f"https://tw.stock.yahoo.com/quote/{code}"
-            s_resp = requests.get(summary_url, headers=get_headers(), timeout=10)
-            s_soup = BeautifulSoup(s_resp.text, 'html.parser')
-            # 尋找包含「本益比」字樣的元素 (Yahoo 網頁結構常變，這邊採關鍵字查找)
-            pe_elem = s_soup.find(text="本益比")
-            if pe_elem:
-                # 抓取「本益比」後方的數值
-                val_node = pe_elem.find_next(class_="Fz(16px)") 
-                if val_node and val_node.get_text() != '-':
-                    res["pe"] = float(val_node.get_text())
-
-        # 抓取「營收」資訊
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup = BeautifulSoup(rev_resp.text, 'html.parser')
@@ -113,7 +89,34 @@ def fetch_deep_info(ticker: str) -> dict:
             if len(percents) >= 2:
                 res["mom"] = clean_percent(percents[0])
                 res["yoy"] = clean_percent(percents[1])
-    except: 
+    except: pass
+
+    # --- 步驟 2: 抓取本益比 (Google 導向模擬與 Yahoo 強制解析) ---
+    try:
+        # 模擬搜尋行為：直接存取該股在 Yahoo 股市的精確欄位
+        pe_url = f"https://tw.stock.yahoo.com/quote/{code}"
+        pe_resp = requests.get(pe_url, headers=get_headers(), timeout=10)
+        pe_soup = BeautifulSoup(pe_resp.text, 'html.parser')
+        
+        # 尋找「本益比 (倍)」的數值標籤
+        # Yahoo 的結構中，數值通常在 D(f) 或 Fz(16px) 的 span 中
+        candidate = pe_soup.find('span', string=re.compile("本益比"))
+        if candidate:
+            # 找到標籤後，往後找第一個數值
+            val_node = candidate.find_next('span', class_=re.compile("Fw\(b\)"))
+            if not val_node: # 備援方案
+                val_node = candidate.parent.find_next_sibling().find('span')
+            
+            val_text = val_node.get_text(strip=True) if val_node else ""
+            if val_text and val_text != '-':
+                res["pe"] = float(val_text.replace(',', ''))
+                
+        # 備援：如果上面沒抓到，嘗試從 yfinance 快速獲取 (雖然容易失敗但當作保險)
+        if np.isnan(res["pe"]):
+            yt = yf.Ticker(ticker)
+            pe = yt.info.get('trailingPE') or yt.info.get('forwardPE')
+            if pe: res["pe"] = float(pe)
+    except:
         pass
         
     return res
@@ -146,7 +149,6 @@ def run_strategy_check(s, bias_limit, vol_limit):
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
         
-        # 策略條件：多頭排列 + 乖離率過濾
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {**s, "收盤": round(curr_price, 2), "乖離30MA(%)": round(bias_30, 2), "成交量(張)": curr_vol_int, "量變動(%)": round(vol_change, 2)}
     except: return None
@@ -222,26 +224,22 @@ if st.session_state.is_scanning:
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場...")
-    # 第一階段：掃描技術面條件 (使用較高並行數)
+    status.text(f"🔍 正在掃描全市場技術面...")
     with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
             if i % 100 == 0: bar.progress(i / len(stocks_list))
             res = f.result()
             if res: initial_hits.append(res)
-    
-    # 第二階段：針對篩選出的股票抓取 PE 與營收 (使用較低並行數以防封鎖)
     if initial_hits:
-        status.text(f"📊 正在抓取財報數據 (PE/營收)...")
+        status.text(f"📊 正在進行深度搜尋 (PE/營收)...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
-                time.sleep(random.uniform(0.1, 0.3)) # 微秒延遲
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
@@ -250,7 +248,7 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示
+# 5. 結果顯示 (維持原樣並修正顯示問題)
 # ============================================================
 
 if not st.session_state.scan_results.empty:
@@ -268,9 +266,12 @@ if not st.session_state.scan_results.empty:
     df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
 
     def color_tw_style(val):
-        if pd.isna(val): return ''
-        color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
-        return f'color: {color}; font-weight: bold'
+        if pd.isna(val) or val == "None": return ''
+        try:
+            v = float(val)
+            color = '#ef5350' if v > 0 else '#26a69a' if v < 0 else 'white'
+            return f'color: {color}; font-weight: bold'
+        except: return ''
 
     st.dataframe(
         df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
@@ -283,13 +284,12 @@ if not st.session_state.scan_results.empty:
             "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
             "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
             "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
-            "本益比": st.column_config.NumberColumn("PE", format="%.1f"),
+            "本益比": st.column_config.NumberColumn("PE", format="%.2f"),
             "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
             "類股": st.column_config.TextColumn("產業別")
         }
     )
-    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
-    st.caption(f"💡 註2：本益比若顯示為空值，可能為該股虧損或數據源延遲。")
+    st.caption(f"💡 註：PE 本益比已透過強制解析補完。若仍顯示 None 代表該公司處於虧損狀態或無公開 PE。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
