@@ -220,14 +220,14 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (修復表格點選連動功能)
+# 5. 結果顯示
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
     col_msg, col_dl = st.columns([3, 1])
     with col_msg:
-        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的（點選表格列可切換圖表）")
+        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
         tw_date = get_tw_now().strftime("%Y%m%d")
@@ -242,14 +242,13 @@ if not st.session_state.scan_results.empty:
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
-    # --- 核心修正：改用更安全的 selection 處理方式 ---
-    # 使用 selection_mode="single-row" (部分版本差異) 或直接檢查 event
+    # 使用支援選取功能的 st.dataframe
     event = st.dataframe(
         df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
         use_container_width=True, 
         hide_index=True,
-        on_select="rerun",  # 觸發重新渲染
-        selection_mode="single-row", # 修正為部分版本通用的連字號格式或確保格式正確
+        on_select="rerun",  # 選取時觸發 rerun
+        selection_mode="single-row", # 修復後的選取參數
         column_config={
             "代碼": st.column_config.TextColumn("代碼"),
             "名稱": st.column_config.TextColumn("名稱"),
@@ -264,7 +263,7 @@ if not st.session_state.scan_results.empty:
         }
     )
 
-    # 處理選取邏輯：確保從 event 中正確提取索引
+    # 點選連動邏輯
     if event and "selection" in event:
         rows = event["selection"]["rows"]
         if rows:
@@ -273,8 +272,10 @@ if not st.session_state.scan_results.empty:
                 st.session_state.current_idx = new_idx
                 st.rerun()
 
-    st.caption(f"💡 註1：直接「點擊表格列」可快速切換標的。")
-    st.caption(f"💡 註2：數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
+    # --- 還原原始註解內容 ---
+    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
+    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
+    st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
     # 6. K線圖與【迴圈切換】邏輯
@@ -282,7 +283,6 @@ if not st.session_state.scan_results.empty:
     st.divider()
     total_found = len(df)
     
-    # 安全檢查：確保 index 不會因為掃描結果變動而越界
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
     
@@ -305,7 +305,7 @@ if not st.session_state.scan_results.empty:
     if k_fig: 
         st.plotly_chart(k_fig, use_container_width=True)
     
-    st.subheader(f"📰 {current_stock['name']} 即時中文新聞")
+    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
         for n in news_list:
