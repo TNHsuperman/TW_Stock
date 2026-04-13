@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.7", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.8", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -45,7 +45,7 @@ def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
 # ============================================================
-# 2. 數據清洗與深度資訊抓取
+# 2. 數據清洗與深度資訊抓取 (修正 PE 抓取邏輯)
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -73,14 +73,37 @@ def clean_percent(text):
     except: return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
+    """整合 yfinance 與網頁爬蟲獲取 PE 與營收資訊"""
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    
+    # 策略 A: 嘗試使用 yfinance 抓取 (包含備援欄位)
     try:
         yt = yf.Ticker(ticker)
-        pe = yt.info.get('trailingPE')
-        if pe: res["pe"] = float(pe)
-    except: pass
+        # yf.info 容易失效，嘗試抓取多個可能的 PE 鍵名
+        info = yt.info
+        pe_val = info.get('trailingPE') or info.get('forwardPE') or info.get('regularMarketTrailingPE')
+        if pe_val:
+            res["pe"] = float(pe_val)
+    except: 
+        pass
+
+    # 策略 B: 如果 yfinance 抓不到 PE，或是為了抓取營收，統一爬取 Yahoo 股市頁面
     try:
+        # 抓取「個股概括」頁面來補足 PE
+        if np.isnan(res["pe"]):
+            summary_url = f"https://tw.stock.yahoo.com/quote/{code}"
+            s_resp = requests.get(summary_url, headers=get_headers(), timeout=10)
+            s_soup = BeautifulSoup(s_resp.text, 'html.parser')
+            # 尋找包含「本益比」字樣的元素 (Yahoo 網頁結構常變，這邊採關鍵字查找)
+            pe_elem = s_soup.find(text="本益比")
+            if pe_elem:
+                # 抓取「本益比」後方的數值
+                val_node = pe_elem.find_next(class_="Fz(16px)") 
+                if val_node and val_node.get_text() != '-':
+                    res["pe"] = float(val_node.get_text())
+
+        # 抓取「營收」資訊
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup = BeautifulSoup(rev_resp.text, 'html.parser')
@@ -90,7 +113,9 @@ def fetch_deep_info(ticker: str) -> dict:
             if len(percents) >= 2:
                 res["mom"] = clean_percent(percents[0])
                 res["yoy"] = clean_percent(percents[1])
-    except: pass
+    except: 
+        pass
+        
     return res
 
 # ============================================================
@@ -121,6 +146,7 @@ def run_strategy_check(s, bias_limit, vol_limit):
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
         
+        # 策略條件：多頭排列 + 乖離率過濾
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             return {**s, "收盤": round(curr_price, 2), "乖離30MA(%)": round(bias_30, 2), "成交量(張)": curr_vol_int, "量變動(%)": round(vol_change, 2)}
     except: return None
@@ -197,21 +223,25 @@ if st.session_state.is_scanning:
     stocks_list = get_stock_market_list()
     initial_hits = []
     status.text(f"🔍 正在掃描全市場...")
+    # 第一階段：掃描技術面條件 (使用較高並行數)
     with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
             if i % 100 == 0: bar.progress(i / len(stocks_list))
             res = f.result()
             if res: initial_hits.append(res)
+    
+    # 第二階段：針對篩選出的股票抓取 PE 與營收 (使用較低並行數以防封鎖)
     if initial_hits:
-        status.text(f"📊 正在抓取財報數據...")
+        status.text(f"📊 正在抓取財報數據 (PE/營收)...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
                 final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+                time.sleep(random.uniform(0.1, 0.3)) # 微秒延遲
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
@@ -220,7 +250,7 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (維持原始表格呈現)
+# 5. 結果顯示
 # ============================================================
 
 if not st.session_state.scan_results.empty:
@@ -259,7 +289,7 @@ if not st.session_state.scan_results.empty:
         }
     )
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
-    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
+    st.caption(f"💡 註2：本益比若顯示為空值，可能為該股虧損或數據源延遲。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
@@ -271,14 +301,12 @@ if not st.session_state.scan_results.empty:
     
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
-        # 修正：首尾輪迴邏輯 (如果當前是 0，跳到最後一個)
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state.current_idx = (c_idx - 1) % total_found
             st.rerun()
     with btn_col2:
         st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
     with btn_col3:
-        # 修正：首尾輪迴邏輯 (如果當前是最後一個，跳回 0)
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state.current_idx = (c_idx + 1) % total_found
             st.rerun()
