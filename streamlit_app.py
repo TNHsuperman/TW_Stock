@@ -75,6 +75,130 @@ def get_stock_market_list():
     except: pass
     return stocks
 
+# ============================================================
+# 2-A. 批次取得今日全市場行情（TWSE + TPEX）
+# ============================================================
+
+@st.cache_data(ttl=1800)  # 快取 30 分鐘，避免重複打 API
+def get_today_quote_batch() -> dict:
+    """
+    一次拿回上市＋上櫃所有股票今日收盤價與成交量。
+    回傳 dict: { "2330": {"close": 910.0, "volume": 45000, "market": "TW"}, ... }
+    非交易日或抓取失敗則回傳空 dict。
+    """
+    result = {}
+    today = get_tw_now().strftime("%Y%m%d")
+
+    # ── 上市（TWSE）──
+    try:
+        url_twse = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={today}&type=ALL"
+        r = requests.get(url_twse, headers=get_headers(), timeout=15)
+        j = r.json()
+        # 表格 9 = 個股行情（欄位：證券代號/名稱/成交股數/收盤 ...）
+        for table in j.get("tables", []):
+            fields = table.get("fields", [])
+            if "收盤價" in fields and "成交股數" in fields:
+                ci = fields.index("收盤價")
+                vi = fields.index("成交股數")
+                ni = fields.index("證券代號")
+                for row in table.get("data", []):
+                    code = row[ni].strip()
+                    if not (len(code) == 4 and code.isdigit()):
+                        continue
+                    try:
+                        close  = float(row[ci].replace(",", ""))
+                        volume = int(row[vi].replace(",", "")) // 1000  # 股→張
+                        result[code] = {"close": close, "volume": volume, "market": "TW"}
+                    except: pass
+    except: pass
+
+    # ── 上櫃（TPEX）──
+    try:
+        d = get_tw_now()
+        roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
+        url_tpex = f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc_date}&se=AL"
+        r = requests.get(url_tpex, headers=get_headers(), timeout=15)
+        j = r.json()
+        for row in j.get("aaData", []):
+            # row: [代號, 名稱, 收盤, 漲跌, 開盤, 最高, 最低, 成交股數, ...]
+            try:
+                code   = str(row[0]).strip()
+                if not (len(code) == 4 and code.isdigit()): continue
+                close  = float(str(row[2]).replace(",", ""))
+                volume = int(str(row[7]).replace(",", "")) // 1000  # 股→張
+                result[code] = {"close": close, "volume": volume, "market": "TWO"}
+            except: pass
+    except: pass
+
+    return result
+
+
+@st.cache_data(ttl=3600)  # 快取 1 小時
+def get_history_for_ma(ticker: str) -> pd.DataFrame:
+    """
+    用 Yahoo Finance 取得單支股票 250 天歷史，計算 30/45/60MA。
+    只對「通過成交量初篩」的股票才呼叫，大幅減少請求次數。
+    """
+    for attempt in range(3):
+        try:
+            now_ts   = int(get_tw_now().timestamp())
+            start_ts = int((get_tw_now() - timedelta(days=350)).timestamp())
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                params={"period1": start_ts, "period2": now_ts, "interval": "1d"},
+                headers=get_headers(), timeout=20
+            )
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            data = r.json()["chart"]["result"][0]
+            closes  = pd.Series(data["indicators"]["quote"][0]["close"]).ffill().dropna()
+            volumes = pd.Series(data["indicators"]["quote"][0]["volume"]).ffill().dropna()
+            return pd.DataFrame({"close": closes.values, "volume": volumes.values})
+        except requests.exceptions.Timeout:
+            time.sleep(1 + attempt)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def check_ma_condition(code: str, market: str, today_close: float,
+                       today_vol: int, bias_limit: float) -> dict | None:
+    """
+    對單支股票取歷史資料，判斷均線多頭排列＋乖離條件。
+    today_close / today_vol 已由批次 API 提供，不需再抓一次。
+    """
+    ticker = f"{code}.{market}"
+    df_h = get_history_for_ma(ticker)
+    if df_h.empty or len(df_h) < 65:
+        return None
+
+    closes  = df_h["close"]
+    volumes = df_h["volume"]
+
+    ma30 = closes.rolling(30).mean().iloc[-1]
+    ma45 = closes.rolling(45).mean().iloc[-1]
+    ma60 = closes.rolling(60).mean().iloc[-1]
+
+    # 用批次 API 的今日收盤取代歷史末筆（更準確）
+    curr_price = today_close
+    bias_30    = ((curr_price - ma30) / ma30) * 100
+
+    if not ((ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit)):
+        return None
+
+    vol_yesterday = volumes.iloc[-2] / 1000
+    vol_change    = ((today_vol - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
+
+    return {
+        "ticker": ticker,
+        "收盤": round(curr_price, 2),
+        "乖離30MA(%)": round(bias_30, 2),
+        "成交量(張)": int(today_vol),
+        "量變動(%)": round(vol_change, 2),
+    }
+
+
 def clean_percent(text):
     if not text or text == "N/A": return np.nan
     try: return float(text.replace('%', '').replace(',', ''))
@@ -219,31 +343,87 @@ if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disab
 if st.session_state.is_scanning:
     status = st.empty()
     bar    = st.progress(0)
-    stocks_list   = get_stock_market_list()
-    initial_hits  = []
-    status.text("🔍 正在掃描全市場...")
-    with ThreadPoolExecutor(max_workers=10) as ex:  # ★ 降低併發數，避免被 Yahoo 限流
-        futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
+
+    # ── Step 1：批次抓今日全市場行情（一次 API，約 1~2 秒）──
+    status.text("📡 Step 1/3：取得全市場今日行情...")
+    bar.progress(0.05)
+    stock_map   = get_stock_market_list()           # [{ticker, name, industry, code}, ...]
+    today_quote = get_today_quote_batch()           # {code: {close, volume, market}}
+
+    if not today_quote:
+        st.warning("⚠️ 今日行情尚未更新（可能為非交易日），將改用 Yahoo Finance 歷史末筆資料繼續掃描。")
+
+    # ── Step 2：成交量初篩（純 CPU，毫秒級）──
+    status.text("🔍 Step 2/3：成交量初篩...")
+    bar.progress(0.10)
+    candidates = []
+    for s in stock_map:
+        code = s["code"]
+        q    = today_quote.get(code)
+        if q:
+            if q["volume"] >= user_vol:          # 通過成交量門檻
+                candidates.append({**s, "_close": q["close"], "_volume": q["volume"]})
+        else:
+            # 批次 API 沒有資料（非交易日 or 新股）→ 仍列入候選，後續由 Yahoo 補
+            candidates.append({**s, "_close": None, "_volume": None})
+
+    status.text(f"🔍 Step 2/3：初篩通過 {len(candidates)} 支，開始均線計算...")
+
+    # ── Step 3：對初篩股票抓歷史 K 線並做均線條件判斷 ──
+    initial_hits = []
+    total_c = len(candidates)
+
+    def _check(s):
+        code   = s["code"]
+        market = "TW" if s["ticker"].endswith(".TW") else "TWO"
+        close  = s["_close"]
+        vol    = s["_volume"] if s["_volume"] else 0
+        res    = check_ma_condition(code, market, close or 0, vol, user_bias)
+        if res:
+            return {**s, **res}
+        return None
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(_check, s): s for s in candidates}
         for i, f in enumerate(as_completed(futures), 1):
-            if i % 100 == 0: bar.progress(i / len(stocks_list))
+            bar.progress(0.10 + 0.75 * i / total_c)
+            if i % 50 == 0:
+                status.text(f"📊 Step 3/3：均線計算中... {i}/{total_c}")
             res = f.result()
-            if res: initial_hits.append(res)
+            if res:
+                initial_hits.append(res)
+
+    bar.progress(0.85)
+
     if initial_hits:
-        status.text("📊 正在抓取財報數據...")
+        # ── Step 4：抓財報數據（只對符合條件的股票）──
+        status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
-            f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
+            f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
-                status.text(f"進度: {j} / {len(initial_hits)}")
+                bar.progress(0.85 + 0.14 * j / len(initial_hits))
                 deep_res = f.result()
-                final_list.append({**f_deep[f],
-                                    "本益比": deep_res["pe"],
-                                    "營收月增": deep_res["mom"],
-                                    "營收年增": deep_res["yoy"]})
+                base     = f_deep[f]
+                final_list.append({
+                    "ticker":    base["ticker"],
+                    "code":      base["code"],
+                    "name":      base["name"],
+                    "industry":  base["industry"],
+                    "收盤":      base["收盤"],
+                    "乖離30MA(%)": base["乖離30MA(%)"],
+                    "成交量(張)":  base["成交量(張)"],
+                    "量變動(%)":   base["量變動(%)"],
+                    "本益比":    deep_res["pe"],
+                    "營收月增":  deep_res["mom"],
+                    "營收年增":  deep_res["yoy"],
+                })
+        bar.progress(1.0)
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
         st.warning("查無條件標的。")
+
     st.session_state.is_scanning = False
     st.rerun()
 
