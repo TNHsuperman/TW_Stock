@@ -499,7 +499,7 @@ st.sidebar.markdown("""
     margin-bottom:12px;
 ">⚙ STRATEGY CONFIG</div>
 """, unsafe_allow_html=True)
-st.sidebar.header("🎯 策略設定")
+st.sidebar.markdown("### 🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol  = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
