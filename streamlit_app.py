@@ -758,7 +758,7 @@ if not st.session_state.scan_results.empty:
 
     st.markdown(f"""
     <div style="font-family:Share Tech Mono,monospace; font-size:11px;
-        color:#4a7a8a; padding:6px 4px; letter-spacing:0.5px; line-height:2;">
+        color:#4a7a8a; padding:6px 4px; letter-spacing:0.5px; line-height:2; font-size:14px;">
         ▸ 進度條滿格 = 乖離率接近上限 ({user_bias}%)，越短代表越貼近 30MA
         &nbsp;&nbsp;▸ 紅字 = 正增長 / 綠字 = 負增長
         &nbsp;&nbsp;▸ 點擊任一列查看 K 線圖
