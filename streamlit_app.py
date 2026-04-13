@@ -133,44 +133,68 @@ def get_today_quote_batch() -> dict:
     return result
 
 
-@st.cache_data(ttl=3600)  # 快取 1 小時
-def get_history_for_ma(ticker: str) -> pd.DataFrame:
+@st.cache_data(ttl=86400)
+def get_twse_history_batch(code: str) -> pd.DataFrame:
     """
-    用 Yahoo Finance 取得單支股票 250 天歷史，計算 30/45/60MA。
-    只對「通過成交量初篩」的股票才呼叫，大幅減少請求次數。
+    從 TWSE 抓單支上市股票近 3 個月逐日收盤，不限流、穩定。
+    回傳 DataFrame columns: [date, close, volume(張)]
     """
-    for attempt in range(3):
+    rows = []
+    now = get_tw_now()
+    # 抓最近 3 個月（每月一次請求，共 3 次）
+    for delta_month in range(3):
+        d = now - timedelta(days=30 * delta_month)
+        yyyymm = f"{d.year}{d.month:02d}01"
+        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm}&stockNo={code}"
         try:
-            now_ts   = int(get_tw_now().timestamp())
-            start_ts = int((get_tw_now() - timedelta(days=350)).timestamp())
-            r = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-                params={"period1": start_ts, "period2": now_ts, "interval": "1d"},
-                headers=get_headers(), timeout=20
-            )
-            if r.status_code == 429:
-                time.sleep(2 + attempt * 2)
-                continue
-            data = r.json()["chart"]["result"][0]
-            closes  = pd.Series(data["indicators"]["quote"][0]["close"]).ffill().dropna()
-            volumes = pd.Series(data["indicators"]["quote"][0]["volume"]).ffill().dropna()
-            return pd.DataFrame({"close": closes.values, "volume": volumes.values})
-        except requests.exceptions.Timeout:
-            time.sleep(1 + attempt)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+            r = requests.get(url, headers=get_headers(), timeout=10)
+            j = r.json()
+            for row in j.get("data", []):
+                try:
+                    # row: [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 成交筆數]
+                    close  = float(str(row[6]).replace(",", ""))
+                    volume = int(str(row[1]).replace(",", "")) // 1000
+                    rows.append({"close": close, "volume": volume})
+                except: pass
+        except: pass
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows[::-1])  # 最新在前 → 反轉為舊→新
+
+
+@st.cache_data(ttl=86400)
+def get_tpex_history_batch(code: str) -> pd.DataFrame:
+    """
+    從 TPEX 抓單支上櫃股票近 3 個月逐日收盤。
+    """
+    rows = []
+    now = get_tw_now()
+    for delta_month in range(3):
+        d = now - timedelta(days=30 * delta_month)
+        roc_ym = f"{d.year - 1911}/{d.month:02d}"
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
+        try:
+            r = requests.get(url, headers=get_headers(), timeout=10)
+            j = r.json()
+            for row in j.get("aaData", []):
+                try:
+                    close  = float(str(row[6]).replace(",", ""))
+                    volume = int(str(row[1]).replace(",", "")) // 1000
+                    rows.append({"close": close, "volume": volume})
+                except: pass
+        except: pass
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows[::-1])
 
 
 def check_ma_condition(code: str, market: str, today_close: float,
                        today_vol: int, bias_limit: float) -> dict | None:
     """
-    對單支股票取歷史資料，判斷均線多頭排列＋乖離條件。
-    today_close / today_vol 已由批次 API 提供，不需再抓一次。
+    用官方 API 歷史資料判斷均線條件，完全不依賴 Yahoo Finance。
     """
-    ticker = f"{code}.{market}"
-    df_h = get_history_for_ma(ticker)
-    if df_h.empty or len(df_h) < 65:
+    df_h = get_twse_history_batch(code) if market == "TW" else get_tpex_history_batch(code)
+    if df_h.empty or len(df_h) < 62:
         return None
 
     closes  = df_h["close"]
@@ -180,16 +204,16 @@ def check_ma_condition(code: str, market: str, today_close: float,
     ma45 = closes.rolling(45).mean().iloc[-1]
     ma60 = closes.rolling(60).mean().iloc[-1]
 
-    # 用批次 API 的今日收盤取代歷史末筆（更準確）
-    curr_price = today_close
+    curr_price = today_close if today_close else closes.iloc[-1]
     bias_30    = ((curr_price - ma30) / ma30) * 100
 
     if not ((ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit)):
         return None
 
-    vol_yesterday = volumes.iloc[-2] / 1000
+    vol_yesterday = float(volumes.iloc[-2])
     vol_change    = ((today_vol - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
 
+    ticker = f"{code}.{market}"
     return {
         "ticker": ticker,
         "收盤": round(curr_price, 2),
@@ -275,25 +299,92 @@ def run_strategy_check(s, bias_limit, vol_limit):
             return None               # 其他錯誤（格式異常等）直接放棄
     return None
 
+@st.cache_data(ttl=3600)
+def get_kline_data(code: str, market: str) -> pd.DataFrame:
+    """抓 K 線用歷史資料（含 OHLCV），最多 6 個月，來自官方 API。"""
+    rows = []
+    now = get_tw_now()
+    months = 6
+    if market == "TW":
+        for delta in range(months):
+            d = now - timedelta(days=30 * delta)
+            yyyymm = f"{d.year}{d.month:02d}01"
+            url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm}&stockNo={code}"
+            try:
+                r = requests.get(url, headers=get_headers(), timeout=10)
+                for row in r.json().get("data", []):
+                    try:
+                        # [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 筆數]
+                        date   = str(row[0])
+                        # 民國年轉西元
+                        yy, mm, dd = date.split("/")
+                        date_str = f"{int(yy)+1911}-{mm}-{dd}"
+                        rows.append({
+                            "date":   date_str,
+                            "open":   float(str(row[3]).replace(",","")),
+                            "high":   float(str(row[4]).replace(",","")),
+                            "low":    float(str(row[5]).replace(",","")),
+                            "close":  float(str(row[6]).replace(",","")),
+                            "volume": int(str(row[1]).replace(",","")) // 1000,
+                        })
+                    except: pass
+            except: pass
+    else:
+        for delta in range(months):
+            d = now - timedelta(days=30 * delta)
+            roc_ym = f"{d.year - 1911}/{d.month:02d}"
+            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
+            try:
+                r = requests.get(url, headers=get_headers(), timeout=10)
+                for row in r.json().get("aaData", []):
+                    try:
+                        # [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, ...]
+                        date_raw = str(row[0])
+                        yy, mm, dd = date_raw.split("/")
+                        date_str = f"{int(yy)+1911}-{mm}-{dd}"
+                        rows.append({
+                            "date":   date_str,
+                            "open":   float(str(row[3]).replace(",","")),
+                            "high":   float(str(row[4]).replace(",","")),
+                            "low":    float(str(row[5]).replace(",","")),
+                            "close":  float(str(row[6]).replace(",","")),
+                            "volume": int(str(row[1]).replace(",","")) // 1000,
+                        })
+                    except: pass
+            except: pass
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    return df
+
+
 def draw_k_line(ticker, name):
-    yt = yf.Ticker(ticker)
-    df = yt.history(period="1y")
-    if df.empty or len(df) < 60: return None
-    df['MA30'] = df['Close'].rolling(30).mean()
-    df['MA45'] = df['Close'].rolling(45).mean()
-    df['MA60'] = df['Close'].rolling(60).mean()
+    code   = ticker.split(".")[0]
+    market = "TW" if ticker.endswith(".TW") else "TWO"
+    df = get_kline_data(code, market)
+    # fallback to yfinance if official API fails
+    if df.empty or len(df) < 30:
+        yt = yf.Ticker(ticker)
+        raw = yt.history(period="6mo")
+        if raw.empty: return None
+        df = raw.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}).reset_index()
+        df["date"] = df["Date"].dt.strftime("%Y-%m-%d")
+        df["volume"] = df["volume"] // 1000
     df = df.tail(180).copy()
-    colors = ['#ef5350' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#26a69a' for i in range(len(df))]
-    df.index = df.index.strftime('%Y-%m-%d')
+    if len(df) < 10: return None
+    df['MA30'] = df['close'].rolling(30).mean()
+    df['MA45'] = df['close'].rolling(45).mean()
+    df['MA60'] = df['close'].rolling(60).mean()
+    colors = ['#ef5350' if df['close'].iloc[i] >= df['open'].iloc[i] else '#26a69a' for i in range(len(df))]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
-                                 low=df['Low'], close=df['Close'], name='K線',
+    fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'],
+                                 low=df['low'], close=df['close'], name='K線',
                                  increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA45'], line=dict(color='blue',   width=1.5), name='45MA'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color=colors), row=2, col=1)
-    fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖",
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='blue',   width=1.5), name='45MA'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
+    fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=colors), row=2, col=1)
+    fig.update_layout(title=f"{name} ({ticker}) K線與均線圖",
                       xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
     fig.update_xaxes(type='category')
     return fig
@@ -383,7 +474,7 @@ if st.session_state.is_scanning:
             return {**s, **res}
         return None
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=50) as ex:  # 官方 API 無限流，可大幅提高並發
         futures = {ex.submit(_check, s): s for s in candidates}
         for i, f in enumerate(as_completed(futures), 1):
             bar.progress(0.10 + 0.75 * i / total_c)
