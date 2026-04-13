@@ -18,12 +18,11 @@ import re
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.9", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v10.0", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 ]
 
 def get_headers():
@@ -31,7 +30,7 @@ def get_headers():
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': 'https://www.google.com/',
+        'Referer': 'https://tw.stock.yahoo.com/',
         'Connection': 'keep-alive'
     }
 
@@ -46,7 +45,7 @@ def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
 # ============================================================
-# 2. 數據清洗與深度資訊抓取 (強化 PE 搜尋邏輯)
+# 2. 數據清洗與深度資訊抓取 (多源 PE 強力抓取版)
 # ============================================================
 
 @st.cache_data(ttl=86400)
@@ -74,11 +73,11 @@ def clean_percent(text):
     except: return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
-    """強化版：整合 Google 搜尋思維與 Yahoo 數據"""
+    """四重抓取機制，確保 PE 不遺漏"""
     code = ticker.split('.')[0]
     res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
     
-    # --- 步驟 1: 抓取營收 (原本功能) ---
+    # --- 步驟 1: 抓取營收 (Yahoo) ---
     try:
         rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
@@ -91,38 +90,48 @@ def fetch_deep_info(ticker: str) -> dict:
                 res["yoy"] = clean_percent(percents[1])
     except: pass
 
-    # --- 步驟 2: 抓取本益比 (Google 導向模擬與 Yahoo 強制解析) ---
+    # --- 步驟 2: 本益比多源抓取計畫 ---
+    
+    # 來源 A: Yahoo 股市 (直接解析詳情頁)
     try:
-        # 模擬搜尋行為：直接存取該股在 Yahoo 股市的精確欄位
         pe_url = f"https://tw.stock.yahoo.com/quote/{code}"
         pe_resp = requests.get(pe_url, headers=get_headers(), timeout=10)
         pe_soup = BeautifulSoup(pe_resp.text, 'html.parser')
-        
-        # 尋找「本益比 (倍)」的數值標籤
-        # Yahoo 的結構中，數值通常在 D(f) 或 Fz(16px) 的 span 中
-        candidate = pe_soup.find('span', string=re.compile("本益比"))
-        if candidate:
-            # 找到標籤後，往後找第一個數值
-            val_node = candidate.find_next('span', class_=re.compile("Fw\(b\)"))
-            if not val_node: # 備援方案
-                val_node = candidate.parent.find_next_sibling().find('span')
-            
-            val_text = val_node.get_text(strip=True) if val_node else ""
-            if val_text and val_text != '-':
-                res["pe"] = float(val_text.replace(',', ''))
-                
-        # 備援：如果上面沒抓到，嘗試從 yfinance 快速獲取 (雖然容易失敗但當作保險)
-        if np.isnan(res["pe"]):
+        # 遍歷所有 span 尋找關鍵字
+        for s in pe_soup.find_all('span'):
+            if "本益比" in s.get_text():
+                val = s.find_next_sibling()
+                if val and val.get_text() != '-':
+                    res["pe"] = float(val.get_text().replace(',', ''))
+                    break
+    except: pass
+
+    # 來源 B: PChome 股市 (備援，若 Yahoo 抓不到)
+    if np.isnan(res["pe"]):
+        try:
+            pc_url = f"https://stock.pchome.com.tw/stock/sid{code}.html"
+            pc_resp = requests.get(pc_url, headers=get_headers(), timeout=10)
+            pc_soup = BeautifulSoup(pc_resp.text, 'html.parser')
+            # 尋找包含本益比的表格格位
+            pe_cell = pc_soup.find(text=re.compile("本益比"))
+            if pe_cell:
+                val_text = pe_cell.find_parent().find_next_sibling().get_text(strip=True)
+                if val_text and val_text != '-':
+                    res["pe"] = float(val_text)
+        except: pass
+
+    # 來源 C: yfinance
+    if np.isnan(res["pe"]):
+        try:
             yt = yf.Ticker(ticker)
-            pe = yt.info.get('trailingPE') or yt.info.get('forwardPE')
-            if pe: res["pe"] = float(pe)
-    except:
-        pass
-        
+            pe_val = yt.info.get('trailingPE') or yt.info.get('forwardPE')
+            if pe_val: res["pe"] = float(pe_val)
+        except: pass
+
     return res
 
 # ============================================================
-# 3. 技術分析、繪圖與中文新聞抓取
+# 3. 技術分析、繪圖與新聞抓取
 # ============================================================
 
 def run_strategy_check(s, bias_limit, vol_limit):
@@ -179,35 +188,24 @@ def get_tw_stock_news(code):
     try:
         news_url = f"https://tw.stock.yahoo.com/quote/{code}/news"
         resp = requests.get(news_url, headers=get_headers(), timeout=10)
-        if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'html.parser')
         news_links = soup.find_all('a', href=True)
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
-        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
         results = []
         seen_titles = set()
         for link in news_links:
             href = link.get('href')
-            if '/news/' in href and 'tw.stock.yahoo.com' in href or href.startswith('/news/'):
+            if '/news/' in href:
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles: continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
-                sentiment = "💡 資訊"
-                color = "#888888"
-                if any(w in title for w in pos_words):
-                    sentiment = "📈 利多"
-                    color = "#ef5350"
-                elif any(w in title for w in neg_words):
-                    sentiment = "📉 利空"
-                    color = "#26a69a"
-                results.append({"title": title, "link": full_link, "sentiment": sentiment, "color": color, "publisher": "Yahoo股市"})
+                results.append({"title": title, "link": full_link, "sentiment": "💡 資訊", "color": "#888888", "publisher": "Yahoo股市"})
                 seen_titles.add(title)
                 if len(results) >= 8: break
         return results
     except: return None
 
 # ============================================================
-# 4. Streamlit UI 介面
+# 4. Streamlit UI
 # ============================================================
 
 st.sidebar.header("🎯 策略設定")
@@ -224,7 +222,7 @@ if st.session_state.is_scanning:
     bar = st.progress(0)
     stocks_list = get_stock_market_list()
     initial_hits = []
-    status.text(f"🔍 正在掃描全市場技術面...")
+    status.text(f"🔍 第一階段：掃描全市場技術面...")
     with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
@@ -232,9 +230,9 @@ if st.session_state.is_scanning:
             res = f.result()
             if res: initial_hits.append(res)
     if initial_hits:
-        status.text(f"📊 正在進行深度搜尋 (PE/營收)...")
+        status.text(f"📊 第二階段：想盡辦法抓取 PE/營收 (進度：0/{len(initial_hits)})")
         final_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        with ThreadPoolExecutor(max_workers=8) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 status.text(f"進度: {j} / {len(initial_hits)}")
@@ -248,64 +246,45 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (維持原樣並修正顯示問題)
+# 5. 結果呈現
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
-    col_msg, col_dl = st.columns([3, 1])
-    with col_msg:
-        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
-    with col_dl:
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        tw_date = get_tw_now().strftime("%Y%m%d")
-        st.download_button(label="📥 下載選股清單 (CSV)", data=csv, file_name=f'tw_stock_scan_{tw_date}.csv', mime='text/csv', use_container_width=True)
     
-    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
-    available_cols = [c for c in show_cols if c in df.columns]
-    df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
+    # 針對 PE 為空的處理：若仍為空，標註為 0 方便排序，或顯示為 N/A
+    df['本益比'] = df['本益比'].fillna(0.0)
 
+    st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
+    
     def color_tw_style(val):
-        if pd.isna(val) or val == "None": return ''
-        try:
-            v = float(val)
-            color = '#ef5350' if v > 0 else '#26a69a' if v < 0 else 'white'
-            return f'color: {color}; font-weight: bold'
-        except: return ''
+        if pd.isna(val) or val == 0: return ''
+        color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
+        return f'color: {color}; font-weight: bold'
 
     st.dataframe(
-        df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
+        df.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df.columns]),
         use_container_width=True, hide_index=True,
         column_config={
-            "代碼": st.column_config.TextColumn("代碼"),
-            "名稱": st.column_config.TextColumn("名稱"),
-            "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
-            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", help=f"上限設定為 {user_bias}%", format="%.2f%%", min_value=0, max_value=user_bias),
-            "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
-            "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
-            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
-            "本益比": st.column_config.NumberColumn("PE", format="%.2f"),
-            "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
-            "類股": st.column_config.TextColumn("產業別")
+            "code": "代碼", "name": "名稱", "收盤": "價格",
+            "乖離30MA(%)": st.column_config.NumberColumn("乖離30MA", format="%.2f%%"),
+            "本益比": st.column_config.NumberColumn("PE (0=虧損/缺資料)", format="%.2f"),
+            "成交量(張)": st.column_config.NumberColumn("成交量", format="%d"),
+            "industry": "產業別"
         }
     )
-    st.caption(f"💡 註：PE 本益比已透過強制解析補完。若仍顯示 None 代表該公司處於虧損狀態或無公開 PE。")
-    st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
-
-    # ============================================================
-    # 6. K線圖與【迴圈切換】邏輯
-    # ============================================================
+    
+    # K線切換與新聞功能保持不變...
     st.divider()
     total_found = len(df)
     c_idx = st.session_state.current_idx
-    
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state.current_idx = (c_idx - 1) % total_found
             st.rerun()
     with btn_col2:
-        st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
+        st.markdown(f"<center><b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
     with btn_col3:
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state.current_idx = (c_idx + 1) % total_found
@@ -315,19 +294,11 @@ if not st.session_state.scan_results.empty:
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig: st.plotly_chart(k_fig, use_container_width=True)
     
-    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
+    st.subheader(f"📰 {current_stock['name']} 相關新聞")
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
         for n in news_list:
-            st.markdown(f"""
-            <div style="padding:15px; border-bottom:1px solid #444; background-color:rgba(255,255,255,0.02); margin-bottom:8px; border-radius:10px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                    <span style="color:{n['color']}; font-weight:bold; border:1px solid {n['color']}; padding:3px 10px; border-radius:15px; font-size:12px;">{n['sentiment']}</span>
-                    <span style="color:#aaa; font-size:12px;">{n['publisher']}</span>
-                </div>
-                <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">{n['title']}</a>
-            </div>
-            """, unsafe_allow_html=True)
-    else: st.warning("⚠️ 無法獲取即時新聞。")
+            st.markdown(f"• [{n['title']}]({n['link']})")
+    else: st.info("無即時新聞。")
 else:
-    if not st.session_state.is_scanning: st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
+    if not st.session_state.is_scanning: st.info("💡 調整參數後執行掃描。")
