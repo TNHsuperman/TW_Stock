@@ -242,13 +242,13 @@ if not st.session_state.scan_results.empty:
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
-    # 使用支援選取功能的 st.dataframe
+    # 設定選取功能
     event = st.dataframe(
         df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
         use_container_width=True, 
         hide_index=True,
-        on_select="rerun",  # 選取時觸發 rerun
-        selection_mode="single-row", # 修復後的選取參數
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
             "代碼": st.column_config.TextColumn("代碼"),
             "名稱": st.column_config.TextColumn("名稱"),
@@ -263,16 +263,14 @@ if not st.session_state.scan_results.empty:
         }
     )
 
-    # 點選連動邏輯
-    if event and "selection" in event:
-        rows = event["selection"]["rows"]
-        if rows:
-            new_idx = rows[0]
-            if st.session_state.current_idx != new_idx:
-                st.session_state.current_idx = new_idx
-                st.rerun()
+    # 點擊連動邏輯：僅當選取列有變化時更新
+    if event and "selection" in event and event["selection"]["rows"]:
+        selected_row = event["selection"]["rows"][0]
+        if st.session_state.current_idx != selected_row:
+            st.session_state.current_idx = selected_row
+            # 這裡不直接 rerun，讓下方的按鈕邏輯有機會被執行
 
-    # --- 還原原始註解內容 ---
+    # --- 保有原始註解內容 ---
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
@@ -283,24 +281,31 @@ if not st.session_state.scan_results.empty:
     st.divider()
     total_found = len(df)
     
+    # 防止索引溢出
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
     
-    c_idx = st.session_state.current_idx
-    
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
+    
+    # 獲取當前 index
+    c_idx = st.session_state.current_idx
+
     with btn_col1:
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state.current_idx = (c_idx - 1) % total_found
             st.rerun()
+            
     with btn_col2:
-        st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
+        # 顯示目前選中的股票資訊
+        st.markdown(f"<center>第 {st.session_state.current_idx + 1} / {total_found} 支：<b>{df.iloc[st.session_state.current_idx]['code']} {df.iloc[st.session_state.current_idx]['name']}</b></center>", unsafe_allow_html=True)
+        
     with btn_col3:
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state.current_idx = (c_idx + 1) % total_found
             st.rerun()
     
-    current_stock = df.iloc[c_idx]
+    # 最終顯示
+    current_stock = df.iloc[st.session_state.current_idx]
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig: 
         st.plotly_chart(k_fig, use_container_width=True)
