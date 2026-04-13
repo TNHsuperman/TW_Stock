@@ -34,12 +34,16 @@ def get_headers():
         'Connection': 'keep-alive'
     }
 
+# ── Session State 初始化 ──────────────────────────────────────
 if 'scan_results' not in st.session_state:
     st.session_state['scan_results'] = pd.DataFrame()
 if 'is_scanning' not in st.session_state:
     st.session_state['is_scanning'] = False
 if 'current_idx' not in st.session_state:
     st.session_state['current_idx'] = 0
+# 記錄上一次點擊的列，用來偵測「是否真的換了一列」
+if 'last_selected_row' not in st.session_state:
+    st.session_state['last_selected_row'] = None
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
@@ -99,36 +103,41 @@ def fetch_deep_info(ticker: str) -> dict:
 
 def run_strategy_check(s, bias_limit, vol_limit):
     now_ts = int(get_tw_now().timestamp())
-    start_ts = int((get_tw_now() - timedelta(days=250)).timestamp()) 
+    start_ts = int((get_tw_now() - timedelta(days=250)).timestamp())
     try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}", 
-                         params={"period1":start_ts, "period2":now_ts, "interval":"1d"}, headers=get_headers(), timeout=10)
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}",
+                         params={"period1": start_ts, "period2": now_ts, "interval": "1d"},
+                         headers=get_headers(), timeout=10)
         data = r.json()['chart']['result'][0]
         c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
         v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
         if len(c_series) < 65: return None
-        
-        vol_today = v_series.iloc[-1]
+
+        vol_today     = v_series.iloc[-1]
         vol_yesterday = v_series.iloc[-2]
-        vol_change = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-        curr_vol_int = int(vol_today / 1000)
-        avg_vol_5d = v_series.tail(5).mean() / 1000
+        vol_change    = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
+        curr_vol_int  = int(vol_today / 1000)
+        avg_vol_5d    = v_series.tail(5).mean() / 1000
         if avg_vol_5d < vol_limit: return None
-        
-        ma30 = c_series.rolling(30).mean().iloc[-1]
-        ma45 = c_series.rolling(45).mean().iloc[-1]
-        ma60 = c_series.rolling(60).mean().iloc[-1]
+
+        ma30  = c_series.rolling(30).mean().iloc[-1]
+        ma45  = c_series.rolling(45).mean().iloc[-1]
+        ma60  = c_series.rolling(60).mean().iloc[-1]
         curr_price = c_series.iloc[-1]
         bias_30 = ((curr_price - ma30) / ma30) * 100
-        
+
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
-            return {**s, "收盤": round(curr_price, 2), "乖離30MA(%)": round(bias_30, 2), "成交量(張)": curr_vol_int, "量變動(%)": round(vol_change, 2)}
+            return {**s,
+                    "收盤": round(curr_price, 2),
+                    "乖離30MA(%)": round(bias_30, 2),
+                    "成交量(張)": curr_vol_int,
+                    "量變動(%)": round(vol_change, 2)}
     except: return None
     return None
 
 def draw_k_line(ticker, name):
     yt = yf.Ticker(ticker)
-    df = yt.history(period="1y") 
+    df = yt.history(period="1y")
     if df.empty or len(df) < 60: return None
     df['MA30'] = df['Close'].rolling(30).mean()
     df['MA45'] = df['Close'].rolling(45).mean()
@@ -137,14 +146,16 @@ def draw_k_line(ticker, name):
     colors = ['#ef5350' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#26a69a' for i in range(len(df))]
     df.index = df.index.strftime('%Y-%m-%d')
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], 
-                                 name='K線', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+                                 low=df['Low'], close=df['Close'], name='K線',
+                                 increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA45'], line=dict(color='blue', width=1.5), name='45MA'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA45'], line=dict(color='blue',   width=1.5), name='45MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='成交量', marker_color=colors), row=2, col=1)
-    fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖", xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
-    fig.update_xaxes(type='category') 
+    fig.update_layout(title=f"{name} ({ticker}) 180日K線與均線圖",
+                      xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
+    fig.update_xaxes(type='category')
     return fig
 
 def get_tw_stock_news(code):
@@ -156,23 +167,20 @@ def get_tw_stock_news(code):
         news_links = soup.find_all('a', href=True)
         pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
         neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
-        results = []
-        seen_titles = set()
+        results, seen_titles = [], set()
         for link in news_links:
             href = link.get('href')
             if '/news/' in href and 'tw.stock.yahoo.com' in href or href.startswith('/news/'):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles: continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
-                sentiment = "💡 資訊"
-                color = "#888888"
+                sentiment, color = "💡 資訊", "#888888"
                 if any(w in title for w in pos_words):
-                    sentiment = "📈 利多"
-                    color = "#ef5350"
+                    sentiment, color = "📈 利多", "#ef5350"
                 elif any(w in title for w in neg_words):
-                    sentiment = "📉 利空"
-                    color = "#26a69a"
-                results.append({"title": title, "link": full_link, "sentiment": sentiment, "color": color, "publisher": "Yahoo股市"})
+                    sentiment, color = "📉 利空", "#26a69a"
+                results.append({"title": title, "link": full_link, "sentiment": sentiment,
+                                 "color": color, "publisher": "Yahoo股市"})
                 seen_titles.add(title)
                 if len(results) >= 8: break
         return results
@@ -184,19 +192,20 @@ def get_tw_stock_news(code):
 
 st.sidebar.header("🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
-user_vol = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
+user_vol  = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
 
 if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
-    st.session_state.is_scanning = True
-    st.session_state.current_idx = 0 
+    st.session_state.is_scanning   = True
+    st.session_state.current_idx   = 0
+    st.session_state.last_selected_row = None
     st.rerun()
 
 if st.session_state.is_scanning:
     status = st.empty()
-    bar = st.progress(0)
-    stocks_list = get_stock_market_list()
-    initial_hits = []
-    status.text(f"🔍 正在掃描全市場...")
+    bar    = st.progress(0)
+    stocks_list   = get_stock_market_list()
+    initial_hits  = []
+    status.text("🔍 正在掃描全市場...")
     with ThreadPoolExecutor(max_workers=30) as ex:
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
@@ -204,14 +213,17 @@ if st.session_state.is_scanning:
             res = f.result()
             if res: initial_hits.append(res)
     if initial_hits:
-        status.text(f"📊 正在抓取財報數據...")
+        status.text("📊 正在抓取財報數據...")
         final_list = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r['ticker']): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 status.text(f"進度: {j} / {len(initial_hits)}")
                 deep_res = f.result()
-                final_list.append({**f_deep[f], "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"]})
+                final_list.append({**f_deep[f],
+                                    "本益比": deep_res["pe"],
+                                    "營收月增": deep_res["mom"],
+                                    "營收年增": deep_res["yoy"]})
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
@@ -225,91 +237,111 @@ if st.session_state.is_scanning:
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
+
     col_msg, col_dl = st.columns([3, 1])
     with col_msg:
         st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
     with col_dl:
-        csv = df.to_csv(index=False).encode('utf-8-sig')
+        csv     = df.to_csv(index=False).encode('utf-8-sig')
         tw_date = get_tw_now().strftime("%Y%m%d")
-        st.download_button(label="📥 下載選股清單 (CSV)", data=csv, file_name=f'tw_stock_scan_{tw_date}.csv', mime='text/csv', use_container_width=True)
-    
-    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+        st.download_button(label="📥 下載選股清單 (CSV)", data=csv,
+                           file_name=f'tw_stock_scan_{tw_date}.csv',
+                           mime='text/csv', use_container_width=True)
+
+    show_cols      = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
-    df_display = df[available_cols].rename(columns={"code":"代碼","name":"名稱","industry":"類股"})
+    df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
 
     def color_tw_style(val):
         if pd.isna(val): return ''
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
-    # 設定選取功能
+    # ── 確保索引不溢出 ──────────────────────────────────────────
+    total_found = len(df)
+    if st.session_state.current_idx >= total_found:
+        st.session_state.current_idx = 0
+
+    # ── 顯示表格，捕捉點擊事件 ─────────────────────────────────
     event = st.dataframe(
-        df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
-        use_container_width=True, 
+        df_display.style.map(
+            color_tw_style,
+            subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
+        ),
+        use_container_width=True,
         hide_index=True,
-        on_select="rerun",
+        on_select="rerun",          # 點擊任一列時觸發 rerun
         selection_mode="single-row",
         column_config={
-            "代碼": st.column_config.TextColumn("代碼"),
-            "名稱": st.column_config.TextColumn("名稱"),
-            "收盤": st.column_config.NumberColumn("價格", format="%.2f"),
-            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", help=f"上限設定為 {user_bias}%", format="%.2f%%", min_value=0, max_value=user_bias),
-            "量變動(%)": st.column_config.NumberColumn("量變動", format="%.1f%%"),
-            "營收月增": st.column_config.NumberColumn("營收月增", format="%.1f%%"),
-            "營收年增": st.column_config.NumberColumn("營收年增", format="%.1f%%"),
-            "本益比": st.column_config.NumberColumn("PE", format="%.1f"),
-            "成交量(張)": st.column_config.NumberColumn("成交量", format="%d 📦"),
-            "類股": st.column_config.TextColumn("產業別")
+            "代碼":        st.column_config.TextColumn("代碼"),
+            "名稱":        st.column_config.TextColumn("名稱"),
+            "收盤":        st.column_config.NumberColumn("價格",    format="%.2f"),
+            "乖離30MA(%)": st.column_config.ProgressColumn("30MA 乖離", help=f"上限設定為 {user_bias}%",
+                                                            format="%.2f%%", min_value=0, max_value=user_bias),
+            "量變動(%)":   st.column_config.NumberColumn("量變動",  format="%.1f%%"),
+            "營收月增":    st.column_config.NumberColumn("營收月增", format="%.1f%%"),
+            "營收年增":    st.column_config.NumberColumn("營收年增", format="%.1f%%"),
+            "本益比":      st.column_config.NumberColumn("PE",       format="%.1f"),
+            "成交量(張)":  st.column_config.NumberColumn("成交量",  format="%d 📦"),
+            "類股":        st.column_config.TextColumn("產業別"),
         }
     )
 
-    # 點擊連動邏輯：僅當選取列有變化時更新
+    # ── ★ 核心修正：點擊列 → 同步更新 current_idx ──────────────
+    # on_select="rerun" 已觸發重跑；此處直接更新 session_state 即可
     if event and "selection" in event and event["selection"]["rows"]:
-        selected_row = event["selection"]["rows"][0]
-        if st.session_state.current_idx != selected_row:
-            st.session_state.current_idx = selected_row
-            # 這裡不直接 rerun，讓下方的按鈕邏輯有機會被執行
+        clicked_row = event["selection"]["rows"][0]
+        # 只有真正換了列才更新（避免同列重複觸發不必要的 state 更動）
+        if st.session_state.last_selected_row != clicked_row:
+            st.session_state.current_idx      = clicked_row
+            st.session_state.last_selected_row = clicked_row
+            # on_select="rerun" 已觸發重跑，不需再呼叫 st.rerun()
 
-    # --- 保有原始註解內容 ---
     st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
-    # 6. K線圖與【迴圈切換】邏輯
+    # 6. 上一支 / 下一支 按鈕 + K 線圖
     # ============================================================
     st.divider()
-    total_found = len(df)
-    
-    # 防止索引溢出
-    if st.session_state.current_idx >= total_found:
-        st.session_state.current_idx = 0
-    
+
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
-    
-    # 獲取當前 index
-    c_idx = st.session_state.current_idx
 
     with btn_col1:
         if st.button("⬅️ 上一支", use_container_width=True):
-            st.session_state.current_idx = (c_idx - 1) % total_found
+            # 先讀目前值，再計算新值，最後一次性寫入並 rerun
+            new_idx = (st.session_state.current_idx - 1) % total_found
+            st.session_state.current_idx      = new_idx
+            st.session_state.last_selected_row = new_idx
             st.rerun()
-            
+
     with btn_col2:
-        # 顯示目前選中的股票資訊
-        st.markdown(f"<center>第 {st.session_state.current_idx + 1} / {total_found} 支：<b>{df.iloc[st.session_state.current_idx]['code']} {df.iloc[st.session_state.current_idx]['name']}</b></center>", unsafe_allow_html=True)
-        
+        c_idx = st.session_state.current_idx
+        st.markdown(
+            f"<div style='text-align:center; padding:6px 0;'>"
+            f"第 <b>{c_idx + 1}</b> / {total_found} 支："
+            f"<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
     with btn_col3:
         if st.button("下一支 ➡️", use_container_width=True):
-            st.session_state.current_idx = (c_idx + 1) % total_found
+            new_idx = (st.session_state.current_idx + 1) % total_found
+            st.session_state.current_idx      = new_idx
+            st.session_state.last_selected_row = new_idx
             st.rerun()
-    
-    # 最終顯示
+
+    # ── K 線圖 ────────────────────────────────────────────────
     current_stock = df.iloc[st.session_state.current_idx]
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
-    if k_fig: 
+    if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
-    
+    else:
+        st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
+
+    # ── 新聞 ──────────────────────────────────────────────────
     st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
@@ -323,8 +355,9 @@ if not st.session_state.scan_results.empty:
                 <a href="{n['link']}" target="_blank" style="text-decoration:none; color:#ffffff; font-size:17px; font-weight:500; line-height:1.4;">{n['title']}</a>
             </div>
             """, unsafe_allow_html=True)
-    else: 
+    else:
         st.warning("⚠️ 無法獲取即時新聞。")
+
 else:
-    if not st.session_state.is_scanning: 
+    if not st.session_state.is_scanning:
         st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
