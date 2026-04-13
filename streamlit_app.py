@@ -108,35 +108,47 @@ def fetch_deep_info(ticker: str) -> dict:
 def run_strategy_check(s, bias_limit, vol_limit):
     now_ts = int(get_tw_now().timestamp())
     start_ts = int((get_tw_now() - timedelta(days=250)).timestamp())
-    try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}",
-                         params={"period1": start_ts, "period2": now_ts, "interval": "1d"},
-                         headers=get_headers(), timeout=10)
-        data = r.json()['chart']['result'][0]
-        c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
-        v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
-        if len(c_series) < 65: return None
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{s['ticker']}"
+    params = {"period1": start_ts, "period2": now_ts, "interval": "1d"}
 
-        vol_today     = v_series.iloc[-1]
-        vol_yesterday = v_series.iloc[-2]
-        vol_change    = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-        curr_vol_int  = int(vol_today / 1000)
-        avg_vol_5d    = v_series.tail(5).mean() / 1000
-        if avg_vol_5d < vol_limit: return None
+    # ★ 最多重試 3 次，每次失敗後等待再重試，解決限流與 timeout 造成的結果不穩定
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=get_headers(), timeout=20)
+            # 被限流時 Yahoo 回傳 429，等待後重試
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            data = r.json()['chart']['result'][0]
+            c_series = pd.Series(data['indicators']['quote'][0]['close']).ffill().dropna()
+            v_series = pd.Series(data['indicators']['quote'][0]['volume']).ffill().dropna()
+            if len(c_series) < 65: return None
 
-        ma30  = c_series.rolling(30).mean().iloc[-1]
-        ma45  = c_series.rolling(45).mean().iloc[-1]
-        ma60  = c_series.rolling(60).mean().iloc[-1]
-        curr_price = c_series.iloc[-1]
-        bias_30 = ((curr_price - ma30) / ma30) * 100
+            vol_today     = v_series.iloc[-1]
+            vol_yesterday = v_series.iloc[-2]
+            vol_change    = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
+            curr_vol_int  = int(vol_today / 1000)
+            avg_vol_5d    = v_series.tail(5).mean() / 1000
+            if avg_vol_5d < vol_limit: return None
 
-        if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
-            return {**s,
-                    "收盤": round(curr_price, 2),
-                    "乖離30MA(%)": round(bias_30, 2),
-                    "成交量(張)": curr_vol_int,
-                    "量變動(%)": round(vol_change, 2)}
-    except: return None
+            ma30  = c_series.rolling(30).mean().iloc[-1]
+            ma45  = c_series.rolling(45).mean().iloc[-1]
+            ma60  = c_series.rolling(60).mean().iloc[-1]
+            curr_price = c_series.iloc[-1]
+            bias_30 = ((curr_price - ma30) / ma30) * 100
+
+            if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
+                return {**s,
+                        "收盤": round(curr_price, 2),
+                        "乖離30MA(%)": round(bias_30, 2),
+                        "成交量(張)": curr_vol_int,
+                        "量變動(%)": round(vol_change, 2)}
+            return None  # 條件不符，不需重試
+        except requests.exceptions.Timeout:
+            time.sleep(1 + attempt)   # timeout 時稍等再重試
+            continue
+        except Exception:
+            return None               # 其他錯誤（格式異常等）直接放棄
     return None
 
 def draw_k_line(ticker, name):
@@ -210,7 +222,7 @@ if st.session_state.is_scanning:
     stocks_list   = get_stock_market_list()
     initial_hits  = []
     status.text("🔍 正在掃描全市場...")
-    with ThreadPoolExecutor(max_workers=30) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:  # ★ 降低併發數，避免被 Yahoo 限流
         futures = {ex.submit(run_strategy_check, s, user_bias, user_vol): s for s in stocks_list}
         for i, f in enumerate(as_completed(futures), 1):
             if i % 100 == 0: bar.progress(i / len(stocks_list))
