@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.9", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板", layout="wide", page_icon="📈")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -274,8 +274,27 @@ def draw_k_line(ticker, name):
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='blue',   width=1.5), name='45MA'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
     fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=colors), row=2, col=1)
-    fig.update_layout(title=f"{name} ({ticker}) K線與均線圖",
-                      xaxis_rangeslider_visible=False, height=600, template='plotly_dark')
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{name}</b>  <span style='color:#4a7a8a;font-size:14px;'>({ticker})</span>",
+            font=dict(family="Share Tech Mono, monospace", size=16, color="#00ffc8"),
+        ),
+        xaxis_rangeslider_visible=False,
+        height=620,
+        template='plotly_dark',
+        paper_bgcolor='#050d1a',
+        plot_bgcolor='#070f1f',
+        font=dict(family="Share Tech Mono, monospace", color="#7a9aaa"),
+        legend=dict(
+            bgcolor='#0a1628', bordercolor='#0ff2', borderwidth=1,
+            font=dict(size=11, color="#a0c4d8"),
+        ),
+        margin=dict(l=12, r=12, t=48, b=12),
+        xaxis=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
+        yaxis=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
+        xaxis2=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
+        yaxis2=dict(gridcolor='#0ff1', showgrid=True, zeroline=False),
+    )
     fig.update_xaxes(type='category')
     return fig
 
@@ -311,6 +330,181 @@ def get_tw_stock_news(code):
 # 4. Streamlit UI 介面
 # ============================================================
 
+# ── 全域 CSS 主題注入 ──────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
+
+/* ── 全域底色 ── */
+html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: #050d1a !important;
+    color: #c8d8e8 !important;
+}
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #070f1f 0%, #0a1628 100%) !important;
+    border-right: 1px solid #0ff3 !important;
+}
+[data-testid="stSidebar"] * { color: #a0c4d8 !important; }
+
+/* ── 掃描按鈕 ── */
+[data-testid="stButton"] > button {
+    background: linear-gradient(135deg, #003d2e 0%, #00251a 100%) !important;
+    color: #00ffc8 !important;
+    border: 1px solid #00ffc855 !important;
+    border-radius: 4px !important;
+    font-family: 'Share Tech Mono', monospace !important;
+    font-size: 15px !important;
+    letter-spacing: 2px !important;
+    transition: all 0.25s ease !important;
+    text-transform: uppercase !important;
+}
+[data-testid="stButton"] > button:hover {
+    background: linear-gradient(135deg, #005a44 0%, #003d2e 100%) !important;
+    border-color: #00ffc8 !important;
+    box-shadow: 0 0 18px #00ffc840, 0 0 40px #00ffc820 !important;
+    color: #ffffff !important;
+}
+[data-testid="stButton"] > button:disabled {
+    opacity: 0.35 !important;
+    cursor: not-allowed !important;
+}
+
+/* ── 下載按鈕 ── */
+[data-testid="stDownloadButton"] > button {
+    background: linear-gradient(135deg, #001f3d 0%, #000d1a 100%) !important;
+    color: #4db8ff !important;
+    border: 1px solid #4db8ff55 !important;
+    border-radius: 4px !important;
+    font-family: 'Share Tech Mono', monospace !important;
+    letter-spacing: 1px !important;
+    transition: all 0.25s ease !important;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    border-color: #4db8ff !important;
+    box-shadow: 0 0 15px #4db8ff40 !important;
+    color: #ffffff !important;
+}
+
+/* ── 表格 ── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #0ff2 !important;
+    border-radius: 6px !important;
+    overflow: hidden !important;
+}
+
+/* ── 進度條 ── */
+[data-testid="stProgress"] > div > div {
+    background: linear-gradient(90deg, #00ffc8, #4db8ff) !important;
+    box-shadow: 0 0 10px #00ffc860 !important;
+}
+[data-testid="stProgress"] > div {
+    background: #0a1628 !important;
+    border: 1px solid #0ff2 !important;
+    border-radius: 4px !important;
+}
+
+/* ── 成功 / 警告訊息框 ── */
+[data-testid="stAlert"] {
+    border-radius: 4px !important;
+    border-left: 3px solid #00ffc8 !important;
+    background: #00ffc808 !important;
+}
+
+/* ── slider & number_input ── */
+[data-testid="stSlider"] div[role="slider"] {
+    background: #00ffc8 !important;
+    box-shadow: 0 0 8px #00ffc880 !important;
+}
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+    background: #070f1f !important;
+    border: 1px solid #0ff3 !important;
+    color: #c8d8e8 !important;
+    border-radius: 4px !important;
+}
+
+/* ── divider ── */
+hr {
+    border-color: #0ff2 !important;
+    margin: 16px 0 !important;
+}
+
+/* ── caption ── */
+[data-testid="stCaptionContainer"] {
+    color: #4a6070 !important;
+    font-size: 11px !important;
+    font-family: 'Share Tech Mono', monospace !important;
+}
+
+/* ── 頁面內所有純文字 ── */
+p, span, label, .stMarkdown { font-family: 'Noto Sans TC', sans-serif !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── 頁頭 Banner ───────────────────────────────────────────────
+st.markdown("""
+<div style="
+    background: linear-gradient(90deg, #050d1a 0%, #071828 40%, #050d1a 100%);
+    border-bottom: 1px solid #00ffc830;
+    padding: 22px 32px 16px;
+    margin-bottom: 8px;
+    position: relative;
+    overflow: hidden;
+">
+  <!-- 背景裝飾線 -->
+  <div style="position:absolute;top:0;left:0;right:0;height:2px;
+    background:linear-gradient(90deg,transparent,#00ffc8,#4db8ff,transparent);"></div>
+
+  <div style="display:flex; align-items:center; gap:16px;">
+    <div style="font-size:32px; filter:drop-shadow(0 0 8px #00ffc8);">📈</div>
+    <div>
+      <div style="
+        font-family:'Share Tech Mono',monospace;
+        font-size:22px;
+        font-weight:700;
+        color:#00ffc8;
+        letter-spacing:4px;
+        text-shadow: 0 0 20px #00ffc860;
+        line-height:1.1;
+      ">台股智慧選股系統</div>
+      <div style="
+        font-family:'Share Tech Mono',monospace;
+        font-size:11px;
+        color:#4a7a8a;
+        letter-spacing:3px;
+        margin-top:3px;
+      ">TAIWAN STOCK SMART SCANNER · MA STRATEGY ENGINE</div>
+    </div>
+    <div style="margin-left:auto; text-align:right;">
+      <div style="
+        font-family:'Share Tech Mono',monospace;
+        font-size:11px;
+        color:#4a7a8a;
+        letter-spacing:1px;
+      ">STRATEGY</div>
+      <div style="
+        font-family:'Share Tech Mono',monospace;
+        font-size:12px;
+        color:#00ffc8;
+        letter-spacing:1px;
+      ">MA30 &gt; MA45 &gt; MA60 · BULL ALIGNMENT</div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Sidebar 美化 ──────────────────────────────────────────────
+st.sidebar.markdown("""
+<div style="
+    font-family:'Share Tech Mono',monospace;
+    font-size:13px;
+    color:#00ffc8;
+    letter-spacing:3px;
+    padding:8px 0 12px;
+    border-bottom:1px solid #00ffc830;
+    margin-bottom:12px;
+">⚙ STRATEGY CONFIG</div>
+""", unsafe_allow_html=True)
 st.sidebar.header("🎯 策略設定")
 user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
 user_vol  = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
@@ -390,11 +584,29 @@ if not st.session_state.scan_results.empty:
 
     col_msg, col_dl = st.columns([3, 1])
     with col_msg:
-        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(90deg, #002a1a, #001a10);
+            border: 1px solid #00ffc840;
+            border-left: 3px solid #00ffc8;
+            border-radius: 4px;
+            padding: 12px 20px;
+            display: flex; align-items: center; gap: 12px;
+        ">
+            <span style="font-size:20px;">✅</span>
+            <span style="font-family:'Share Tech Mono',monospace; color:#00ffc8; letter-spacing:2px; font-size:14px;">
+                掃描完成 &nbsp;·&nbsp; 找到 <b style="font-size:20px; color:#fff;">{len(df)}</b> 支符合條件標的
+            </span>
+            <span style="margin-left:auto; font-family:'Share Tech Mono',monospace;
+                color:#4a7a8a; font-size:11px; letter-spacing:1px;">
+                {get_tw_now().strftime("%Y-%m-%d %H:%M")} TWN
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
     with col_dl:
         csv     = df.to_csv(index=False).encode('utf-8-sig')
         tw_date = get_tw_now().strftime("%Y%m%d")
-        st.download_button(label="📥 下載選股清單 (CSV)", data=csv,
+        st.download_button(label="⬇ 匯出 CSV", data=csv,
                            file_name=f'tw_stock_scan_{tw_date}.csv',
                            mime='text/csv', use_container_width=True)
 
@@ -448,9 +660,14 @@ if not st.session_state.scan_results.empty:
             st.session_state.current_idx       = clicked_row
             st.session_state.last_selected_row = clicked_row
 
-    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
-    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
-    st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
+    st.markdown(f"""
+    <div style="font-family:'Share Tech Mono',monospace; font-size:11px;
+        color:#2a4a5a; padding:6px 4px; letter-spacing:0.5px; line-height:2;">
+        ▸ 進度條滿格 = 乖離率接近上限 ({user_bias}%)，越短代表越貼近 30MA
+        &nbsp;&nbsp;▸ 紅字 = 正增長 / 綠字 = 負增長
+        &nbsp;&nbsp;▸ 點擊任一列查看 K 線圖
+    </div>
+    """, unsafe_allow_html=True)
 
     # ============================================================
     # 6. 上一支 / 下一支 按鈕 + K 線圖
@@ -469,13 +686,24 @@ if not st.session_state.scan_results.empty:
 
     with btn_col2:
         c_idx = st.session_state.current_idx
-        st.markdown(
-            f"<div style='text-align:center; padding:6px 0;'>"
-            f"第 <b>{c_idx + 1}</b> / {total_found} 支："
-            f"<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown(f"""
+        <div style="
+            text-align:center;
+            font-family:'Share Tech Mono',monospace;
+            padding: 8px 0;
+        ">
+            <span style="color:#4a7a8a; font-size:11px; letter-spacing:2px;">
+                [ {c_idx+1} / {total_found} ]
+            </span><br>
+            <span style="color:#00ffc8; font-size:16px; font-weight:700;
+                text-shadow: 0 0 12px #00ffc860; letter-spacing:2px;">
+                {df.iloc[c_idx]['code']}
+            </span>
+            <span style="color:#c8d8e8; font-size:15px; margin-left:8px;">
+                {df.iloc[c_idx]['name']}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
 
     with btn_col3:
         if st.button("下一支 ➡️", use_container_width=True):
@@ -494,7 +722,18 @@ if not st.session_state.scan_results.empty:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
     # ── 新聞 ──────────────────────────────────────────────────
-    st.subheader(f"📰 {current_stock['name']} 即時中文新聞與情緒標籤")
+    st.markdown(f"""
+    <div style="
+        font-family:'Share Tech Mono',monospace;
+        font-size:13px; color:#4db8ff; letter-spacing:3px;
+        padding: 16px 0 8px;
+        border-top: 1px solid #4db8ff20;
+        margin-top: 8px;
+    ">
+        📡 &nbsp; LIVE NEWS &nbsp;·&nbsp;
+        <span style="color:#c8d8e8;">{current_stock['name']} ({current_stock['code']})</span>
+    </div>
+    """, unsafe_allow_html=True)
     news_list = get_tw_stock_news(current_stock['code'])
     if news_list:
         for n in news_list:
@@ -512,4 +751,23 @@ if not st.session_state.scan_results.empty:
 
 else:
     if not st.session_state.is_scanning:
-        st.info("💡 調整左側參數後，點擊按鈕執行智慧選股。")
+        st.markdown("""
+        <div style="
+            text-align:center;
+            padding: 80px 20px;
+            font-family:'Share Tech Mono',monospace;
+        ">
+            <div style="font-size:56px; margin-bottom:20px;
+                filter:drop-shadow(0 0 20px #00ffc860);">📈</div>
+            <div style="font-size:20px; color:#00ffc8; letter-spacing:4px;
+                text-shadow:0 0 20px #00ffc840; margin-bottom:12px;">
+                READY TO SCAN
+            </div>
+            <div style="font-size:13px; color:#2a5060; letter-spacing:2px; margin-bottom:6px;">
+                均線多頭排列策略 · MA30 &gt; MA45 &gt; MA60
+            </div>
+            <div style="font-size:12px; color:#1a3040; letter-spacing:1px;">
+                調整左側策略參數，點擊掃描按鈕開始選股
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
