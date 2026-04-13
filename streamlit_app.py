@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 # 1. 基礎設定與環境初始化
 # ============================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="台股智慧選股儀表板 v9.7", layout="wide")
+st.set_page_config(page_title="台股智慧選股儀表板 v9.8", layout="wide")
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -220,14 +220,14 @@ if st.session_state.is_scanning:
     st.rerun()
 
 # ============================================================
-# 5. 結果顯示 (維持原始表格呈現)
+# 5. 結果顯示 (新增表格點選連動功能)
 # ============================================================
 
 if not st.session_state.scan_results.empty:
     df = st.session_state.scan_results.copy()
     col_msg, col_dl = st.columns([3, 1])
     with col_msg:
-        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的")
+        st.success(f"✅ 掃描完成！找到 {len(df)} 支標的（點選下方表格可直接查看圖表）")
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
         tw_date = get_tw_now().strftime("%Y%m%d")
@@ -242,9 +242,13 @@ if not st.session_state.scan_results.empty:
         color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
         return f'color: {color}; font-weight: bold'
 
-    st.dataframe(
+    # --- 新增功能：點選表格列連動 ---
+    event = st.dataframe(
         df_display.style.map(color_tw_style, subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
-        use_container_width=True, hide_index=True,
+        use_container_width=True, 
+        hide_index=True,
+        on_select="rerun",  # 當選取變動時重新執行，以更新 current_idx
+        selection_mode="single_row",  # 設定為單選模式
         column_config={
             "代碼": st.column_config.TextColumn("代碼"),
             "名稱": st.column_config.TextColumn("名稱"),
@@ -258,8 +262,16 @@ if not st.session_state.scan_results.empty:
             "類股": st.column_config.TextColumn("產業別")
         }
     )
-    st.caption(f"💡 註1：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
-    st.caption(f"💡 註2：營收增長與量變動如果為正數，會以紅色粗體顯示。")
+
+    # 處理選取事件：如果使用者有點選表格，更新 session_state 中的索引
+    if event and event.selection and event.selection.rows:
+        selected_row_idx = event.selection.rows[0]
+        if st.session_state.current_idx != selected_row_idx:
+            st.session_state.current_idx = selected_row_idx
+            st.rerun()
+
+    st.caption(f"💡 註1：點選上方表格任意列，下方 K 線圖與新聞將同步更新。")
+    st.caption(f"💡 註2：進度條滿格代表乖離率接近你的上限值 ({user_bias}%)；條狀越短代表股價越貼近 30MA。")
     st.caption(f"💡 數據更新時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')} (台灣時間)")
 
     # ============================================================
@@ -269,16 +281,19 @@ if not st.session_state.scan_results.empty:
     total_found = len(df)
     c_idx = st.session_state.current_idx
     
+    # 防止索引溢出（例如重新掃描後數量變少）
+    if c_idx >= total_found:
+        c_idx = 0
+        st.session_state.current_idx = 0
+
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
-        # 修正：首尾輪迴邏輯 (如果當前是 0，跳到最後一個)
         if st.button("⬅️ 上一支", use_container_width=True):
             st.session_state.current_idx = (c_idx - 1) % total_found
             st.rerun()
     with btn_col2:
         st.markdown(f"<center>第 {c_idx + 1} / {total_found} 支：<b>{df.iloc[c_idx]['code']} {df.iloc[c_idx]['name']}</b></center>", unsafe_allow_html=True)
     with btn_col3:
-        # 修正：首尾輪迴邏輯 (如果當前是最後一個，跳回 0)
         if st.button("下一支 ➡️", use_container_width=True):
             st.session_state.current_idx = (c_idx + 1) % total_found
             st.rerun()
