@@ -245,7 +245,7 @@ def draw_k_line(ticker, name):
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}).reset_index()
         df["date"] = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
-    df = df.tail(90).copy()   # 90天
+    df = df.tail(70).copy()   # 70天
     if len(df) < 10:
         return None
 
