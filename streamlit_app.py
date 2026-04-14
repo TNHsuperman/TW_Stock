@@ -300,7 +300,11 @@ def draw_k_line(ticker, name):
     )
 
     fig.update_layout(
-        title=None,
+        title=dict(
+            text=f'{name}．{ticker}',
+            font=dict(size=13, color='#00ffc0', family='Noto Sans TC, sans-serif'),
+            x=0, xanchor='left', pad=dict(l=8, t=4),
+        ),
         xaxis_rangeslider_visible=False,
         height=500,
         template='plotly_dark',
@@ -312,10 +316,10 @@ def draw_k_line(ticker, name):
             bordercolor='rgba(0,200,140,0.15)', borderwidth=1,
             font=dict(size=10, color="#a0c4d8"),
             orientation='h',
-            yanchor='bottom', y=0.29,   # ← K線圖下半空白區（黃框位置）
+            yanchor='bottom', y=0.29,
             xanchor='left', x=0.01,
         ),
-        margin=dict(l=8, r=8, t=32, b=8),
+        margin=dict(l=8, r=8, t=36, b=8),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35', bordercolor='rgba(0,200,180,0.4)',
@@ -325,16 +329,12 @@ def draw_k_line(ticker, name):
         hoverdistance=100,
         spikedistance=-1,
         dragmode=False,
-        xaxis=dict(
+        xaxis=dict(                        # K線圖 x 軸：不顯示日期（底部 xaxis2 顯示）
             **spike_cfg,
             fixedrange=True,
-            tickmode='array',
-            # 每月1日、15日顯示一個刻度，大幅減少密度
-            tickvals=[d for d in df['date'] if d[8:] in ('01', '15')],
-            tickangle=-45,
-            tickfont=dict(size=9),
+            showticklabels=False,
         ),
-        xaxis2=dict(
+        xaxis2=dict(                       # 成交量 x 軸：顯示日期，每月1日和15日
             **spike_cfg,
             matches='x',
             fixedrange=True,
@@ -342,7 +342,7 @@ def draw_k_line(ticker, name):
             tickvals=[d for d in df['date'] if d[8:] in ('01', '15')],
             tickangle=-45,
             tickfont=dict(size=9),
-            showticklabels=False,          # 成交量子圖不重複顯示日期
+            showticklabels=True,
         ),
     )
 
