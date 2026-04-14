@@ -252,7 +252,6 @@ def draw_k_line(ticker, name):
     code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
     df = get_kline_data(code, market)
-    # fallback to yfinance if official API fails
     if df.empty or len(df) < 30:
         yt = yf.Ticker(ticker)
         raw = yt.history(period="6mo")
@@ -262,18 +261,61 @@ def draw_k_line(ticker, name):
         df["volume"] = df["volume"] // 1000
     df = df.tail(180).copy()
     if len(df) < 10: return None
+
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
     colors = ['#ef5350' if df['close'].iloc[i] >= df['open'].iloc[i] else '#26a69a' for i in range(len(df))]
+
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
-    fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'],
-                                 low=df['low'], close=df['close'], name='K線',
-                                 increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='blue',   width=1.5), name='45MA'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5), name='60MA'), row=1, col=1)
-    fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=colors), row=2, col=1)
+
+    # ── K 線（自訂 hover 顯示全部欄位）──
+    fig.add_trace(go.Candlestick(
+        x=df['date'],
+        open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        name='K線',
+        increasing_line_color='#ef5350',
+        decreasing_line_color='#26a69a',
+        hoverinfo='none',           # 關掉預設，改用 unified hover
+    ), row=1, col=1)
+
+    # ── 自訂 Scatter（透明，負責攜帶 unified hover 的完整資訊）──
+    fig.add_trace(go.Scatter(
+        x=df['date'],
+        y=df['close'],
+        mode='none',
+        name='info',
+        showlegend=False,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "開盤：%{customdata[0]:.2f}<br>"
+            "收盤：%{customdata[1]:.2f}<br>"
+            "最高：%{customdata[2]:.2f}<br>"
+            "最低：%{customdata[3]:.2f}<br>"
+            "─────────────<br>"
+            "30MA：%{customdata[4]:.2f}<br>"
+            "45MA：%{customdata[5]:.2f}<br>"
+            "60MA：%{customdata[6]:.2f}<br>"
+            "─────────────<br>"
+            "成交量：%{customdata[7]:,} 張"
+            "<extra></extra>"
+        ),
+        customdata=df[['open','close','high','low','MA30','MA45','MA60','volume']].values,
+    ), row=1, col=1)
+
+    # ── 均線 ──
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5),  name='30MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='blue',   width=1.5),  name='45MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5),  name='60MA', hoverinfo='skip'), row=1, col=1)
+
+    # ── 成交量 ──
+    fig.add_trace(go.Bar(
+        x=df['date'], y=df['volume'],
+        name='成交量',
+        marker_color=colors,
+        hovertemplate="成交量：%{y:,} 張<extra></extra>",
+    ), row=2, col=1)
+
     fig.update_layout(
         title=f"{name} ({ticker})",
         xaxis_rangeslider_visible=False,
@@ -287,9 +329,37 @@ def draw_k_line(ticker, name):
             font=dict(size=11, color="#a0c4d8"),
         ),
         margin=dict(l=12, r=12, t=48, b=12),
+
+        # ── ★ 核心：unified hover + 垂直虛線跨子圖 ──
+        hovermode='x unified',
+        hoverlabel=dict(
+            bgcolor='#0d1f35',
+            bordercolor='#1a4a6a',
+            font=dict(size=12, color='#c8e8ff', family='Share Tech Mono, monospace'),
+        ),
+        hoverdistance=50,
     )
-    fig.update_xaxes(type='category', gridcolor='rgba(255,255,255,0.06)', showgrid=True, zeroline=False)
-    fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)', showgrid=True, zeroline=False)
+
+    # ── 十字線設定（垂直虛線貫穿上下兩個子圖）──
+    fig.update_xaxes(
+        type='category',
+        gridcolor='rgba(255,255,255,0.06)',
+        showgrid=True,
+        zeroline=False,
+        showspikes=True,
+        spikemode='across',          # 貫穿所有子圖
+        spikesnap='cursor',
+        spikecolor='rgba(0,255,192,0.35)',
+        spikethickness=1,
+        spikedash='dot',
+    )
+    fig.update_yaxes(
+        gridcolor='rgba(255,255,255,0.06)',
+        showgrid=True,
+        zeroline=False,
+        showspikes=False,
+    )
+
     return fig
 
 def get_tw_stock_news(code):
