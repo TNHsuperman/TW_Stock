@@ -341,17 +341,22 @@ def draw_k_line(ticker, name):
     )
 
     # ── 十字線設定（垂直虛線貫穿上下兩個子圖）──
-    fig.update_xaxes(
+    # ── 十字線設定（垂直虛線貫穿上下兩個子圖）──
+    spike_style = dict(
         type='category',
         gridcolor='rgba(255,255,255,0.06)',
         showgrid=True,
         zeroline=False,
         showspikes=True,
-        spikemode='across',          # 貫穿所有子圖
+        spikemode='across+toaxis',
         spikesnap='cursor',
         spikecolor='rgba(0,255,192,0.35)',
         spikethickness=1,
         spikedash='dot',
+    )
+    fig.update_layout(
+        xaxis=spike_style,
+        xaxis2=spike_style,
     )
     fig.update_yaxes(
         gridcolor='rgba(255,255,255,0.06)',
