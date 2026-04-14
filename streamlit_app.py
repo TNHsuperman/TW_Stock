@@ -11,6 +11,7 @@ import random
 import time
 import yfinance as yf
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 # ============================================================
@@ -313,38 +314,13 @@ def draw_k_line(ticker, name):
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#4488ff', width=1.5), name='45MA', hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#cc66ff', width=1.5), name='60MA', hoverinfo='skip'), row=1, col=1)
 
-    # ── 成交量（加入 spike 觸發用的透明 scatter）──
+    # ── 成交量 ──
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'],
         name='成交量',
         marker_color=colors,
-        hoverinfo='skip',       # 不顯示自己的 tooltip，由上方統一顯示
-    ), row=2, col=1)
-
-    # ── 成交量子圖也放一條透明 Scatter，讓 spike 在此子圖也能觸發 ──
-    fig.add_trace(go.Scatter(
-        x=df['date'],
-        y=df['volume'],
-        mode='none',
-        name='',
-        showlegend=False,
         hoverinfo='skip',
     ), row=2, col=1)
-
-    # ── 共用的 spike 樣式 ──
-    spike_cfg = dict(
-        showspikes=True,
-        spikemode='across',          # ← 關鍵：across 會跨越整個繪圖區
-        spikesnap='cursor',
-        spikecolor='rgba(0,255,192,0.5)',
-        spikethickness=1,
-        spikedash='dot',
-        showline=True,
-        showgrid=True,
-        gridcolor='rgba(255,255,255,0.06)',
-        zeroline=False,
-        type='category',
-    )
 
     fig.update_layout(
         title=f"{name} ({ticker})",
@@ -359,7 +335,6 @@ def draw_k_line(ticker, name):
             font=dict(size=11, color="#a0c4d8"),
         ),
         margin=dict(l=12, r=12, t=48, b=12),
-        # ── unified hover ──
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35',
@@ -368,11 +343,22 @@ def draw_k_line(ticker, name):
             namelength=0,
         ),
         hoverdistance=100,
-        spikedistance=1000,         # ← 加大感應距離，確保跨子圖都能捕捉
-        # ── xaxis1（K 線區）──
-        xaxis=dict(**spike_cfg),
-        # ── xaxis2（成交量區）── matches='x' 讓兩軸完全同步
-        xaxis2=dict(**spike_cfg, matches='x'),
+        # ── xaxis spike 只管 K 線區，虛線貫穿改用 JS shapes ──
+        xaxis=dict(
+            type='category',
+            showspikes=False,        # ← 關掉原生 spike，改由 JS 畫
+            showgrid=True,
+            gridcolor='rgba(255,255,255,0.06)',
+            zeroline=False,
+        ),
+        xaxis2=dict(
+            type='category',
+            matches='x',
+            showspikes=False,
+            showgrid=True,
+            gridcolor='rgba(255,255,255,0.06)',
+            zeroline=False,
+        ),
     )
 
     fig.update_yaxes(
@@ -381,6 +367,52 @@ def draw_k_line(ticker, name):
         zeroline=False,
         showspikes=False,
     )
+
+    # ── 注入 JS：監聽 hover 事件，用 layout.shapes 畫跨全圖虛線 ──
+    # 用 paper 座標系 (0~1) 畫垂直線，y0=0 y1=1 就是全圖高度
+    js_code = """
+    <script>
+    (function() {
+        function attachHover() {
+            var plots = document.querySelectorAll('.js-plotly-plot');
+            if (!plots.length) { setTimeout(attachHover, 300); return; }
+            var gd = plots[plots.length - 1];
+
+            gd.on('plotly_hover', function(data) {
+                if (!data.xvals && !data.points) return;
+                var xval = data.xvals ? data.xvals[0] : data.points[0].x;
+                Plotly.relayout(gd, {
+                    shapes: [{
+                        type: 'line',
+                        xref: 'x',
+                        yref: 'paper',
+                        x0: xval,
+                        x1: xval,
+                        y0: 0,
+                        y1: 1,
+                        line: {
+                            color: 'rgba(0,255,192,0.45)',
+                            width: 1,
+                            dash: 'dot'
+                        }
+                    }]
+                });
+            });
+
+            gd.on('plotly_unhover', function() {
+                Plotly.relayout(gd, { shapes: [] });
+            });
+        }
+        attachHover();
+    })();
+    </script>
+    """
+
+    # 把 JS 掛到 plotly 圖表 config 裡
+    fig._config = {"responsive": True}
+    
+    # 將 JS 存到 fig 物件，讓外層可以取用
+    fig._crosshair_js = js_code
 
     return fig
 
@@ -924,6 +956,9 @@ if not st.session_state.scan_results.empty:
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
+        # ── 注入跨子圖虛線 JS ──
+        if hasattr(k_fig, '_crosshair_js'):
+            st.components.v1.html(k_fig._crosshair_js, height=0)
     else:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
