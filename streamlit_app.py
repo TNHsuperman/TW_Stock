@@ -259,8 +259,9 @@ def draw_k_line(ticker, name):
 
     fig.add_trace(go.Candlestick(
         x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        name='K線', increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
-        hoverinfo='none', showlegend=False,
+        name=f'{name} ({code})',          # ← 顯示股票名稱
+        increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
+        hoverinfo='none', showlegend=True,
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
@@ -307,12 +308,12 @@ def draw_k_line(ticker, name):
         plot_bgcolor='#070f1f',
         font=dict(color="#7a9aaa", size=11),
         legend=dict(
-            bgcolor='rgba(5,13,26,0.0)',   # 完全透明背景
-            borderwidth=0,
+            bgcolor='rgba(5,13,26,0.75)',
+            bordercolor='rgba(0,200,140,0.15)', borderwidth=1,
             font=dict(size=10, color="#a0c4d8"),
             orientation='h',
-            yanchor='bottom', y=1.01,      # ← 標題下方、圖表上方的空隙
-            xanchor='left', x=0,
+            yanchor='bottom', y=0.29,   # ← K線圖下半空白區（黃框位置）
+            xanchor='left', x=0.01,
         ),
         margin=dict(l=8, r=8, t=32, b=8),
         hovermode='x unified',
