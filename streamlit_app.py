@@ -307,14 +307,14 @@ def draw_k_line(ticker, name):
         plot_bgcolor='#070f1f',
         font=dict(color="#7a9aaa", size=11),
         legend=dict(
-            bgcolor='rgba(10,22,40,0.85)',
+            bgcolor='rgba(5,13,26,0.85)',
             bordercolor='#1a3a4a', borderwidth=1,
             font=dict(size=10, color="#a0c4d8"),
             orientation='h',
-            yanchor='top', y=-0.08,   # ← 圖例移到圖表下方，不再覆蓋標題
-            xanchor='left', x=0,
+            yanchor='top', y=0.99,    # ← 圖表內右上角
+            xanchor='right', x=0.99,
         ),
-        margin=dict(l=8, r=8, t=50, b=48),
+        margin=dict(l=8, r=8, t=50, b=8),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35', bordercolor='rgba(0,200,180,0.4)',
@@ -376,6 +376,14 @@ st.markdown("""
 /* ── 隱藏 sidebar collapse 按鈕 ── */
 [data-testid='stSidebarCollapseButton'],
 [data-testid='collapsedControl'] { display: none !important; }
+
+/* ── 隱藏頂部工具列（Share / Star / Fork 按鈕列）── */
+[data-testid='stHeader'],
+header[data-testid='stHeader'],
+[data-testid='stToolbar'] { display: none !important; }
+
+/* ── 補回頂部空間 ── */
+.block-container { padding-top: 0.5rem !important; }
 
 /* ── 全域底色 ── */
 html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
