@@ -299,7 +299,7 @@ def draw_k_line(ticker, name):
     )
 
     fig.update_layout(
-        title=f"{name} ({ticker})",
+        title=None,
         xaxis_rangeslider_visible=False,
         height=500,
         template='plotly_dark',
@@ -314,7 +314,7 @@ def draw_k_line(ticker, name):
             yanchor='bottom', y=1.01,      # ← 標題下方、圖表上方的空隙
             xanchor='left', x=0,
         ),
-        margin=dict(l=8, r=8, t=52, b=8),
+        margin=dict(l=8, r=8, t=32, b=8),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35', bordercolor='rgba(0,200,180,0.4)',
