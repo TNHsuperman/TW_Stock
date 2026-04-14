@@ -321,11 +321,12 @@ def draw_k_line(ticker, name):
         ),
         hoverdistance=100,
         spikedistance=-1,
-        xaxis=dict(**spike_cfg),
-        xaxis2=dict(**spike_cfg, matches='x'),
+        dragmode=False,          # ← 停用拖曳縮放，防止誤觸
+        xaxis=dict(**spike_cfg, fixedrange=True),
+        xaxis2=dict(**spike_cfg, matches='x', fixedrange=True),
     )
 
-    fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)', showgrid=True,
+    fig.update_yaxes(fixedrange=True, gridcolor='rgba(255,255,255,0.06)', showgrid=True,
                      zeroline=False, showspikes=False, tickfont=dict(size=10))
 
     return fig
@@ -805,7 +806,12 @@ if not st.session_state.scan_results.empty:
     current_stock = df.iloc[st.session_state.current_idx]
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig:
-        st.plotly_chart(k_fig, use_container_width=True)
+        st.plotly_chart(k_fig, use_container_width=True, config={
+            "displayModeBar": False,   # 隱藏右上角工具列
+            "scrollZoom": False,       # 停用滾輪縮放
+            "doubleClick": False,      # 停用雙擊重置
+            "showTips": False,
+        })
     else:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
