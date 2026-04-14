@@ -343,21 +343,34 @@ def draw_k_line(ticker, name):
             namelength=0,
         ),
         hoverdistance=100,
-        # ── xaxis spike 只管 K 線區，虛線貫穿改用 JS shapes ──
+        spikedistance=-1,
         xaxis=dict(
             type='category',
-            showspikes=False,        # ← 關掉原生 spike，改由 JS 畫
             showgrid=True,
             gridcolor='rgba(255,255,255,0.06)',
             zeroline=False,
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikecolor='rgba(0,255,192,0.5)',
+            spikethickness=1,
+            spikedash='dot',
+            showline=False,
+            domain=[0, 1],
         ),
         xaxis2=dict(
             type='category',
             matches='x',
-            showspikes=False,
             showgrid=True,
             gridcolor='rgba(255,255,255,0.06)',
             zeroline=False,
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikecolor='rgba(0,255,192,0.5)',
+            spikethickness=1,
+            spikedash='dot',
+            showline=False,
         ),
     )
 
@@ -367,6 +380,8 @@ def draw_k_line(ticker, name):
         zeroline=False,
         showspikes=False,
     )
+
+    return fig
 
     # ── 注入 JS：監聽 hover 事件，用 layout.shapes 畫跨全圖虛線 ──
     # 用 paper 座標系 (0~1) 畫垂直線，y0=0 y1=1 就是全圖高度
@@ -956,9 +971,6 @@ if not st.session_state.scan_results.empty:
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True)
-        # ── 注入跨子圖虛線 JS ──
-        if hasattr(k_fig, '_crosshair_js'):
-            st.components.v1.html(k_fig._crosshair_js, height=0)
     else:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
