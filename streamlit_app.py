@@ -795,7 +795,7 @@ if not st.session_state.scan_results.empty:
     # 8. K 線圖區
     # ============================================================
     st.markdown("""
-    <div style="display:flex;align-items:center;gap:12px;padding:14px 0 10px;
+    <div style="display:flex;align-items:center;gap:12px;padding:14px 0 6px;
         border-top:1px solid rgba(0,200,140,0.12);margin-top:8px;">
       <div style="width:3px;height:20px;background:linear-gradient(180deg,#00ffc0,#38a8e8);border-radius:2px;flex-shrink:0;"></div>
       <div style="font-family:Orbitron,monospace;font-size:11px;font-weight:600;color:#00c890;letter-spacing:3px;">K-LINE CHART</div>
@@ -804,7 +804,8 @@ if not st.session_state.scan_results.empty:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── 上一支 / 股票名稱 / 下一支（手機友善排版）──
+    # ── 上一支 / 股票名稱 / 下一支（按鈕在兩側黃框位置）──
+    c_idx = st.session_state.current_idx
     btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
     with btn_col1:
         if st.button("⬅ 上一支", use_container_width=True):
@@ -813,7 +814,6 @@ if not st.session_state.scan_results.empty:
             st.session_state.table_key += 1
             st.rerun()
     with btn_col2:
-        c_idx = st.session_state.current_idx
         st.markdown(f"""
         <div style="text-align:center;font-family:Share Tech Mono,monospace;padding:8px 0;">
             <span style="color:#4a7a8a;font-size:11px;letter-spacing:2px;">[ {c_idx+1} / {total_found} ]</span><br>
