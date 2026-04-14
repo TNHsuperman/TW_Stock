@@ -810,7 +810,7 @@ if not st.session_state.scan_results.empty:
 
     # ── 上一支 / 股票名稱 / 下一支 ── 單列緊湊版
     c_idx = st.session_state.current_idx
-    nav_col1, nav_col2, nav_col3 = st.columns([1, 5, 1])
+    nav_col1, nav_col2, nav_col3 = st.columns([60, 1, 60], gap="small")
     with nav_col1:
         if st.button("◀", use_container_width=True, key="btn_prev"):
             st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
