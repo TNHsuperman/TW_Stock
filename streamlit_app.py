@@ -808,31 +808,71 @@ if not st.session_state.scan_results.empty:
     # 8. K 線圖區
     # ============================================================
 
-    # ── 上一支 / 股票名稱 / 下一支 ── 單列緊湊版
+    # ── 科技風 K線區標題 ──
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:10px;
+        padding:12px 0 8px;border-top:1px solid rgba(0,200,140,0.12);margin-top:8px;">
+      <div style="width:3px;height:18px;
+        background:linear-gradient(180deg,#00ffc0,#38a8e8);
+        border-radius:2px;flex-shrink:0;"></div>
+      <div style="font-family:Orbitron,monospace;font-size:10px;
+        font-weight:600;color:#00c890;letter-spacing:3px;">K-LINE CHART</div>
+      <div style="flex:1;height:1px;background:rgba(0,200,140,0.08);"></div>
+      <div style="font-family:Share Tech Mono,monospace;font-size:9px;
+        color:#3a9070;letter-spacing:2px;">MA30 · MA45 · MA60</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 導航列 ──
     c_idx = st.session_state.current_idx
-    nav_col1, nav_col2, nav_col3 = st.columns([60, 1, 60], gap="small")
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
     with nav_col1:
-        if st.button("◀", use_container_width=True, key="btn_prev"):
+        if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
             st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
             st.session_state.last_selected_row = None
             st.session_state.table_key += 1
             st.rerun()
     with nav_col2:
         st.markdown(f"""
-        <div style="text-align:center;font-family:Share Tech Mono,monospace;
-            padding:6px 0;line-height:1.6;">
-            <span style="color:#4a7a8a;font-size:10px;letter-spacing:2px;">
-                {c_idx+1} / {total_found}</span>
-            &nbsp;
-            <span style="color:#00ffc8;font-size:15px;font-weight:700;letter-spacing:2px;">
-                {df.iloc[c_idx]['code']}</span>
-            &nbsp;
-            <span style="color:#c8d8e8;font-size:14px;">
-                {df.iloc[c_idx]['name']}</span>
+        <div style="
+            background:linear-gradient(135deg,rgba(0,40,30,0.6),rgba(0,20,15,0.8));
+            border:1px solid rgba(0,255,180,0.2);
+            border-radius:2px;
+            padding:8px 12px;
+            text-align:center;
+            position:relative;
+            overflow:hidden;
+        ">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,#00ffc0,transparent);
+            opacity:0.5;"></div>
+          <div style="font-family:Share Tech Mono,monospace;font-size:9px;
+            color:#3a8060;letter-spacing:3px;margin-bottom:3px;">
+            SIGNAL &nbsp;{c_idx+1} / {total_found}
+          </div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:8px;">
+            <span style="font-family:Orbitron,monospace;font-size:17px;
+              font-weight:700;color:#00ffc8;letter-spacing:3px;
+              text-shadow:0 0 12px rgba(0,255,200,0.5);">
+              {df.iloc[c_idx]['code']}
+            </span>
+            <span style="width:1px;height:16px;background:rgba(0,255,180,0.3);"></span>
+            <span style="font-family:Noto Sans TC,sans-serif;font-size:14px;
+              color:#a0c8d8;letter-spacing:1px;">
+              {df.iloc[c_idx]['name']}
+            </span>
+          </div>
+          <div style="position:absolute;bottom:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,#38a8e8,transparent);
+            opacity:0.3;"></div>
         </div>
         """, unsafe_allow_html=True)
     with nav_col3:
-        if st.button("▶", use_container_width=True, key="btn_next"):
+        if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
+            st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
+            st.session_state.last_selected_row = None
+            st.session_state.table_key += 1
+            st.rerun()
             st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
             st.session_state.last_selected_row = None
             st.session_state.table_key += 1
