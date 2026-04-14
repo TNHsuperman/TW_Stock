@@ -301,20 +301,20 @@ def draw_k_line(ticker, name):
     fig.update_layout(
         title=f"{name} ({ticker})",
         xaxis_rangeslider_visible=False,
-        height=500,          # 手機高度略降
+        height=500,
         template='plotly_dark',
         paper_bgcolor='#050d1a',
         plot_bgcolor='#070f1f',
         font=dict(color="#7a9aaa", size=11),
         legend=dict(
-            bgcolor='rgba(5,13,26,0.85)',
-            bordercolor='#1a3a4a', borderwidth=1,
+            bgcolor='rgba(5,13,26,0.0)',   # 完全透明背景
+            borderwidth=0,
             font=dict(size=10, color="#a0c4d8"),
             orientation='h',
-            yanchor='top', y=0.99,    # ← 圖表內右上角
-            xanchor='right', x=0.99,
+            yanchor='bottom', y=1.01,      # ← 標題下方、圖表上方的空隙
+            xanchor='left', x=0,
         ),
-        margin=dict(l=8, r=8, t=50, b=8),
+        margin=dict(l=8, r=8, t=52, b=8),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35', bordercolor='rgba(0,200,180,0.4)',
@@ -324,8 +324,25 @@ def draw_k_line(ticker, name):
         hoverdistance=100,
         spikedistance=-1,
         dragmode=False,
-        xaxis=dict(**spike_cfg, fixedrange=True),
-        xaxis2=dict(**spike_cfg, matches='x', fixedrange=True),
+        xaxis=dict(
+            **spike_cfg,
+            fixedrange=True,
+            tickmode='array',
+            # 每月1日、15日顯示一個刻度，大幅減少密度
+            tickvals=[d for d in df['date'] if d[8:] in ('01', '15')],
+            tickangle=-45,
+            tickfont=dict(size=9),
+        ),
+        xaxis2=dict(
+            **spike_cfg,
+            matches='x',
+            fixedrange=True,
+            tickmode='array',
+            tickvals=[d for d in df['date'] if d[8:] in ('01', '15')],
+            tickangle=-45,
+            tickfont=dict(size=9),
+            showticklabels=False,          # 成交量子圖不重複顯示日期
+        ),
     )
 
     fig.update_yaxes(fixedrange=True, gridcolor='rgba(255,255,255,0.06)', showgrid=True,
