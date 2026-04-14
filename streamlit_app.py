@@ -500,8 +500,21 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     font-weight: 600 !important;
 }
 
-/* ── Divider ── */
-hr { border: none !important; border-top: 1px solid rgba(0,200,140,0.12) !important; margin: 16px 0 !important; }
+/* ── 導航按鈕列：壓縮間距讓三欄在同一行 ── */
+div[data-testid='stHorizontalBlock']:has(button[kind='secondary']) {
+    gap: 4px !important;
+    align-items: center !important;
+}
+div[data-testid='stHorizontalBlock']:has(button[kind='secondary'])
+    > div[data-testid='stColumn'] { padding: 0 2px !important; }
+
+/* ── 導航按鈕本身：縮小高度 ── */
+button[data-testid='stBaseButton-secondary'] {
+    padding: 6px 4px !important;
+    min-height: 36px !important;
+    font-size: 18px !important;
+    letter-spacing: 0 !important;
+}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
@@ -797,7 +810,7 @@ if not st.session_state.scan_results.empty:
 
     # ── 上一支 / 股票名稱 / 下一支 ── 單列緊湊版
     c_idx = st.session_state.current_idx
-    nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 5, 1])
     with nav_col1:
         if st.button("◀", use_container_width=True, key="btn_prev"):
             st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
