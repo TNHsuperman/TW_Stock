@@ -267,24 +267,29 @@ def draw_k_line(ticker, name):
     df['MA60'] = df['close'].rolling(60).mean()
     colors = ['#ef5350' if df['close'].iloc[i] >= df['open'].iloc[i] else '#26a69a' for i in range(len(df))]
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.7, 0.3],
+    )
 
-    # ── K 線（自訂 hover 顯示全部欄位）──
+    # ── K 線 ──
     fig.add_trace(go.Candlestick(
         x=df['date'],
         open=df['open'], high=df['high'], low=df['low'], close=df['close'],
         name='K線',
         increasing_line_color='#ef5350',
         decreasing_line_color='#26a69a',
-        hoverinfo='none',           # 關掉預設，改用 unified hover
+        hoverinfo='none',
     ), row=1, col=1)
 
-    # ── 自訂 Scatter（透明，負責攜帶 unified hover 的完整資訊）──
+    # ── 透明 Scatter 攜帶完整 hover 資訊 ──
     fig.add_trace(go.Scatter(
         x=df['date'],
         y=df['close'],
         mode='none',
-        name='info',
+        name='',
         showlegend=False,
         hovertemplate=(
             "<b>%{x}</b><br>"
@@ -304,17 +309,42 @@ def draw_k_line(ticker, name):
     ), row=1, col=1)
 
     # ── 均線 ──
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5),  name='30MA', hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='blue',   width=1.5),  name='45MA', hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='purple', width=1.5),  name='60MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#4488ff', width=1.5), name='45MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#cc66ff', width=1.5), name='60MA', hoverinfo='skip'), row=1, col=1)
 
-    # ── 成交量 ──
+    # ── 成交量（加入 spike 觸發用的透明 scatter）──
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'],
         name='成交量',
         marker_color=colors,
-        hovertemplate="成交量：%{y:,} 張<extra></extra>",
+        hoverinfo='skip',       # 不顯示自己的 tooltip，由上方統一顯示
     ), row=2, col=1)
+
+    # ── 成交量子圖也放一條透明 Scatter，讓 spike 在此子圖也能觸發 ──
+    fig.add_trace(go.Scatter(
+        x=df['date'],
+        y=df['volume'],
+        mode='none',
+        name='',
+        showlegend=False,
+        hoverinfo='skip',
+    ), row=2, col=1)
+
+    # ── 共用的 spike 樣式 ──
+    spike_cfg = dict(
+        showspikes=True,
+        spikemode='across',          # ← 關鍵：across 會跨越整個繪圖區
+        spikesnap='cursor',
+        spikecolor='rgba(0,255,192,0.5)',
+        spikethickness=1,
+        spikedash='dot',
+        showline=True,
+        showgrid=True,
+        gridcolor='rgba(255,255,255,0.06)',
+        zeroline=False,
+        type='category',
+    )
 
     fig.update_layout(
         title=f"{name} ({ticker})",
@@ -329,35 +359,22 @@ def draw_k_line(ticker, name):
             font=dict(size=11, color="#a0c4d8"),
         ),
         margin=dict(l=12, r=12, t=48, b=12),
-
-        # ── ★ 核心：unified hover + 垂直虛線跨子圖 ──
+        # ── unified hover ──
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35',
-            bordercolor='#1a4a6a',
+            bordercolor='rgba(0,200,180,0.4)',
             font=dict(size=12, color='#c8e8ff', family='Share Tech Mono, monospace'),
+            namelength=0,
         ),
-        hoverdistance=50,
+        hoverdistance=100,
+        spikedistance=1000,         # ← 加大感應距離，確保跨子圖都能捕捉
+        # ── xaxis1（K 線區）──
+        xaxis=dict(**spike_cfg),
+        # ── xaxis2（成交量區）── matches='x' 讓兩軸完全同步
+        xaxis2=dict(**spike_cfg, matches='x'),
     )
 
-    # ── 十字線設定（垂直虛線貫穿上下兩個子圖）──
-    # ── 十字線設定（垂直虛線貫穿上下兩個子圖）──
-    spike_style = dict(
-        type='category',
-        gridcolor='rgba(255,255,255,0.06)',
-        showgrid=True,
-        zeroline=False,
-        showspikes=True,
-        spikemode='across+toaxis',
-        spikesnap='cursor',
-        spikecolor='rgba(0,255,192,0.35)',
-        spikethickness=1,
-        spikedash='dot',
-    )
-    fig.update_layout(
-        xaxis=spike_style,
-        xaxis2=spike_style,
-    )
     fig.update_yaxes(
         gridcolor='rgba(255,255,255,0.06)',
         showgrid=True,
