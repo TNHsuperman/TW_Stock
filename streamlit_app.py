@@ -794,35 +794,32 @@ if not st.session_state.scan_results.empty:
     # ============================================================
     # 8. K 線圖區
     # ============================================================
-    st.markdown("""
-    <div style="display:flex;align-items:center;gap:12px;padding:14px 0 6px;
-        border-top:1px solid rgba(0,200,140,0.12);margin-top:8px;">
-      <div style="width:3px;height:20px;background:linear-gradient(180deg,#00ffc0,#38a8e8);border-radius:2px;flex-shrink:0;"></div>
-      <div style="font-family:Orbitron,monospace;font-size:11px;font-weight:600;color:#00c890;letter-spacing:3px;">K-LINE CHART</div>
-      <div style="flex:1;height:1px;background:rgba(0,200,140,0.08);"></div>
-      <div style="font-family:Share Tech Mono,monospace;font-size:9px;color:#3a9070;letter-spacing:2px;">MA30 · MA45 · MA60</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-    # ── 上一支 / 股票名稱 / 下一支（按鈕在兩側黃框位置）──
+    # ── 上一支 / 股票名稱 / 下一支 ── 單列緊湊版
     c_idx = st.session_state.current_idx
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
-    with btn_col1:
-        if st.button("⬅ 上一支", use_container_width=True):
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
+    with nav_col1:
+        if st.button("◀", use_container_width=True, key="btn_prev"):
             st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
             st.session_state.last_selected_row = None
             st.session_state.table_key += 1
             st.rerun()
-    with btn_col2:
+    with nav_col2:
         st.markdown(f"""
-        <div style="text-align:center;font-family:Share Tech Mono,monospace;padding:8px 0;">
-            <span style="color:#4a7a8a;font-size:11px;letter-spacing:2px;">[ {c_idx+1} / {total_found} ]</span><br>
-            <span style="color:#00ffc8;font-size:16px;font-weight:700;letter-spacing:2px;">{df.iloc[c_idx]['code']}</span>
-            <span style="color:#c8d8e8;font-size:14px;margin-left:6px;">{df.iloc[c_idx]['name']}</span>
+        <div style="text-align:center;font-family:Share Tech Mono,monospace;
+            padding:6px 0;line-height:1.6;">
+            <span style="color:#4a7a8a;font-size:10px;letter-spacing:2px;">
+                {c_idx+1} / {total_found}</span>
+            &nbsp;
+            <span style="color:#00ffc8;font-size:15px;font-weight:700;letter-spacing:2px;">
+                {df.iloc[c_idx]['code']}</span>
+            &nbsp;
+            <span style="color:#c8d8e8;font-size:14px;">
+                {df.iloc[c_idx]['name']}</span>
         </div>
         """, unsafe_allow_html=True)
-    with btn_col3:
-        if st.button("下一支 ➡", use_container_width=True):
+    with nav_col3:
+        if st.button("▶", use_container_width=True, key="btn_next"):
             st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
             st.session_state.last_selected_row = None
             st.session_state.table_key += 1
