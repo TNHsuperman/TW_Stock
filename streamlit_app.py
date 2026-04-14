@@ -307,12 +307,14 @@ def draw_k_line(ticker, name):
         plot_bgcolor='#070f1f',
         font=dict(color="#7a9aaa", size=11),
         legend=dict(
-            bgcolor='#0a1628', bordercolor='#1a3a4a', borderwidth=1,
+            bgcolor='rgba(10,22,40,0.85)',
+            bordercolor='#1a3a4a', borderwidth=1,
             font=dict(size=10, color="#a0c4d8"),
-            orientation='h',          # 手機橫向圖例
-            yanchor='bottom', y=1.02, xanchor='right', x=1,
+            orientation='h',
+            yanchor='top', y=-0.08,   # ← 圖例移到圖表下方，不再覆蓋標題
+            xanchor='left', x=0,
         ),
-        margin=dict(l=8, r=8, t=40, b=8),
+        margin=dict(l=8, r=8, t=50, b=48),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#0d1f35', bordercolor='rgba(0,200,180,0.4)',
@@ -321,7 +323,7 @@ def draw_k_line(ticker, name):
         ),
         hoverdistance=100,
         spikedistance=-1,
-        dragmode=False,          # ← 停用拖曳縮放，防止誤觸
+        dragmode=False,
         xaxis=dict(**spike_cfg, fixedrange=True),
         xaxis2=dict(**spike_cfg, matches='x', fixedrange=True),
     )
