@@ -245,7 +245,7 @@ def draw_k_line(ticker, name):
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}).reset_index()
         df["date"] = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
-    df = df.tail(180).copy()
+    df = df.tail(90).copy()   # 90天
     if len(df) < 10:
         return None
 
@@ -260,7 +260,7 @@ def draw_k_line(ticker, name):
     fig.add_trace(go.Candlestick(
         x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
         name='K線', increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
-        hoverinfo='none',
+        hoverinfo='none', showlegend=False,
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
@@ -288,7 +288,7 @@ def draw_k_line(ticker, name):
 
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'], name='成交量',
-        marker_color=colors, hoverinfo='skip',
+        marker_color=colors, hoverinfo='skip', showlegend=False,
     ), row=2, col=1)
 
     spike_cfg = dict(
