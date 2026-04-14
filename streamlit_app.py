@@ -61,10 +61,15 @@ def get_tw_now():
 def get_stock_market_list():
     stocks = []
     try:
+        session = requests.Session()
+        session.verify = False
+        adapter = requests.adapters.HTTPAdapter(max_retries=2)
+        session.mount('https://', adapter)
+
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
-            r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
+            r = session.get(url, headers=get_headers(), timeout=8)
             df_isin = pd.read_html(StringIO(r.text))[0]
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
@@ -730,17 +735,18 @@ if not st.session_state.scan_results.empty:
         selection_mode="single-row",
         key=f"stock_table_{st.session_state.table_key}",
         column_config={
-            "代碼":        st.column_config.TextColumn("代碼"),
-            "名稱":        st.column_config.TextColumn("名稱"),
-            "收盤":        st.column_config.NumberColumn("價格",    format="%.2f"),
-            "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", help=f"上限 {user_bias}%",
+            "代碼":        st.column_config.TextColumn("代碼",    width=70),
+            "名稱":        st.column_config.TextColumn("名稱",    width=100),
+            "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
+            "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
+                                                            help=f"上限 {user_bias}%",
                                                             format="%.2f%%", min_value=0, max_value=user_bias),
-            "量變動(%)":   st.column_config.NumberColumn("量變動",  format="%.1f%%"),
-            "營收月增":    st.column_config.NumberColumn("月增",    format="%.1f%%"),
-            "營收年增":    st.column_config.NumberColumn("年增",    format="%.1f%%"),
-            "本益比":      st.column_config.NumberColumn("PE",      format="%.1f"),
-            "成交量(張)":  st.column_config.NumberColumn("成交量",  format="%d 📦"),
-            "類股":        st.column_config.TextColumn("產業別"),
+            "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
+            "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
+            "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
+            "本益比":      st.column_config.NumberColumn("PE",     width=65, format="%.1f"),
+            "成交量(張)":  st.column_config.NumberColumn("成交量", width=95, format="%d 📦"),
+            "類股":        st.column_config.TextColumn("產業別",  width=120),
         }
     )
 
