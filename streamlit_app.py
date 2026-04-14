@@ -289,7 +289,8 @@ def draw_k_line(ticker, name):
 
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'], name='成交量',
-        marker_color=colors, hoverinfo='skip', showlegend=False,
+        marker_color=colors, showlegend=False,
+        hovertemplate="<b>%{x}</b><br>成交量：%{y:,} 張<extra></extra>",
     ), row=2, col=1)
 
     spike_cfg = dict(
@@ -329,20 +330,16 @@ def draw_k_line(ticker, name):
         hoverdistance=100,
         spikedistance=-1,
         dragmode=False,
-        xaxis=dict(                        # K線圖 x 軸：不顯示日期（底部 xaxis2 顯示）
+        xaxis=dict(
             **spike_cfg,
             fixedrange=True,
             showticklabels=False,
         ),
-        xaxis2=dict(                       # 成交量 x 軸：顯示日期，每月1日和15日
+        xaxis2=dict(
             **spike_cfg,
             matches='x',
             fixedrange=True,
-            tickmode='array',
-            tickvals=[d for d in df['date'] if d[8:] in ('01', '15')],
-            tickangle=-45,
-            tickfont=dict(size=9),
-            showticklabels=True,
+            showticklabels=False,          # 不顯示日期
         ),
     )
 
