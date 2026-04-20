@@ -15,12 +15,13 @@ from plotly.subplots import make_subplots
 # ============================================================
 # 1. 基礎設定與環境初始化
 # ============================================================
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(
     page_title="台股智慧選股",
     layout="wide",
     page_icon="https://cdn-icons-png.flaticon.com/512/2953/2953423.png",
-    initial_sidebar_state="collapsed",   # 手機預設收起 sidebar
+    initial_sidebar_state="collapsed",
 )
 
 USER_AGENTS = [
@@ -39,16 +40,18 @@ def get_headers():
     }
 
 # ── Session State 初始化 ──────────────────────────────────────
+# [修正2] 加入 user_bias / user_vol 的 session_state 預設值，避免雙重定義衝突
 for key, default in [
-    ('scan_results', pd.DataFrame()),
-    ('is_scanning', False),
-    ('current_idx', 0),
+    ('scan_results',      pd.DataFrame()),
+    ('is_scanning',       False),
+    ('current_idx',       0),
     ('last_selected_row', None),
-    ('table_key', 0),
+    ('table_key',         0),
+    ('user_bias',         3.0),
+    ('user_vol',          500),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
-
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
@@ -82,7 +85,6 @@ def get_stock_market_list():
         pass
     return stocks
 
-
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
@@ -93,6 +95,11 @@ def download_batch_history(tickers: tuple) -> dict:
                           group_by="ticker", auto_adjust=True, progress=False, threads=True)
     except Exception:
         return {}
+
+    # [修正3] 下載失敗時提前返回，避免後續 KeyError
+    if raw is None or raw.empty:
+        return {}
+
     result = {}
     if len(tickers) == 1:
         tk = tickers[0]
@@ -114,7 +121,6 @@ def download_batch_history(tickers: tuple) -> dict:
                 pass
     return result
 
-
 def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
     hits = []
     for s in stock_map:
@@ -122,27 +128,26 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         df = history_map.get(tk)
         if df is None or len(df) < 65:
             continue
-        closes = df["close"]
+        closes  = df["close"]
         volumes = df["volume"]
         if volumes.tail(5).mean() < vol_limit:
             continue
         ma30 = closes.rolling(30).mean().iloc[-1]
         ma45 = closes.rolling(45).mean().iloc[-1]
         ma60 = closes.rolling(60).mean().iloc[-1]
-        curr_price = float(closes.iloc[-1])
-        vol_today = int(volumes.iloc[-1])
+        curr_price   = float(closes.iloc[-1])
+        vol_today    = int(volumes.iloc[-1])
         vol_yesterday = float(volumes.iloc[-2])
-        bias_30 = ((curr_price - ma30) / ma30) * 100
+        bias_30   = ((curr_price - ma30) / ma30) * 100
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
             hits.append({**s,
-                "收盤": round(curr_price, 2),
+                "收盤":       round(curr_price, 2),
                 "乖離30MA(%)": round(bias_30, 2),
-                "成交量(張)": vol_today,
-                "量變動(%)": round(vol_change, 2),
+                "成交量(張)":  vol_today,
+                "量變動(%)":   round(vol_change, 2),
             })
     return hits
-
 
 def clean_percent(text):
     if not text or text == "N/A":
@@ -152,10 +157,9 @@ def clean_percent(text):
     except:
         return np.nan
 
-
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
-    res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    res  = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
     try:
         yt = yf.Ticker(ticker)
         pe = yt.info.get('trailingPE')
@@ -164,10 +168,15 @@ def fetch_deep_info(ticker: str) -> dict:
     except:
         pass
     try:
-        rev_url = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
+        rev_url  = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
-        soup = BeautifulSoup(rev_resp.text, 'html.parser')
-        row = soup.select_one(r'li.List\(n\)')
+        soup     = BeautifulSoup(rev_resp.text, 'html.parser')
+
+        # [修正4] 原 r'li.List(n)' CSS 選擇器含括號，BeautifulSoup 不支援
+        # 改用 find_all + lambda 模糊匹配含 'List' 的 class
+        list_items = soup.find_all('li', class_=lambda c: c and 'List' in ' '.join(c) if isinstance(c, list) else c and 'List' in c)
+        row = list_items[0] if list_items else None
+
         if row:
             percents = [s.get_text(strip=True) for s in row.find_all('span') if '%' in s.get_text()]
             if len(percents) >= 2:
@@ -177,16 +186,18 @@ def fetch_deep_info(ticker: str) -> dict:
         pass
     return res
 
-
 @st.cache_data(ttl=3600)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
     rows = []
-    now = get_tw_now()
+    now  = get_tw_now()
     months = 6
     if market == "TW":
         for delta in range(months):
-            d = now - timedelta(days=30 * delta)
-            yyyymm = f"{d.year}{d.month:02d}01"
+            # [修正8] 使用精確的年月計算，避免 timedelta(days=30) 重複月份
+            month_offset = now.month - delta
+            year_offset  = now.year + (month_offset - 1) // 12
+            month_val    = (month_offset - 1) % 12 + 1
+            yyyymm = f"{year_offset}{month_val:02d}01"
             url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm}&stockNo={code}"
             try:
                 r = requests.get(url, headers=get_headers(), timeout=10)
@@ -194,11 +205,11 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
                     try:
                         yy, mm, dd = str(row[0]).split("/")
                         rows.append({
-                            "date": f"{int(yy)+1911}-{mm}-{dd}",
-                            "open": float(str(row[3]).replace(",", "")),
-                            "high": float(str(row[4]).replace(",", "")),
-                            "low": float(str(row[5]).replace(",", "")),
-                            "close": float(str(row[6]).replace(",", "")),
+                            "date":   f"{int(yy)+1911}-{mm}-{dd}",
+                            "open":   float(str(row[3]).replace(",", "")),
+                            "high":   float(str(row[4]).replace(",", "")),
+                            "low":    float(str(row[5]).replace(",", "")),
+                            "close":  float(str(row[6]).replace(",", "")),
                             "volume": int(str(row[1]).replace(",", "")) // 1000,
                         })
                     except:
@@ -207,8 +218,10 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
                 pass
     else:
         for delta in range(months):
-            d = now - timedelta(days=30 * delta)
-            roc_ym = f"{d.year - 1911}/{d.month:02d}"
+            month_offset = now.month - delta
+            year_offset  = now.year + (month_offset - 1) // 12
+            month_val    = (month_offset - 1) % 12 + 1
+            roc_ym = f"{year_offset - 1911}/{month_val:02d}"
             url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
             try:
                 r = requests.get(url, headers=get_headers(), timeout=10)
@@ -216,11 +229,11 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
                     try:
                         yy, mm, dd = str(row[0]).split("/")
                         rows.append({
-                            "date": f"{int(yy)+1911}-{mm}-{dd}",
-                            "open": float(str(row[3]).replace(",", "")),
-                            "high": float(str(row[4]).replace(",", "")),
-                            "low": float(str(row[5]).replace(",", "")),
-                            "close": float(str(row[6]).replace(",", "")),
+                            "date":   f"{int(yy)+1911}-{mm}-{dd}",
+                            "open":   float(str(row[3]).replace(",", "")),
+                            "high":   float(str(row[4]).replace(",", "")),
+                            "low":    float(str(row[5]).replace(",", "")),
+                            "close":  float(str(row[6]).replace(",", "")),
                             "volume": int(str(row[1]).replace(",", "")) // 1000,
                         })
                     except:
@@ -232,34 +245,39 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df
 
-
 def draw_k_line(ticker, name):
-    code = ticker.split(".")[0]
+    code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
-    df = get_kline_data(code, market)
+    df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
-        yt = yf.Ticker(ticker)
+        yt  = yf.Ticker(ticker)
         raw = yt.history(period="6mo")
         if raw.empty:
             return None
-        df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}).reset_index()
-        df["date"] = df["Date"].dt.strftime("%Y-%m-%d")
+        df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
+                                  "Close": "close", "Volume": "volume"}).reset_index()
+        df["date"]   = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
-    df = df.tail(70).copy()   # 70天
-    if len(df) < 10:
-        return None
 
+    # [修正7] 先用全部資料計算 MA，再 tail(70) 截取顯示範圍
+    # 避免 tail(70) 後 MA60 只有最後 11 天有值的問題
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
-    colors = ['#ef5350' if df['close'].iloc[i] >= df['open'].iloc[i] else '#26a69a' for i in range(len(df))]
+    df = df.tail(70).copy()
+
+    if len(df) < 10:
+        return None
+
+    colors = ['#ef5350' if df['close'].iloc[i] >= df['open'].iloc[i]
+              else '#26a69a' for i in range(len(df))]
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.06, row_heights=[0.7, 0.3])
 
     fig.add_trace(go.Candlestick(
         x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        name=f'{name} ({code})',          # ← 顯示股票名稱
+        name=f'{name} ({code})',
         increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
         hoverinfo='none', showlegend=True,
     ), row=1, col=1)
@@ -283,9 +301,12 @@ def draw_k_line(ticker, name):
         customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', 'volume']].values,
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='orange', width=1.5), name='30MA', hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#4488ff', width=1.5), name='45MA', hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#cc66ff', width=1.5), name='60MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'],
+                             line=dict(color='orange', width=1.5), name='30MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'],
+                             line=dict(color='#4488ff', width=1.5), name='45MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'],
+                             line=dict(color='#cc66ff', width=1.5), name='60MA', hoverinfo='skip'), row=1, col=1)
 
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'], name='成交量',
@@ -339,30 +360,33 @@ def draw_k_line(ticker, name):
             **spike_cfg,
             matches='x',
             fixedrange=True,
-            showticklabels=False,          # 不顯示日期
+            showticklabels=False,
         ),
     )
 
     fig.update_yaxes(fixedrange=True, gridcolor='rgba(255,255,255,0.06)', showgrid=True,
                      zeroline=False, showspikes=False, tickfont=dict(size=10))
-
     return fig
 
-
+# [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
+@st.cache_data(ttl=300)
 def get_tw_stock_news(code):
     try:
         news_url = f"https://tw.stock.yahoo.com/quote/{code}/news"
-        resp = requests.get(news_url, headers=get_headers(), timeout=10)
+        resp     = requests.get(news_url, headers=get_headers(), timeout=10)
         if resp.status_code != 200:
             return None
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        soup       = BeautifulSoup(resp.text, 'html.parser')
         news_links = soup.find_all('a', href=True)
-        pos_words = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
-        neg_words = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
+        pos_words  = ["成長", "新高", "利多", "噴發", "買進", "展望佳", "獲利", "創高", "轉盈", "法說", "漲", "配息", "訂單", "營收亮眼"]
+        neg_words  = ["衰退", "減少", "利空", "調降", "跌", "虧損", "賣出", "縮減", "保守", "淡季", "壓力", "下修"]
         results, seen_titles = [], set()
         for link in news_links:
             href = link.get('href')
-            if '/news/' in href and 'tw.stock.yahoo.com' in href or href.startswith('/news/'):
+            if not href:
+                continue
+            # [修正5] 修正 href 條件判斷邏輯，加括號明確優先順序
+            if '/news/' in href and ('tw.stock.yahoo.com' in href or href.startswith('/')):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles:
                     continue
@@ -384,23 +408,20 @@ def get_tw_stock_news(code):
 # ============================================================
 # 3. 全域 CSS（PC + 手機 RWD）
 # ============================================================
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
 
-/* ── 隱藏 sidebar collapse 按鈕 ── */
 [data-testid='stSidebarCollapseButton'],
 [data-testid='collapsedControl'] { display: none !important; }
 
-/* ── 隱藏頂部工具列（Share / Star / Fork 按鈕列）── */
 [data-testid='stHeader'],
 header[data-testid='stHeader'],
 [data-testid='stToolbar'] { display: none !important; }
 
-/* ── 補回頂部空間 ── */
 .block-container { padding-top: 0.5rem !important; }
 
-/* ── 全域底色 ── */
 html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     background-color: #02080f !important;
     color: #c8d8e8 !important;
@@ -412,7 +433,6 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     background-size: 40px 40px !important;
 }
 
-/* ── Sidebar ── */
 [data-testid='stSidebar'] {
     background: linear-gradient(180deg, #040c18 0%, #061220 100%) !important;
     border-right: 1px solid rgba(0,255,180,0.12) !important;
@@ -420,7 +440,6 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
 [data-testid='stSidebar'] * { color: #90b8c8 !important; }
 [data-testid='stSidebar'] label { font-size: 12px !important; letter-spacing: 1px !important; }
 
-/* ── 主掃描按鈕 ── */
 [data-testid='stButton'] > button {
     background: linear-gradient(135deg, #003828 0%, #001a12 100%) !important;
     color: #00ffc0 !important;
@@ -441,7 +460,6 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
 }
 [data-testid='stButton'] > button:disabled { opacity: 0.25 !important; }
 
-/* ── 下載按鈕 ── */
 [data-testid='stDownloadButton'] > button {
     background: linear-gradient(135deg, #001828 0%, #000c18 100%) !important;
     color: #38a8e8 !important;
@@ -457,13 +475,11 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     color: #ffffff !important;
 }
 
-/* ── 表格 ── */
 [data-testid='stDataFrame'] {
     border: 1px solid rgba(0,200,140,0.15) !important;
     border-radius: 2px !important;
 }
 
-/* ── 進度條 ── */
 [data-testid='stProgress'] > div > div {
     background: linear-gradient(90deg, #00b478, #00ffc0, #38a8e8) !important;
     border-radius: 1px !important;
@@ -475,7 +491,6 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     height: 6px !important;
 }
 
-/* ── Alert ── */
 [data-testid='stAlert'] {
     border-radius: 2px !important;
     border-left: 2px solid #00ffc0 !important;
@@ -483,13 +498,11 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     font-family: 'Share Tech Mono', monospace !important;
 }
 
-/* ── Slider ── */
 [data-testid='stSlider'] div[role='slider'] {
     background: #00ffc0 !important;
     width: 14px !important; height: 14px !important;
 }
 
-/* ── Number input ── */
 [data-testid='stNumberInput'] input {
     background: #040c18 !important;
     border: 1px solid rgba(0,200,140,0.2) !important;
@@ -500,7 +513,6 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
     font-weight: 600 !important;
 }
 
-/* ── 導航按鈕列：壓縮間距讓三欄在同一行 ── */
 div[data-testid='stHorizontalBlock']:has(button[kind='secondary']) {
     gap: 4px !important;
     align-items: center !important;
@@ -508,7 +520,6 @@ div[data-testid='stHorizontalBlock']:has(button[kind='secondary']) {
 div[data-testid='stHorizontalBlock']:has(button[kind='secondary'])
     > div[data-testid='stColumn'] { padding: 0 2px !important; }
 
-/* ── 導航按鈕本身：縮小高度 ── */
 button[data-testid='stBaseButton-secondary'] {
     padding: 6px 4px !important;
     min-height: 36px !important;
@@ -516,46 +527,27 @@ button[data-testid='stBaseButton-secondary'] {
     letter-spacing: 0 !important;
 }
 
-/* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: #02080f; }
 ::-webkit-scrollbar-thumb { background: rgba(0,200,140,0.3); border-radius: 2px; }
 
-/* ── 字型 ── */
 p, li, .stMarkdown { font-family: 'Noto Sans TC', sans-serif !important; }
 
-/* ══════════════════════════════════════════
-   手機 RWD (max-width: 768px)
-   ══════════════════════════════════════════ */
 @media (max-width: 768px) {
-
-    /* padding 縮小 */
     [data-testid='stMain'] > div { padding: 0 8px !important; }
     .block-container { padding: 0.5rem 0.5rem 2rem !important; max-width: 100% !important; }
-
-    /* Banner 字體縮小 */
     .banner-title { font-size: 15px !important; letter-spacing: 3px !important; }
-    .banner-sub   { display: none !important; }          /* 隱藏副標題列 */
-    .banner-stats { display: none !important; }          /* 隱藏下方三欄說明 */
+    .banner-sub   { display: none !important; }
+    .banner-stats { display: none !important; }
     .banner-wrap  { padding: 14px 16px 12px !important; }
-
-    /* 統計卡片：2欄 */
     .stat-grid { grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
-
-    /* K 線圖高度手機版略降 */
     [data-testid='stPlotlyChart'] { min-height: 380px !important; }
-
-    /* 按鈕字體 */
     [data-testid='stButton'] > button {
         font-size: 11px !important;
         letter-spacing: 1px !important;
         padding: 10px 0 !important;
     }
-
-    /* 表格字體縮小 */
     [data-testid='stDataFrame'] * { font-size: 12px !important; }
-
-    /* 新聞卡片 padding 縮小 */
     .news-card { padding: 10px 12px !important; }
     .news-title { font-size: 13px !important; }
 }
@@ -565,6 +557,7 @@ p, li, .stMarkdown { font-family: 'Noto Sans TC', sans-serif !important; }
 # ============================================================
 # 4. Banner 頁頭
 # ============================================================
+
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
 st.markdown(f"""
 <div class="banner-wrap" style="
@@ -575,8 +568,6 @@ st.markdown(f"""
     position:relative;overflow:hidden;">
   <div style="position:absolute;top:0;left:0;right:0;height:1px;
     background:linear-gradient(90deg,transparent,#00ffc0 30%,#38a8e8 70%,transparent);opacity:0.6;"></div>
-
-  <!-- 主標題行 -->
   <div style="display:flex;align-items:center;gap:14px;position:relative;flex-wrap:wrap;">
     <div style="width:44px;height:44px;border:1px solid rgba(0,255,180,0.3);
       border-radius:4px;display:flex;align-items:center;justify-content:center;
@@ -601,8 +592,6 @@ st.markdown(f"""
         {_now_str} TWN +08:00</div>
     </div>
   </div>
-
-  <!-- 下方說明列（手機隱藏）-->
   <div class="banner-stats" style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(0,200,140,0.08);
     display:flex;gap:24px;flex-wrap:wrap;">
     <div style="font-family:Share Tech Mono,monospace;font-size:11px;color:#3a9070;letter-spacing:1px;">
@@ -618,6 +607,7 @@ st.markdown(f"""
 # ============================================================
 # 5. Sidebar 參數設定
 # ============================================================
+
 st.sidebar.markdown("""
 <div style="padding:8px 0 20px;">
   <div style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;
@@ -635,36 +625,58 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-user_bias = st.sidebar.number_input("30MA 乖離上限 (%)", 0.1, 15.0, 3.0, step=0.1)
-user_vol  = st.sidebar.slider("最小成交量 (張)", 0, 3000, 500)
+# [修正2] 統一用 session_state 管理參數，sidebar 與主畫面 expander 共用同一份值
+sb_bias = st.sidebar.number_input(
+    "30MA 乖離上限 (%)", 0.1, 15.0,
+    value=st.session_state.user_bias, step=0.1, key="sb_bias"
+)
+sb_vol = st.sidebar.slider(
+    "最小成交量 (張)", 0, 3000,
+    value=st.session_state.user_vol, key="sb_vol"
+)
+st.session_state.user_bias = sb_bias
+st.session_state.user_vol  = sb_vol
 
-# ── 手機版：在主畫面也放一排參數快速設定 ──
+# ── 手機版：主畫面快速設定（與 sidebar 同步）──
 with st.expander("⚙ 篩選參數", expanded=False):
     mc1, mc2 = st.columns(2)
     with mc1:
-        user_bias = st.number_input("30MA 乖離上限 (%)", 0.1, 15.0, user_bias, step=0.1, key="mb")
+        mb_bias = st.number_input(
+            "30MA 乖離上限 (%)", 0.1, 15.0,
+            value=st.session_state.user_bias, step=0.1, key="mb_bias"
+        )
+        st.session_state.user_bias = mb_bias
     with mc2:
-        user_vol = st.slider("最小成交量 (張)", 0, 3000, user_vol, key="mv")
+        mb_vol = st.slider(
+            "最小成交量 (張)", 0, 3000,
+            value=st.session_state.user_vol, key="mb_vol"
+        )
+        st.session_state.user_vol = mb_vol
+
+# 統一讀取最終值
+user_bias = st.session_state.user_bias
+user_vol  = st.session_state.user_vol
 
 # ── 掃描按鈕 ──
 if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
-    st.session_state.is_scanning = True
-    st.session_state.current_idx = 0
+    st.session_state.is_scanning      = True
+    st.session_state.current_idx      = 0
     st.session_state.last_selected_row = None
     st.rerun()
 
 # ============================================================
 # 6. 掃描流程
 # ============================================================
+
 if st.session_state.is_scanning:
     status = st.empty()
-    bar = st.progress(0)
-    BATCH = 200
+    bar    = st.progress(0)
+    BATCH  = 200
 
     status.text("📋 Step 1/3：載入股票清單...")
     bar.progress(0.03)
-    stock_map = get_stock_market_list()
-    all_tickers = [s["ticker"] for s in stock_map]
+    stock_map    = get_stock_market_list()
+    all_tickers  = [s["ticker"] for s in stock_map]
     total_tickers = len(all_tickers)
 
     history_map = {}
@@ -682,18 +694,24 @@ if st.session_state.is_scanning:
     if initial_hits:
         status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        with ThreadPoolExecutor(max_workers=20) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 bar.progress(0.80 + 0.19 * j / len(initial_hits))
                 deep_res = f.result()
-                base = f_deep[f]
+                base     = f_deep[f]
                 final_list.append({
-                    "ticker": base["ticker"], "code": base["code"],
-                    "name": base["name"], "industry": base["industry"],
-                    "收盤": base["收盤"], "乖離30MA(%)": base["乖離30MA(%)"],
-                    "成交量(張)": base["成交量(張)"], "量變動(%)": base["量變動(%)"],
-                    "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"],
+                    "ticker":   base["ticker"],
+                    "code":     base["code"],
+                    "name":     base["name"],
+                    "industry": base["industry"],
+                    "收盤":       base["收盤"],
+                    "乖離30MA(%)": base["乖離30MA(%)"],
+                    "成交量(張)":  base["成交量(張)"],
+                    "量變動(%)":   base["量變動(%)"],
+                    "本益比":      deep_res["pe"],
+                    "營收月增":    deep_res["mom"],
+                    "營收年增":    deep_res["yoy"],
                 })
         bar.progress(1.0)
         st.session_state.scan_results = pd.DataFrame(final_list)
@@ -707,13 +725,14 @@ if st.session_state.is_scanning:
 # ============================================================
 # 7. 結果顯示
 # ============================================================
+
 if not st.session_state.scan_results.empty:
-    df = st.session_state.scan_results.copy()
+    df          = st.session_state.scan_results.copy()
     total_found = len(df)
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
 
-    # ── 統計卡片（手機 2 欄 / PC 4 欄）──
+    # ── 統計卡片 ──
     st.markdown(f"""
     <div class="stat-grid" style="
         display:grid; grid-template-columns:1fr 1fr 1fr 1fr;
@@ -749,14 +768,16 @@ if not st.session_state.scan_results.empty:
     col_spacer, col_dl = st.columns([3, 1])
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(label="⬇ EXPORT CSV", data=csv,
-                           file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
-                           mime='text/csv', use_container_width=True)
+        st.download_button(
+            label="⬇ EXPORT CSV", data=csv,
+            file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
+            mime='text/csv', use_container_width=True
+        )
 
     # ── 結果表格 ──
-    show_cols = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
-    df_display = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
+    df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
 
     def color_tw_style(val):
         if pd.isna(val): return ''
@@ -792,7 +813,7 @@ if not st.session_state.scan_results.empty:
     if event and "selection" in event and event["selection"]["rows"]:
         clicked_row = event["selection"]["rows"][0]
         if clicked_row != st.session_state.last_selected_row:
-            st.session_state.current_idx = clicked_row
+            st.session_state.current_idx      = clicked_row
             st.session_state.last_selected_row = clicked_row
 
     st.markdown(f"""
@@ -808,7 +829,6 @@ if not st.session_state.scan_results.empty:
     # 8. K 線圖區
     # ============================================================
 
-    # ── 科技風 K線區標題 ──
     st.markdown("""
     <div style="display:flex;align-items:center;gap:10px;
         padding:12px 0 8px;border-top:1px solid rgba(0,200,140,0.12);margin-top:8px;">
@@ -828,9 +848,9 @@ if not st.session_state.scan_results.empty:
     nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
     with nav_col1:
         if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
-            st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
+            st.session_state.current_idx      = (st.session_state.current_idx - 1) % total_found
             st.session_state.last_selected_row = None
-            st.session_state.table_key += 1
+            st.session_state.table_key        += 1
             st.rerun()
     with nav_col2:
         st.markdown(f"""
@@ -841,11 +861,9 @@ if not st.session_state.scan_results.empty:
             padding:8px 12px;
             text-align:center;
             position:relative;
-            overflow:hidden;
-        ">
+            overflow:hidden;">
           <div style="position:absolute;top:0;left:0;right:0;height:1px;
-            background:linear-gradient(90deg,transparent,#00ffc0,transparent);
-            opacity:0.5;"></div>
+            background:linear-gradient(90deg,transparent,#00ffc0,transparent);opacity:0.5;"></div>
           <div style="font-family:Share Tech Mono,monospace;font-size:9px;
             color:#3a8060;letter-spacing:3px;margin-bottom:3px;">
             SIGNAL &nbsp;{c_idx+1} / {total_found}
@@ -863,29 +881,25 @@ if not st.session_state.scan_results.empty:
             </span>
           </div>
           <div style="position:absolute;bottom:0;left:0;right:0;height:1px;
-            background:linear-gradient(90deg,transparent,#38a8e8,transparent);
-            opacity:0.3;"></div>
+            background:linear-gradient(90deg,transparent,#38a8e8,transparent);opacity:0.3;"></div>
         </div>
         """, unsafe_allow_html=True)
     with nav_col3:
+        # [修正1] 移除重複的 dead code，只保留一次 rerun
         if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
-            st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
+            st.session_state.current_idx      = (st.session_state.current_idx + 1) % total_found
             st.session_state.last_selected_row = None
-            st.session_state.table_key += 1
-            st.rerun()
-            st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-            st.session_state.last_selected_row = None
-            st.session_state.table_key += 1
+            st.session_state.table_key        += 1
             st.rerun()
 
     current_stock = df.iloc[st.session_state.current_idx]
     k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
     if k_fig:
         st.plotly_chart(k_fig, use_container_width=True, config={
-            "displayModeBar": False,   # 隱藏右上角工具列
-            "scrollZoom": False,       # 停用滾輪縮放
-            "doubleClick": False,      # 停用雙擊重置
-            "showTips": False,
+            "displayModeBar": False,
+            "scrollZoom":     False,
+            "doubleClick":    False,
+            "showTips":       False,
         })
     else:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
@@ -905,7 +919,7 @@ if not st.session_state.scan_results.empty:
     if news_list:
         for n in news_list:
             badge_bg = (
-                "rgba(0,80,40,0.3)" if "利多" in n["sentiment"]
+                "rgba(0,80,40,0.3)"  if "利多" in n["sentiment"]
                 else "rgba(80,0,20,0.3)" if "利空" in n["sentiment"]
                 else "rgba(20,40,60,0.3)"
             )
@@ -936,9 +950,9 @@ else:
         st.markdown("""
         <div style="text-align:center;padding:60px 20px 70px;position:relative;overflow:hidden;">
           <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:280px;height:280px;border:1px solid rgba(0,200,140,0.04);border-radius:50%;"></div>
+               width:280px;height:280px;border:1px solid rgba(0,200,140,0.04);border-radius:50%;"></div>
           <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-            width:190px;height:190px;border:1px solid rgba(0,200,140,0.06);border-radius:50%;"></div>
+               width:190px;height:190px;border:1px solid rgba(0,200,140,0.06);border-radius:50%;"></div>
           <div style="position:relative;">
             <div style="font-size:42px;margin-bottom:20px;filter:drop-shadow(0 0 24px rgba(0,255,180,0.5));">📈</div>
             <div style="font-family:Orbitron,monospace;font-size:20px;font-weight:700;
