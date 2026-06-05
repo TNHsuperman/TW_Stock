@@ -1094,41 +1094,24 @@ if not st.session_state.scan_results.empty:
     left_area, right_area = st.columns([4.7, 1.25], gap="medium")
 
     with left_area:
-        toolbar_left, toolbar_right = st.columns([3.2, 1.4])
-        with toolbar_left:
-            ctrl1, ctrl2 = st.columns([1.7, 1.0])
-            with ctrl1:
-                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>圖表模式</div>", unsafe_allow_html=True)
-                st.radio(
-                    "圖表模式", ["K線圖", "走勢圖", "技術指標"],
-                    key="chart_mode", horizontal=True, label_visibility="collapsed"
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-            with ctrl2:
-                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>週期</div>", unsafe_allow_html=True)
-                st.radio(
-                    "週期", ["日", "週", "月"],
-                    key="chart_period", horizontal=True, label_visibility="collapsed"
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-        with toolbar_right:
-            nav1, nav2 = st.columns(2)
-            with nav1:
-                if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
-                    st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
-                    st.session_state.last_selected_row = None
-                    st.session_state.table_key += 1
-                    st.rerun()
-            with nav2:
-                if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
-                    st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-                    st.session_state.last_selected_row = None
-                    st.session_state.table_key += 1
-                    st.rerun()
+        nav_spacer, nav1, nav2 = st.columns([3.2, 0.9, 0.9])
+        with nav1:
+            if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
+                st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
+                st.session_state.last_selected_row = None
+                st.session_state.table_key += 1
+                st.rerun()
+        with nav2:
+            if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
+                st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
+                st.session_state.last_selected_row = None
+                st.session_state.table_key += 1
+                st.rerun()
 
+        # 固定顯示日 K 線圖：移除「圖表模式」與「週期」切換控制，只保留 K 線圖本體。
         k_fig = draw_k_line(
             current_stock['ticker'], current_stock['name'],
-            st.session_state.chart_mode, st.session_state.chart_period
+            chart_mode='K線圖', chart_period='日'
         )
         if k_fig:
             st.plotly_chart(k_fig, use_container_width=True, config={
