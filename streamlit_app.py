@@ -631,7 +631,7 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
 }
 .block-container {
     max-width: none !important;
-    padding: 78px 24px 2.2rem 214px !important;
+    padding: 78px 24px 2.2rem 24px !important;
 }
 
 [data-testid='stSidebar'] { display:none !important; }
@@ -762,72 +762,28 @@ hr { border-color: var(--tv-border) !important; }
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 4. 交易終端機 Top Bar / 左側導航
+# 4. 交易終端機 Top Bar（保留實際資訊，移除無作用導航）
 # ============================================================
 
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
+_signal_count = len(st.session_state.scan_results) if isinstance(st.session_state.scan_results, pd.DataFrame) else 0
 st.markdown(f"""
 <div class="tv-topbar">
   <div class="tv-brand"><span class="tv-brand-icon">◆</span> 台股智慧選股系統</div>
-  <div class="tv-tabs">
-    <div class="tv-tab active">總覽</div>
-    <div class="tv-tab">選股掃描</div>
-    <div class="tv-tab">熱門族群</div>
-    <div class="tv-tab">飆股雷達</div>
-    <div class="tv-tab">自選股</div>
-    <div class="tv-tab">回測分析</div>
-  </div>
-  <div class="tv-top-meta"><span>◐</span><span>🔔</span><span>更新時間：{_now_str}</span><span>↻</span></div>
-</div>
-<div class="tv-leftnav">
-  <div class="tv-navitem active"><span class="ico">▧</span> 總覽看板</div>
-  <div class="tv-navitem"><span class="ico">⌕</span> 選股掃描</div>
-  <div class="tv-navitem"><span class="ico">▥</span> 熱門族群</div>
-  <div class="tv-navitem"><span class="ico">🚀</span> 飆股雷達</div>
-  <div class="tv-navitem"><span class="ico">♙</span> 自選股</div>
-  <div class="tv-navitem"><span class="ico">◷</span> 回測分析</div>
-  <div class="tv-navitem"><span class="ico">⚙</span> 設定</div>
-  <div class="tv-market-mini">
-    <div style="font-weight:900;color:#e6edf6;margin-bottom:10px;">市場狀態</div>
-    <div class="tv-caption" style="border-top:1px solid var(--tv-border);padding-top:8px;">加權指數</div>
-    <div style="font-family:Roboto Mono,monospace;font-size:22px;font-weight:800;color:var(--tv-green);margin-top:8px;">--</div>
-    <div style="font-family:Roboto Mono,monospace;color:var(--tv-green);font-size:12px;">等待掃描資料</div>
+  <div class="tv-top-meta">
+    <span>策略：MA30 &gt; MA45 &gt; MA60</span>
+    <span>目前訊號：{_signal_count}</span>
+    <span>更新時間：{_now_str}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. Sidebar 參數設定
+# 5. 篩選參數設定（實際可操作）
 # ============================================================
 
-st.sidebar.markdown("""
-<div style="padding:8px 0 18px;">
-  <div style="font-family:Inter,Noto Sans TC,sans-serif;font-size:12px;font-weight:800;color:#e6edf3;letter-spacing:.5px;padding-bottom:12px;border-bottom:1px solid #30363d;margin-bottom:14px;">
-    ⚙ STRATEGY CONFIG
-  </div>
-  <div class="tv-panel" style="padding:12px 13px;margin-bottom:16px;box-shadow:none;">
-    <div class="tv-label">Signal Condition</div>
-    <div style="font-family:Roboto Mono,monospace;font-size:13px;font-weight:700;color:#8fb2ff;margin-top:7px;">MA30 &gt; MA45 &gt; MA60</div>
-    <div class="tv-caption">Bullish alignment · Bias filter</div>
-  </div>
-  <div class="tv-label">篩選參數</div>
-</div>
-""", unsafe_allow_html=True)
-
-# [修正2] 統一用 session_state 管理參數，sidebar 與主畫面 expander 共用同一份值
-sb_bias = st.sidebar.number_input(
-    "30MA 乖離上限 (%)", 0.1, 15.0,
-    value=st.session_state.user_bias, step=0.1, key="sb_bias"
-)
-sb_vol = st.sidebar.slider(
-    "最小成交量 (張)", 0, 3000,
-    value=st.session_state.user_vol, key="sb_vol"
-)
-st.session_state.user_bias = sb_bias
-st.session_state.user_vol  = sb_vol
-
-# ── 手機版：主畫面快速設定（與 sidebar 同步）──
-with st.expander("⚙ 篩選參數", expanded=False):
+# ── 主畫面篩選參數：這裡是實際會影響掃描結果的控制項 ──
+with st.expander("▸ 篩選參數", expanded=False):
     mc1, mc2 = st.columns(2)
     with mc1:
         mb_bias = st.number_input(
