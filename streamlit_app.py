@@ -40,7 +40,6 @@ def get_headers():
     }
 
 # ── Session State 初始化 ──────────────────────────────────────
-# [修正2] 加入 user_bias / user_vol 的 session_state 預設值，避免雙重定義衝突
 for key, default in [
     ('scan_results',      pd.DataFrame()),
     ('is_scanning',       False),
@@ -55,6 +54,13 @@ for key, default in [
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
+
+# ── 雙向同步回呼函式 (解決 Sidebar 與主畫面元件衝突) ──────────────────
+def sync_bias(src_key):
+    st.session_state.user_bias = st.session_state[src_key]
+
+def sync_vol(src_key):
+    st.session_state.user_vol = st.session_state[src_key]
 
 # ============================================================
 # 2. 數據抓取
@@ -77,8 +83,8 @@ def get_stock_market_list():
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
                 val = str(row['有價證券代號及名稱'])
-                if '　' in val:
-                    code, name = val.split('　')
+                if ' ' in val:
+                    code, name = val.split(' ')
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
     except:
@@ -91,12 +97,11 @@ def download_batch_history(tickers: tuple) -> dict:
         return {}
     ticker_str = " ".join(tickers)
     try:
-        raw = yf.download(ticker_str, period="4mo", interval="1d",
+        raw = yf.download(ticker_str, period="5mo", interval="1d",
                           group_by="ticker", auto_adjust=True, progress=False, threads=True)
     except Exception:
         return {}
 
-    # [修正3] 下載失敗時提前返回，避免後續 KeyError
     if raw is None or raw.empty:
         return {}
 
@@ -135,6 +140,10 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         ma30 = closes.rolling(30).mean().iloc[-1]
         ma45 = closes.rolling(45).mean().iloc[-1]
         ma60 = closes.rolling(60).mean().iloc[-1]
+        
+        if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
+            continue
+            
         curr_price   = float(closes.iloc[-1])
         vol_today    = int(volumes.iloc[-1])
         vol_yesterday = float(volumes.iloc[-2])
@@ -172,8 +181,6 @@ def fetch_deep_info(ticker: str) -> dict:
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup     = BeautifulSoup(rev_resp.text, 'html.parser')
 
-        # [修正4] 原 r'li.List(n)' CSS 選擇器含括號，BeautifulSoup 不支援
-        # 改用 find_all + lambda 模糊匹配含 'List' 的 class
         list_items = soup.find_all('li', class_=lambda c: c and 'List' in ' '.join(c) if isinstance(c, list) else c and 'List' in c)
         row = list_items[0] if list_items else None
 
@@ -193,7 +200,6 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     months = 6
     if market == "TW":
         for delta in range(months):
-            # [修正8] 使用精確的年月計算，避免 timedelta(days=30) 重複月份
             month_offset = now.month - delta
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
@@ -251,7 +257,7 @@ def draw_k_line(ticker, name):
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
         yt  = yf.Ticker(ticker)
-        raw = yt.history(period="6mo")
+        raw = yt.history(period="1y")
         if raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
@@ -259,12 +265,11 @@ def draw_k_line(ticker, name):
         df["date"]   = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
 
-    # [修正7] 先用全部資料計算 MA，再 tail(70) 截取顯示範圍
-    # 避免 tail(70) 後 MA60 只有最後 11 天有值的問題
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
-    df = df.tail(70).copy()
+    
+    df = df.dropna(subset=['MA60']).tail(70).copy()
 
     if len(df) < 10:
         return None
@@ -368,7 +373,6 @@ def draw_k_line(ticker, name):
                      zeroline=False, showspikes=False, tickfont=dict(size=10))
     return fig
 
-# [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
 def get_tw_stock_news(code):
     try:
@@ -385,7 +389,6 @@ def get_tw_stock_news(code):
             href = link.get('href')
             if not href:
                 continue
-            # [修正5] 修正 href 條件判斷邏輯，加括號明確優先順序
             if '/news/' in href and ('tw.stock.yahoo.com' in href or href.startswith('/')):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles:
@@ -605,7 +608,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. Sidebar 參數設定
+# 5. Sidebar 與主畫面控制項（修正同步邏輯）
 # ============================================================
 
 st.sidebar.markdown("""
@@ -625,35 +628,31 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# [修正2] 統一用 session_state 管理參數，sidebar 與主畫面 expander 共用同一份值
-sb_bias = st.sidebar.number_input(
+# 透過回呼(on_change)機制，完美解決雙向同步衝突
+st.sidebar.number_input(
     "30MA 乖離上限 (%)", 0.1, 15.0,
-    value=st.session_state.user_bias, step=0.1, key="sb_bias"
+    value=st.session_state.user_bias, step=0.1, key="sb_bias", on_change=sync_bias, args=("sb_bias",)
 )
-sb_vol = st.sidebar.slider(
+st.sidebar.slider(
     "最小成交量 (張)", 0, 3000,
-    value=st.session_state.user_vol, key="sb_vol"
+    value=st.session_state.user_vol, key="sb_vol", on_change=sync_vol, args=("sb_vol",)
 )
-st.session_state.user_bias = sb_bias
-st.session_state.user_vol  = sb_vol
 
-# ── 手機版：主畫面快速設定（與 sidebar 同步）──
+# ── 手機版：主畫面快速設定 ──
 with st.expander("⚙ 篩選參數", expanded=False):
     mc1, mc2 = st.columns(2)
     with mc1:
-        mb_bias = st.number_input(
+        st.number_input(
             "30MA 乖離上限 (%)", 0.1, 15.0,
-            value=st.session_state.user_bias, step=0.1, key="mb_bias"
+            value=st.session_state.user_bias, step=0.1, key="mb_bias", on_change=sync_bias, args=("mb_bias",)
         )
-        st.session_state.user_bias = mb_bias
     with mc2:
-        mb_vol = st.slider(
+        st.slider(
             "最小成交量 (張)", 0, 3000,
-            value=st.session_state.user_vol, key="mb_vol"
+            value=st.session_state.user_vol, key="mb_vol", on_change=sync_vol, args=("mb_vol",)
         )
-        st.session_state.user_vol = mb_vol
 
-# 統一讀取最終值
+# 最終讀取統一的 session state 基礎變數值
 user_bias = st.session_state.user_bias
 user_vol  = st.session_state.user_vol
 
@@ -800,7 +799,7 @@ if not st.session_state.scan_results.empty:
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
                                                             help=f"上限 {user_bias}%",
-                                                            format="%.2f%%", min_value=0, max_value=user_bias),
+                                                            format="%.2f%%", min_value=0, max_value=user_bias if user_bias > 0 else 1.0),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
             "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
             "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
@@ -852,6 +851,7 @@ if not st.session_state.scan_results.empty:
             st.session_state.last_selected_row = None
             st.session_state.table_key        += 1
             st.rerun()
+            
     with nav_col2:
         st.markdown(f"""
         <div style="
@@ -884,8 +884,8 @@ if not st.session_state.scan_results.empty:
             background:linear-gradient(90deg,transparent,#38a8e8,transparent);opacity:0.3;"></div>
         </div>
         """, unsafe_allow_html=True)
+        
     with nav_col3:
-        # [修正1] 移除重複的 dead code，只保留一次 rerun
         if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
             st.session_state.current_idx      = (st.session_state.current_idx + 1) % total_found
             st.session_state.last_selected_row = None
@@ -902,7 +902,7 @@ if not st.session_state.scan_results.empty:
             "showTips":       False,
         })
     else:
-        st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
+        st.warning("⚠️ 無法載入 K 線資料，可能歷史交易日數不足以計算 60MA。")
 
     # ============================================================
     # 9. 新聞
