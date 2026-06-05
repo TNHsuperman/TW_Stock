@@ -191,15 +191,15 @@ def _to_float_or_nan(value):
 
 def _extract_pe_from_goodinfo_html(html: str) -> float:
     """
-    從 Goodinfo 個股概況頁的「PER」欄位精準擷取本益比。
+    從 Goodinfo 個股概況頁的「PER」欄位擷取本益比。
 
-    Goodinfo 的個股概況表通常是：
-    第 1 列：成交張數 / 成交金額 / 成交筆數 / 成交均張 / 成交均價 / PBR / PER / PEG
-    第 2 列：數值列，PER 位於與「PER」表頭相同欄位。
+    這版專門修正 Goodinfo HTML 有時會被壓成「純文字區塊」或 table 欄位錯位，
+    導致嚴格 table 對位抓不到 PER 的問題。
 
-    修正重點：
-    - 不再用「找到 PER 後往後找第一個數字」的方式，避免抓到 PEG、成交均價或其他欄位。
-    - 以 HTML tr / td 的欄位位置對齊為主，PER 欄在哪一欄，就抓下一列同欄數值。
+    判斷原則：
+    - 必須找到同一段裡的 PBR / PER / PEG 表頭。
+    - 數值列最後三個數字依序視為 PBR / PER / PEG。
+    - 回傳中間值，也就是 PER。
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -213,7 +213,36 @@ def _extract_pe_from_goodinfo_html(html: str) -> float:
         pe = _to_float_or_nan(x)
         return pe if pd.notna(pe) and pe > 0 else np.nan
 
-    # 方法 1：逐列掃描表格，找到 PER 表頭後，抓下一個資料列的同欄位數值。
+    def numbers_from_text(x: str):
+        # Goodinfo 可能出現 7,098萬、1.08張/筆、+0.8(+1.33%)；只取獨立數值。
+        vals = []
+        for m in re.findall(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", str(x)):
+            v = valid_pe(m)
+            if pd.notna(v):
+                vals.append(float(v))
+        return vals
+
+    # 方法 0：直接從 Goodinfo 純文字結構抓。這是最穩定的方式。
+    # 例：
+    # 成交張數 成交金額 成交筆數 成交均張 成交均價 PBR PER PEG
+    # 1,196 7,098萬 1,110 1.08張/筆 59.37 1.7 15.71 1.35
+    text_lines = [norm_text(x) for x in soup.get_text("\n", strip=True).split("\n")]
+    text_lines = [x for x in text_lines if x]
+    for i, line in enumerate(text_lines):
+        compact = re.sub(r"\s+", " ", line.upper()).strip()
+        if "PBR" in compact and "PER" in compact and "PEG" in compact:
+            # 優先抓下一個有足夠數字的文字列。
+            for nxt in text_lines[i + 1:i + 6]:
+                nums = numbers_from_text(nxt)
+                if len(nums) >= 3:
+                    return round(float(nums[-2]), 2)
+
+            # 有些情況表頭與數值被合在同一列。
+            nums = numbers_from_text(line)
+            if len(nums) >= 3:
+                return round(float(nums[-2]), 2)
+
+    # 方法 1：逐列掃描表格，找到 PER 表頭後，抓下一列同欄位。
     for table in soup.find_all("table"):
         rows = []
         for tr in table.find_all("tr"):
@@ -223,42 +252,41 @@ def _extract_pe_from_goodinfo_html(html: str) -> float:
                 rows.append(cells)
 
         for r_idx, row in enumerate(rows):
-            per_indices = [i for i, c in enumerate(row) if is_label_per(c)]
-            if not per_indices:
-                continue
+            row_upper = [c.upper() for c in row]
+            # 若同列同時有 PBR/PER/PEG，下一列最後三個數字通常就是 PBR/PER/PEG。
+            if any(c == "PBR" for c in row_upper) and any(c == "PER" for c in row_upper) and any(c == "PEG" for c in row_upper):
+                for next_row in rows[r_idx + 1:r_idx + 4]:
+                    nums = []
+                    for cell in next_row:
+                        nums.extend(numbers_from_text(cell))
+                    if len(nums) >= 3:
+                        return round(float(nums[-2]), 2)
 
+            per_indices = [i for i, c in enumerate(row) if is_label_per(c)]
             for per_idx in per_indices:
-                # 優先抓下一列同欄位，這才是 Goodinfo 畫面上 PER 下方的數值。
                 for next_row in rows[r_idx + 1:r_idx + 4]:
                     if len(next_row) > per_idx:
                         pe = valid_pe(next_row[per_idx])
                         if pd.notna(pe):
                             return round(float(pe), 2)
 
-                # 若 HTML 欄位因 colspan 導致錯位，改抓同一組 PBR/PER/PEG 後方資料列的倒數第二個值。
-                for next_row in rows[r_idx + 1:r_idx + 4]:
-                    nums = [valid_pe(x) for x in next_row]
-                    nums = [x for x in nums if pd.notna(x)]
-                    if len(nums) >= 3:
-                        # PBR / PER / PEG 三欄在該列最後三個數字時，PER 是倒數第二個。
-                        return round(float(nums[-2]), 2)
-
-    # 方法 2：用 pandas 解析 HTML 表格，再用欄名 PER 精準取值。
-    # 有些 Goodinfo 頁面會被 pandas 成功還原為多層表格，這裡作為第二層保險。
+    # 方法 2：pandas 解析 HTML table 後再找 PER。
     try:
         dfs = pd.read_html(StringIO(html))
         for df in dfs:
-            flat_cols = [norm_text(c) for c in df.columns]
-            for col_idx, col_name in enumerate(flat_cols):
-                if col_name.upper() == "PER":
-                    for val in df.iloc[:, col_idx].tolist():
-                        pe = valid_pe(val)
-                        if pd.notna(pe):
-                            return round(float(pe), 2)
+            df_str = df.astype(str).map(norm_text)
+            values = df_str.values.tolist()
 
-            # 若 PER 在資料內容列，而不是欄名。
-            values = df.astype(str).map(norm_text).values.tolist()
             for r_idx, row in enumerate(values):
+                row_upper = [x.upper() for x in row]
+                if "PBR" in row_upper and "PER" in row_upper and "PEG" in row_upper:
+                    for next_row in values[r_idx + 1:r_idx + 4]:
+                        nums = []
+                        for cell in next_row:
+                            nums.extend(numbers_from_text(cell))
+                        if len(nums) >= 3:
+                            return round(float(nums[-2]), 2)
+
                 per_indices = [i for i, c in enumerate(row) if is_label_per(c)]
                 for per_idx in per_indices:
                     for next_row in values[r_idx + 1:r_idx + 4]:
@@ -325,7 +353,11 @@ def fetch_pe(ticker: str) -> float:
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         })
+        # Goodinfo 對沒有瀏覽器狀態的請求較容易回簡化頁或空白區塊，補上常見 cookie。
+        session.cookies.set("IS_TOUCH_DEVICE", "F", domain="goodinfo.tw")
+        session.cookies.set("SCREEN_SIZE", "WIDTH=1920&HEIGHT=1080", domain="goodinfo.tw")
         resp = session.get(goodinfo_url, headers=headers, timeout=15)
         if resp.status_code != 200 or not resp.content:
             return np.nan
