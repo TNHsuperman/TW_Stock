@@ -49,6 +49,8 @@ for key, default in [
     ('table_key',         0),
     ('user_bias',         3.0),
     ('user_vol',          500),
+    ('chart_mode',       'K線圖'),
+    ('chart_period',     '日'),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -436,27 +438,60 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df
 
-def draw_k_line(ticker, name):
+def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
+    """畫出有實際切換功能的金融圖表。
+    chart_mode: K線圖 / 走勢圖 / 技術指標
+    chart_period: 日 / 週 / 月
+    """
     code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
         yt  = yf.Ticker(ticker)
-        raw = yt.history(period="6mo")
+        raw = yt.history(period="1y")
         if raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
                                   "Close": "close", "Volume": "volume"}).reset_index()
-        df["date"]   = df["Date"].dt.strftime("%Y-%m-%d")
+        df["date"]   = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
 
+    df = df.copy()
+    df["date_dt"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date_dt")
+
+    # 週/月是真正重取樣，不只是 UI 顯示。
+    if chart_period in ["週", "月"]:
+        rule = "W-FRI" if chart_period == "週" else "ME"
+        df = (df.set_index("date_dt")
+                .resample(rule)
+                .agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"})
+                .dropna()
+                .reset_index())
+        df["date"] = df["date_dt"].dt.strftime("%Y-%m-%d")
+
+    # 技術計算會因日/週/月切換而重新計算。
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
     df['主力成本20'] = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
     df['VOL_MA5'] = df['volume'].rolling(5).mean()
-    df = df.tail(95).copy()
 
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df['RSI14'] = 100 - (100 / (1 + rs))
+    ema12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = ema12 - ema26
+    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['MACD_HIST'] = df['DIF'] - df['DEA']
+    df['MACD_GOLD'] = (df['DIF'] > df['DEA']) & (df['DIF'].shift(1) <= df['DEA'].shift(1))
+    df['MACD_DEAD'] = (df['DIF'] < df['DEA']) & (df['DIF'].shift(1) >= df['DEA'].shift(1))
+
+    tail_n = 95 if chart_period == '日' else 78 if chart_period == '週' else 60
+    df = df.tail(tail_n).copy()
     if len(df) < 10:
         return None
 
@@ -467,24 +502,31 @@ def draw_k_line(ticker, name):
 
     fig = go.Figure()
 
-    # 成交量與量均線直接疊在同一張圖底部，不再拆成第二張子圖。
+    # 成交量與量均線整合在同一張圖底部。
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'], name='成交量', yaxis='y2',
-        marker_color=colors, opacity=0.62,
+        marker_color=colors, opacity=0.58,
         hovertemplate='<b>%{x}</b><br>成交量：%{y:,} 張<extra></extra>',
     ))
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['VOL_MA5'], yaxis='y2', mode='lines', name='成交量 MA5',
-        line=dict(color='#facc15', width=1.1), hoverinfo='skip'
+        line=dict(color='#facc15', width=1.05), hoverinfo='skip'
     ))
 
-    fig.add_trace(go.Candlestick(
-        x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        name=f'{name} ({code})',
-        increasing_line_color=up_color, increasing_fillcolor='rgba(38,166,154,.88)',
-        decreasing_line_color=down_color, decreasing_fillcolor='rgba(239,68,68,.88)',
-        hoverinfo='none', showlegend=False,
-    ))
+    if chart_mode == '走勢圖':
+        fig.add_trace(go.Scatter(
+            x=df['date'], y=df['close'], mode='lines', name='收盤價',
+            line=dict(color='#22c55e', width=2.2),
+            hovertemplate='<b>%{x}</b><br>收盤：%{y:.2f}<extra></extra>'
+        ))
+    else:
+        fig.add_trace(go.Candlestick(
+            x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+            name=f'{name} ({code})',
+            increasing_line_color=up_color, increasing_fillcolor='rgba(38,166,154,.88)',
+            decreasing_line_color=down_color, decreasing_fillcolor='rgba(239,68,68,.88)',
+            hoverinfo='none', showlegend=False,
+        ))
 
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['close'], mode='none', name='', showlegend=False,
@@ -499,16 +541,43 @@ def draw_k_line(ticker, name):
             "45MA：%{customdata[5]:.2f}<br>"
             "60MA：%{customdata[6]:.2f}<br>"
             "主力成本20：%{customdata[7]:.2f}<br>"
-            "成交量：%{customdata[8]:,} 張"
+            "RSI14：%{customdata[8]:.1f}<br>"
+            "成交量：%{customdata[9]:,} 張"
             "<extra></extra>"
         ),
-        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'volume']].values,
+        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'RSI14', 'volume']].values,
     ))
 
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='#3b82f6', width=1.5), name='MA30', hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#f59e0b', width=1.5), name='MA45', hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#a855f7', width=1.5), name='MA60', hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df['date'], y=df['主力成本20'], line=dict(color='#ef4444', width=1.35, dash='dash'), name='主力成本', hoverinfo='skip'))
+
+    if chart_mode == '技術指標':
+        gold = df[df['MACD_GOLD']]
+        dead = df[df['MACD_DEAD']]
+        overbought = df[df['RSI14'] >= 70]
+        oversold = df[df['RSI14'] <= 30]
+        fig.add_trace(go.Scatter(
+            x=gold['date'], y=gold['low'] * 0.985, mode='markers', name='MACD 黃金交叉',
+            marker=dict(symbol='triangle-up', size=11, color='#22c55e', line=dict(width=1, color='#d8fff0')),
+            hovertemplate='<b>%{x}</b><br>MACD 黃金交叉<extra></extra>'
+        ))
+        fig.add_trace(go.Scatter(
+            x=dead['date'], y=dead['high'] * 1.015, mode='markers', name='MACD 死亡交叉',
+            marker=dict(symbol='triangle-down', size=11, color='#ef4444', line=dict(width=1, color='#ffd6d6')),
+            hovertemplate='<b>%{x}</b><br>MACD 死亡交叉<extra></extra>'
+        ))
+        fig.add_trace(go.Scatter(
+            x=overbought['date'], y=overbought['high'] * 1.028, mode='markers', name='RSI 過熱',
+            marker=dict(symbol='circle-open', size=9, color='#f59e0b', line=dict(width=2)),
+            hovertemplate='<b>%{x}</b><br>RSI 過熱：%{customdata:.1f}<extra></extra>', customdata=overbought['RSI14']
+        ))
+        fig.add_trace(go.Scatter(
+            x=oversold['date'], y=oversold['low'] * 0.972, mode='markers', name='RSI 低檔',
+            marker=dict(symbol='circle-open', size=9, color='#3b82f6', line=dict(width=2)),
+            hovertemplate='<b>%{x}</b><br>RSI 低檔：%{customdata:.1f}<extra></extra>', customdata=oversold['RSI14']
+        ))
 
     spike_cfg = dict(
         type='category', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
@@ -523,7 +592,8 @@ def draw_k_line(ticker, name):
         paper_bgcolor='#0b121b',
         plot_bgcolor='#0b121b',
         font=dict(color='#9aa7b8', size=11, family='Inter, Noto Sans TC, sans-serif'),
-        margin=dict(l=8, r=12, t=18, b=12),
+        # 右側預留空間，避免價格刻度文字被截斷。
+        margin=dict(l=10, r=74, t=18, b=12),
         hovermode='x unified',
         hoverlabel=dict(
             bgcolor='#111a26', bordercolor='rgba(59,130,246,0.45)',
@@ -537,10 +607,11 @@ def draw_k_line(ticker, name):
         ),
         dragmode=False,
         bargap=0.18,
-        xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickfont=dict(size=11)),
+        xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickfont=dict(size=11), automargin=True),
         yaxis=dict(
             fixedrange=True, side='right', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
             zeroline=False, tickfont=dict(size=11, color='#cbd5e1'), showspikes=False,
+            automargin=True, ticks='outside', ticklabelposition='outside right', separatethousands=True,
         ),
         yaxis2=dict(
             overlaying='y', side='left', range=[0, max_vol / 0.22],
@@ -716,6 +787,12 @@ html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
 .tv-section { color:#dce6f2;font-size:13px;font-weight:900;letter-spacing:.4px;margin:15px 0 9px;padding-left:10px;border-left:3px solid var(--tv-blue); }
 .tv-pill { border:1px solid var(--tv-border);background:#101a28;color:#bdc7d5;border-radius:5px;padding:6px 12px;font-size:13px;font-weight:700; }
 .tv-pill.active { background:rgba(59,130,246,.18);border-color:#315b9b;color:#e9f1ff; }
+.chart-control-label {font-size:11px;font-weight:800;color:var(--tv-muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;}
+.chart-control-box {border:1px solid var(--tv-border);background:#0d1622;border-radius:8px;padding:8px 10px;}
+.chart-control-box [data-testid='stRadio'] label {font-size:12px;color:#cbd5e1;font-weight:700;}
+.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] {gap:6px;}
+.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] label {border:1px solid var(--tv-border);background:#101a28;border-radius:5px;padding:4px 9px;margin-right:4px;}
+
 .quote-panel { padding: 6px 0 12px; margin-bottom: 10px; border: 0; box-shadow:none; background:transparent; }
 .quote-head { display:flex;align-items:center;gap:15px;flex-wrap:wrap; }
 .quote-title { font-size:25px;font-weight:900;color:#e6edf6;letter-spacing:.5px; }
@@ -1041,18 +1118,21 @@ if not st.session_state.scan_results.empty:
     with left_area:
         toolbar_left, toolbar_right = st.columns([3.2, 1.4])
         with toolbar_left:
-            st.markdown("""
-            <div class="chart-toolbar">
-              <div class="chart-tabs">
-                <span class="tv-pill active">K線圖</span>
-                <span class="tv-pill">走勢圖</span>
-                <span class="tv-pill">技術指標</span>
-                <span class="tv-pill active">日</span>
-                <span class="tv-pill">週</span>
-                <span class="tv-pill">月</span>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+            ctrl1, ctrl2 = st.columns([1.7, 1.0])
+            with ctrl1:
+                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>圖表模式</div>", unsafe_allow_html=True)
+                st.radio(
+                    "圖表模式", ["K線圖", "走勢圖", "技術指標"],
+                    key="chart_mode", horizontal=True, label_visibility="collapsed"
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+            with ctrl2:
+                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>週期</div>", unsafe_allow_html=True)
+                st.radio(
+                    "週期", ["日", "週", "月"],
+                    key="chart_period", horizontal=True, label_visibility="collapsed"
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
         with toolbar_right:
             nav1, nav2 = st.columns(2)
             with nav1:
@@ -1068,7 +1148,10 @@ if not st.session_state.scan_results.empty:
                     st.session_state.table_key += 1
                     st.rerun()
 
-        k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
+        k_fig = draw_k_line(
+            current_stock['ticker'], current_stock['name'],
+            st.session_state.chart_mode, st.session_state.chart_period
+        )
         if k_fig:
             st.plotly_chart(k_fig, use_container_width=True, config={
                 "displayModeBar": False,
