@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 import random
+import re
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -174,22 +175,96 @@ def clean_percent(text):
     except:
         return np.nan
 
-def fetch_deep_info(ticker: str) -> dict:
+def _to_float_or_nan(value):
+    """將 Yahoo / yfinance 回傳的數值安全轉成 float。"""
+    if value is None or value is False:
+        return np.nan
+    try:
+        text = str(value).strip()
+        if text in ["", "-", "--", "N/A", "None", "nan", "NaN"]:
+            return np.nan
+        text = text.replace(",", "").replace("倍", "")
+        num = float(text)
+        return num if np.isfinite(num) else np.nan
+    except Exception:
+        return np.nan
+
+def _extract_pe_from_yahoo_html(html: str) -> float:
+    """
+    從 Yahoo 股市個股頁擷取本益比。
+    yfinance 對台股經常回傳 None，因此這裡以 Yahoo 頁面文字作為第二資料源。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    lines = [s.get_text(" ", strip=True) for s in soup.find_all(["li", "div", "span", "td"])]
+    lines = [x for x in lines if x]
+
+    # 先處理「本益比 12.34」或「本益比(TTM) 12.34」這類同列文字
+    for line in lines:
+        if "本益比" in line or "PE" in line.upper():
+            m = re.search(r"(?:本益比(?:\s*\(TTM\))?|PE(?:\s*Ratio)?)\D{0,30}([0-9]+(?:\.[0-9]+)?)", line, re.I)
+            if m:
+                pe = _to_float_or_nan(m.group(1))
+                if pd.notna(pe) and pe > 0:
+                    return pe
+
+    # 再處理「本益比」與數字分散在相鄰標籤的情況
+    for i, line in enumerate(lines):
+        if "本益比" in line or "PE" in line.upper():
+            for nxt in lines[i + 1:i + 8]:
+                m = re.search(r"^-?[0-9]+(?:\.[0-9]+)?$", nxt.replace(",", ""))
+                if m:
+                    pe = _to_float_or_nan(nxt)
+                    if pd.notna(pe) and pe > 0:
+                        return pe
+    return np.nan
+
+def fetch_pe(ticker: str) -> float:
+    """
+    台股本益比取得順序：
+    1) yfinance trailingPE / forwardPE
+    2) yfinance 價格 ÷ trailingEps 手動換算
+    3) Yahoo 股市個股頁文字解析
+    """
     code = ticker.split('.')[0]
-    res  = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+
+    # 1 / 2: yfinance
     try:
         yt = yf.Ticker(ticker)
-        pe = yt.info.get('trailingPE')
-        if pe:
-            res["pe"] = float(pe)
-    except:
+        info = yt.info or {}
+        for key in ["trailingPE", "forwardPE"]:
+            pe = _to_float_or_nan(info.get(key))
+            if pd.notna(pe) and pe > 0:
+                return pe
+
+        price = _to_float_or_nan(info.get("currentPrice") or info.get("regularMarketPrice"))
+        eps = _to_float_or_nan(info.get("trailingEps"))
+        if pd.notna(price) and pd.notna(eps) and eps > 0:
+            return round(price / eps, 2)
+    except Exception:
         pass
+
+    # 3: Yahoo 股市頁面 fallback
+    try:
+        quote_url = f"https://tw.stock.yahoo.com/quote/{code}"
+        quote_resp = requests.get(quote_url, headers=get_headers(), timeout=10)
+        if quote_resp.status_code == 200:
+            pe = _extract_pe_from_yahoo_html(quote_resp.text)
+            if pd.notna(pe) and pe > 0:
+                return pe
+    except Exception:
+        pass
+
+    return np.nan
+
+def fetch_deep_info(ticker: str) -> dict:
+    code = ticker.split('.')[0]
+    res  = {"pe": fetch_pe(ticker), "mom": np.nan, "yoy": np.nan}
     try:
         rev_url  = f"https://tw.stock.yahoo.com/quote/{code}/revenue"
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup     = BeautifulSoup(rev_resp.text, 'html.parser')
 
-        # [修正4] 原 r'li.List(n)' CSS 選擇器含括號，BeautifulSoup 不支援
+        # 原 r'li.List(n)' CSS 選擇器含括號，BeautifulSoup 不支援；
         # 改用 find_all + lambda 模糊匹配含 'List' 的 class
         list_items = soup.find_all('li', class_=lambda c: c and 'List' in ' '.join(c) if isinstance(c, list) else c and 'List' in c)
         row = list_items[0] if list_items else None
@@ -199,7 +274,7 @@ def fetch_deep_info(ticker: str) -> dict:
             if len(percents) >= 2:
                 res["mom"] = clean_percent(percents[0])
                 res["yoy"] = clean_percent(percents[1])
-    except:
+    except Exception:
         pass
     return res
 
