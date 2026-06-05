@@ -966,31 +966,13 @@ if not st.session_state.scan_results.empty:
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
 
-    avg_pe = df['本益比'].dropna().mean() if '本益比' in df.columns else np.nan
-    avg_yoy = df['營收年增'].dropna().mean() if '營收年增' in df.columns else np.nan
-    avg_score = df['AI評分'].dropna().mean() if 'AI評分' in df.columns else np.nan
-    radar_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
-    avg_pe_txt = f"{avg_pe:.1f}" if pd.notna(avg_pe) else "N/A"
-    avg_yoy_txt = f"{avg_yoy:.1f}%" if pd.notna(avg_yoy) else "N/A"
-    avg_score_txt = f"{avg_score:.0f}" if pd.notna(avg_score) else "N/A"
-
-    # ── 統計卡片 ──
+    # ── 精簡統計列：移除 Avg AI Score / Rocket Radar 與熱門族群區塊 ──
     st.markdown(f"""
-    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px;">
+    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px;">
       <div class="tv-card">
         <div class="tv-label">Total Signals</div>
         <div class="tv-value" style="color:#8fb2ff;">{total_found}</div>
         <div class="tv-caption">符合條件標的</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Avg AI Score</div>
-        <div class="tv-value" style="font-size:24px;color:#22ab94;">{avg_score_txt}</div>
-        <div class="tv-caption">綜合技術 / 量能 / 財務</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Rocket Radar</div>
-        <div class="tv-value" style="font-size:24px;color:#f9a825;">{radar_count}</div>
-        <div class="tv-caption">AI評分 ≥ 80 強勢標的</div>
       </div>
       <div class="tv-card">
         <div class="tv-label">Bias / Volume</div>
@@ -1009,8 +991,6 @@ if not st.session_state.scan_results.empty:
             file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
             mime='text/csv', use_container_width=True
         )
-
-    render_hot_industries(df)
 
     # ── 結果表格 ──
     show_cols      = ["code", "name", "AI評分", "飆股雷達", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "主力成本乖離(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
