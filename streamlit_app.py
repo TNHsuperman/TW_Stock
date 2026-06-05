@@ -141,11 +141,26 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         bias_30   = ((curr_price - ma30) / ma30) * 100
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
+            avg_vol20 = float(volumes.tail(20).mean())
+            main_cost = calc_main_cost(df, 20)
+            cost_gap = ((curr_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
+            high20 = float(closes.tail(20).max())
+            high60 = float(closes.tail(60).max())
+            prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else np.nan
+            price_change = ((curr_price - prev_close) / prev_close * 100) if pd.notna(prev_close) and prev_close > 0 else np.nan
             hits.append({**s,
                 "收盤":       round(curr_price, 2),
+                "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
                 "乖離30MA(%)": round(bias_30, 2),
                 "成交量(張)":  vol_today,
                 "量變動(%)":   round(vol_change, 2),
+                "量比20日":    round(vol_today / avg_vol20, 2) if avg_vol20 > 0 else np.nan,
+                "主力成本":    round(main_cost, 2) if pd.notna(main_cost) else np.nan,
+                "主力成本乖離(%)": round(cost_gap, 2) if pd.notna(cost_gap) else np.nan,
+                "RSI14":      round(calc_rsi(closes), 1),
+                "MACD柱":     round(calc_macd_hist(closes), 3),
+                "突破20日高":  curr_price >= high20,
+                "接近60日高":  curr_price >= high60 * 0.97,
             })
     return hits
 
@@ -185,6 +200,182 @@ def fetch_deep_info(ticker: str) -> dict:
     except:
         pass
     return res
+
+
+
+def calc_rsi(close: pd.Series, period: int = 14) -> float:
+    try:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan
+    except Exception:
+        return np.nan
+
+
+def calc_macd_hist(close: pd.Series) -> float:
+    try:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        hist = macd - signal
+        return float(hist.iloc[-1]) if pd.notna(hist.iloc[-1]) else np.nan
+    except Exception:
+        return np.nan
+
+
+def calc_main_cost(df: pd.DataFrame, window: int = 20) -> float:
+    """近 N 日量價加權平均成本，作為主力成本估算。"""
+    try:
+        tmp = df.tail(window).copy()
+        vol_sum = tmp['volume'].sum()
+        if vol_sum <= 0:
+            return np.nan
+        return float((tmp['close'] * tmp['volume']).sum() / vol_sum)
+    except Exception:
+        return np.nan
+
+
+def calc_stock_score(row: dict) -> tuple[int, list[str]]:
+    """0-100 分股票評分與飆股雷達條件。"""
+    score = 0
+    radar = []
+    bias = row.get('乖離30MA(%)', np.nan)
+    vol_ratio = row.get('量比20日', np.nan)
+    vol_chg = row.get('量變動(%)', np.nan)
+    yoy = row.get('營收年增', np.nan)
+    mom = row.get('營收月增', np.nan)
+    pe = row.get('本益比', np.nan)
+    rsi = row.get('RSI14', np.nan)
+    macd_hist = row.get('MACD柱', np.nan)
+    cost_gap = row.get('主力成本乖離(%)', np.nan)
+    breakout20 = row.get('突破20日高', False)
+    near60 = row.get('接近60日高', False)
+
+    score += 18
+    if pd.notna(bias) and 0 <= bias <= 2.5:
+        score += 7; radar.append('低乖離多頭')
+    if breakout20:
+        score += 5; radar.append('突破20日高')
+    elif near60:
+        score += 3; radar.append('接近60日高')
+
+    if pd.notna(vol_ratio):
+        if vol_ratio >= 2:
+            score += 12; radar.append('量能放大2倍')
+        elif vol_ratio >= 1.5:
+            score += 9; radar.append('量能放大1.5倍')
+        elif vol_ratio >= 1.1:
+            score += 5
+    if pd.notna(vol_chg) and vol_chg > 20:
+        score += 4; radar.append('單日量增')
+    if pd.notna(cost_gap) and 0 <= cost_gap <= 8:
+        score += 4; radar.append('貼近主力成本')
+
+    if pd.notna(yoy):
+        if yoy >= 30:
+            score += 14; radar.append('營收年增強')
+        elif yoy >= 10:
+            score += 9
+        elif yoy > 0:
+            score += 5
+    if pd.notna(mom):
+        if mom >= 10:
+            score += 7; radar.append('營收月增強')
+        elif mom > 0:
+            score += 4
+    if pd.notna(pe) and 0 < pe <= 25:
+        score += 4; radar.append('PE合理')
+
+    if pd.notna(rsi):
+        if 55 <= rsi <= 70:
+            score += 9; radar.append('RSI強勢未過熱')
+        elif 45 <= rsi < 55:
+            score += 5
+        elif rsi > 78:
+            score -= 5; radar.append('RSI過熱')
+    if pd.notna(macd_hist) and macd_hist > 0:
+        score += 8; radar.append('MACD偏多')
+
+    if pd.notna(cost_gap) and cost_gap > 15:
+        score -= 6; radar.append('遠離成本風險')
+    if pd.notna(pe) and pe > 60:
+        score -= 4; radar.append('PE偏高')
+    return int(max(0, min(100, round(score)))), radar[:8]
+
+
+def build_ai_report(stock: pd.Series) -> dict:
+    score = stock.get('AI評分', np.nan)
+    rsi = stock.get('RSI14', np.nan)
+    macd_hist = stock.get('MACD柱', np.nan)
+    cost_gap = stock.get('主力成本乖離(%)', np.nan)
+    yoy = stock.get('營收年增', np.nan)
+    mom = stock.get('營收月增', np.nan)
+    vol_ratio = stock.get('量比20日', np.nan)
+    bias = stock.get('乖離30MA(%)', np.nan)
+    radar = stock.get('飆股雷達', '')
+
+    strength = '強勢多頭' if pd.notna(score) and score >= 80 else '偏多觀察' if pd.notna(score) and score >= 65 else '中性偏多' if pd.notna(score) and score >= 50 else '訊號普通'
+    trend = '均線多頭排列成立，趨勢結構偏多。'
+    if pd.notna(bias) and bias > 5:
+        trend += ' 但短線乖離偏大，追價風險提高。'
+    elif pd.notna(bias) and bias <= 2.5:
+        trend += ' 目前乖離相對收斂，位置較健康。'
+
+    chip = '主力成本資料不足。'
+    if pd.notna(cost_gap):
+        if 0 <= cost_gap <= 8:
+            chip = f'現價約高於近20日量價成本 {cost_gap:.1f}%，屬於貼近成本的偏多區。'
+        elif cost_gap > 15:
+            chip = f'現價高於近20日量價成本 {cost_gap:.1f}%，短線已明顯遠離成本。'
+        elif cost_gap < 0:
+            chip = f'現價低於近20日量價成本 {abs(cost_gap):.1f}%，需觀察是否重新站回成本線。'
+
+    momentum = []
+    if pd.notna(rsi): momentum.append(f'RSI14={rsi:.1f}')
+    if pd.notna(macd_hist): momentum.append('MACD柱狀體為正' if macd_hist > 0 else 'MACD柱狀體為負')
+    if pd.notna(vol_ratio): momentum.append(f'量比20日={vol_ratio:.2f}x')
+    finance = []
+    if pd.notna(yoy): finance.append(f'營收年增 {yoy:.1f}%')
+    if pd.notna(mom): finance.append(f'營收月增 {mom:.1f}%')
+
+    playbook = '高機率劇本：若守住主力成本線與短期均線，偏向沿均線震盪上攻；若跌破成本線且量縮，則轉為整理。'
+    if pd.notna(score) and score >= 80:
+        playbook = '高機率劇本：具備趨勢、量能與成長條件，偏向強勢股續航；回測主力成本線不破可視為觀察點。'
+    elif pd.notna(score) and score < 55:
+        playbook = '高機率劇本：訊號尚未完全共振，較適合等待量能或營收條件進一步確認。'
+    return {'盤面強弱': strength, '趨勢結構': trend, '主力成本': chip, '動能訊號': '；'.join(momentum) if momentum else '動能資料不足', '財務訊號': '；'.join(finance) if finance else '財務資料不足', '飆股雷達': radar if radar else '尚未觸發高強度雷達條件', '劇本': playbook}
+
+
+def fmt_num(value, pattern='{:.2f}', na='N/A'):
+    return na if pd.isna(value) else pattern.format(value)
+
+
+def render_hot_industries(df: pd.DataFrame):
+    if df.empty or 'industry' not in df.columns or 'AI評分' not in df.columns:
+        return
+    hot = (df.groupby('industry')
+             .agg(標的數=('code', 'count'), 平均分=('AI評分', 'mean'), 平均量變=('量變動(%)', 'mean'), 平均年增=('營收年增', 'mean'))
+             .reset_index())
+    hot = hot[hot['標的數'] >= 1].sort_values(['平均分', '標的數'], ascending=[False, False]).head(8)
+    if hot.empty:
+        return
+    st.markdown('<div class="tv-section">HOT INDUSTRIES · 熱門族群</div>', unsafe_allow_html=True)
+    cols = st.columns(min(4, len(hot)))
+    for i, (_, r) in enumerate(hot.iterrows()):
+        with cols[i % len(cols)]:
+            yoy_txt = 'N/A' if pd.isna(r['平均年增']) else f"{r['平均年增']:.1f}%"
+            vol_txt = 'N/A' if pd.isna(r['平均量變']) else f"{r['平均量變']:.1f}%"
+            st.markdown(f"""
+            <div class="tv-card" style="margin-bottom:10px;">
+              <div class="tv-label">{r['industry']}</div>
+              <div class="tv-value" style="font-size:22px;color:#8fb2ff;">{r['平均分']:.0f}</div>
+              <div class="tv-caption">標的 {int(r['標的數'])} · 量變 {vol_txt} · YoY {yoy_txt}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=3600)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
@@ -264,6 +455,7 @@ def draw_k_line(ticker, name):
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
+    df['主力成本20'] = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
     df = df.tail(70).copy()
 
     if len(df) < 10:
@@ -294,11 +486,12 @@ def draw_k_line(ticker, name):
             "30MA：%{customdata[4]:.2f}<br>"
             "45MA：%{customdata[5]:.2f}<br>"
             "60MA：%{customdata[6]:.2f}<br>"
+            "主力成本20：%{customdata[7]:.2f}<br>"
             "─────────────<br>"
-            "成交量：%{customdata[7]:,} 張"
+            "成交量：%{customdata[8]:,} 張"
             "<extra></extra>"
         ),
-        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', 'volume']].values,
+        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'volume']].values,
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'],
@@ -307,6 +500,8 @@ def draw_k_line(ticker, name):
                              line=dict(color='#f9a825', width=1.7), name='45MA', hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'],
                              line=dict(color='#ab47bc', width=1.7), name='60MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['主力成本20'],
+                             line=dict(color='#ffffff', width=1.2, dash='dot'), name='主力成本20', hoverinfo='skip'), row=1, col=1)
 
     fig.add_trace(go.Bar(
         x=df['date'], y=df['volume'], name='成交量',
@@ -650,21 +845,33 @@ if st.session_state.is_scanning:
                 bar.progress(0.80 + 0.19 * j / len(initial_hits))
                 deep_res = f.result()
                 base     = f_deep[f]
-                final_list.append({
+                row_data = {
                     "ticker":   base["ticker"],
                     "code":     base["code"],
                     "name":     base["name"],
                     "industry": base["industry"],
                     "收盤":       base["收盤"],
+                    "漲跌幅(%)":   base.get("漲跌幅(%)", np.nan),
                     "乖離30MA(%)": base["乖離30MA(%)"],
                     "成交量(張)":  base["成交量(張)"],
                     "量變動(%)":   base["量變動(%)"],
+                    "量比20日":    base.get("量比20日", np.nan),
+                    "主力成本":    base.get("主力成本", np.nan),
+                    "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
+                    "RSI14":      base.get("RSI14", np.nan),
+                    "MACD柱":     base.get("MACD柱", np.nan),
+                    "突破20日高":  base.get("突破20日高", False),
+                    "接近60日高":  base.get("接近60日高", False),
                     "本益比":      deep_res["pe"],
                     "營收月增":    deep_res["mom"],
                     "營收年增":    deep_res["yoy"],
-                })
+                }
+                score, radar = calc_stock_score(row_data)
+                row_data["AI評分"] = score
+                row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
+                final_list.append(row_data)
         bar.progress(1.0)
-        st.session_state.scan_results = pd.DataFrame(final_list)
+        st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False).reset_index(drop=True)
     else:
         st.session_state.scan_results = pd.DataFrame()
         st.warning("查無條件標的。")
@@ -684,8 +891,11 @@ if not st.session_state.scan_results.empty:
 
     avg_pe = df['本益比'].dropna().mean() if '本益比' in df.columns else np.nan
     avg_yoy = df['營收年增'].dropna().mean() if '營收年增' in df.columns else np.nan
+    avg_score = df['AI評分'].dropna().mean() if 'AI評分' in df.columns else np.nan
+    radar_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
     avg_pe_txt = f"{avg_pe:.1f}" if pd.notna(avg_pe) else "N/A"
     avg_yoy_txt = f"{avg_yoy:.1f}%" if pd.notna(avg_yoy) else "N/A"
+    avg_score_txt = f"{avg_score:.0f}" if pd.notna(avg_score) else "N/A"
 
     # ── 統計卡片 ──
     st.markdown(f"""
@@ -696,14 +906,14 @@ if not st.session_state.scan_results.empty:
         <div class="tv-caption">符合條件標的</div>
       </div>
       <div class="tv-card">
-        <div class="tv-label">Strategy</div>
-        <div class="tv-value" style="font-size:20px;color:#22ab94;">MA BULL</div>
-        <div class="tv-caption">30MA &gt; 45MA &gt; 60MA</div>
+        <div class="tv-label">Avg AI Score</div>
+        <div class="tv-value" style="font-size:24px;color:#22ab94;">{avg_score_txt}</div>
+        <div class="tv-caption">綜合技術 / 量能 / 財務</div>
       </div>
       <div class="tv-card">
-        <div class="tv-label">Avg PE / Avg YoY</div>
-        <div class="tv-value" style="font-size:20px;">{avg_pe_txt} <span style="color:#8b949e;font-size:14px;">/</span> {avg_yoy_txt}</div>
-        <div class="tv-caption">財務估值與成長概況</div>
+        <div class="tv-label">Rocket Radar</div>
+        <div class="tv-value" style="font-size:24px;color:#f9a825;">{radar_count}</div>
+        <div class="tv-caption">AI評分 ≥ 80 強勢標的</div>
       </div>
       <div class="tv-card">
         <div class="tv-label">Bias / Volume</div>
@@ -723,8 +933,10 @@ if not st.session_state.scan_results.empty:
             mime='text/csv', use_container_width=True
         )
 
+    render_hot_industries(df)
+
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "收盤", "乖離30MA(%)", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "AI評分", "飆股雷達", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "主力成本乖離(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
 
@@ -736,7 +948,7 @@ if not st.session_state.scan_results.empty:
     event = st.dataframe(
         df_display.style.map(
             color_tw_style,
-            subset=[c for c in ['量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
+            subset=[c for c in ['漲跌幅(%)', '主力成本乖離(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
         ),
         use_container_width=True,
         hide_index=True,
@@ -746,11 +958,18 @@ if not st.session_state.scan_results.empty:
         column_config={
             "代碼":        st.column_config.TextColumn("代碼",    width=70),
             "名稱":        st.column_config.TextColumn("名稱",    width=100),
+            "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
+            "飆股雷達":    st.column_config.TextColumn("飆股雷達", width=180),
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
+            "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
                                                             help=f"上限 {user_bias}%",
                                                             format="%.2f%%", min_value=0, max_value=user_bias),
+            "主力成本":    st.column_config.NumberColumn("主力成本", width=90, format="%.2f"),
+            "主力成本乖離(%)": st.column_config.NumberColumn("成本乖離", width=85, format="%.1f%%"),
+            "量比20日":    st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
+            "RSI14":       st.column_config.NumberColumn("RSI", width=65, format="%.1f"),
             "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
             "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
             "本益比":      st.column_config.NumberColumn("PE",     width=65, format="%.1f"),
@@ -820,7 +1039,31 @@ if not st.session_state.scan_results.empty:
         st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
     # ============================================================
-    # 9. 新聞
+    # 9. AI 分析報告 / 飆股雷達
+    # ============================================================
+    report = build_ai_report(current_stock)
+    main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
+    st.markdown(f"""
+    <div class="tv-section">AI ANALYSIS REPORT · 股票評分 / 主力成本 / 飆股雷達</div>
+    <div class="tv-panel" style="padding:16px 18px;margin-bottom:14px;">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px;">
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">AI Score</div><div class="tv-value" style="color:#8fb2ff;">{current_stock.get('AI評分', 'N/A')}</div><div class="tv-caption">0-100 綜合評分</div></div>
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">Main Cost</div><div class="tv-value" style="font-size:22px;color:#e6edf3;">{main_cost_txt}</div><div class="tv-caption">近20日量價加權成本</div></div>
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">Strength</div><div class="tv-value" style="font-size:22px;color:#22ab94;">{report['盤面強弱']}</div><div class="tv-caption">目前盤面強弱</div></div>
+      </div>
+      <div style="line-height:1.9;color:#c9d1d9;font-size:14px;">
+        <b style="color:#e6edf3;">趨勢結構：</b>{report['趨勢結構']}<br>
+        <b style="color:#e6edf3;">主力成本：</b>{report['主力成本']}<br>
+        <b style="color:#e6edf3;">動能訊號：</b>{report['動能訊號']}<br>
+        <b style="color:#e6edf3;">財務訊號：</b>{report['財務訊號']}<br>
+        <b style="color:#f9a825;">飆股雷達：</b>{report['飆股雷達']}<br>
+        <b style="color:#8fb2ff;">高機率劇本：</b>{report['劇本']}
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ============================================================
+    # 10. 新聞
     # ============================================================
     st.markdown(f"""
     <div class="tv-section">LIVE NEWS · {current_stock['name']} ({current_stock['code']})</div>
