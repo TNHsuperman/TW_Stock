@@ -55,7 +55,7 @@ for key, default in [
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# ── 雙向同步回呼函式 (解決 Sidebar 與主畫面元件衝突) ──────────────────
+# ── 雙向同步回呼函式 ──────────────────
 def sync_bias(src_key):
     st.session_state.user_bias = st.session_state[src_key]
 
@@ -72,23 +72,39 @@ def get_stock_market_list():
     try:
         session = requests.Session()
         session.verify = False
-        adapter = requests.adapters.HTTPAdapter(max_retries=2)
+        adapter = requests.adapters.HTTPAdapter(max_retries=3) # 增加重試機制
         session.mount('https://', adapter)
+
+        headers = get_headers()
+        headers.update({
+            'Host': 'isin.twse.com.tw',
+            'Upgrade-Insecure-Requests': '1'
+        })
 
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
-            r = session.get(url, headers=get_headers(), timeout=8)
-            df_isin = pd.read_html(StringIO(r.text))[0]
+            r = session.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                continue
+            
+            # 【優化】加入 match 精確鎖定目標表格，防止解析整頁 HTML 時卡死
+            dfs = pd.read_html(StringIO(r.text), match='有價證券代號及名稱')
+            if not dfs:
+                continue
+                
+            df_isin = dfs[0]
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
+                if '有價證券代號及名稱' not in df_isin.columns:
+                    continue
                 val = str(row['有價證券代號及名稱'])
                 if ' ' in val:
                     code, name = val.split(' ')
                     if len(code) == 4 and code.isdigit():
-                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
-    except:
-        pass
+                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row.get('產業別', '其他'), "code": code})
+    except Exception as e:
+        print(f"Error fetching stock list: {e}")
     return stocks
 
 @st.cache_data(ttl=3600)
@@ -268,7 +284,6 @@ def draw_k_line(ticker, name):
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
-    
     df = df.dropna(subset=['MA60']).tail(70).copy()
 
     if len(df) < 10:
@@ -608,7 +623,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. Sidebar 與主畫面控制項（修正同步邏輯）
+# 5. Sidebar 與主畫面控制項（同步機制優化）
 # ============================================================
 
 st.sidebar.markdown("""
@@ -628,7 +643,6 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# 透過回呼(on_change)機制，完美解決雙向同步衝突
 st.sidebar.number_input(
     "30MA 乖離上限 (%)", 0.1, 15.0,
     value=st.session_state.user_bias, step=0.1, key="sb_bias", on_change=sync_bias, args=("sb_bias",)
@@ -652,7 +666,7 @@ with st.expander("⚙ 篩選參數", expanded=False):
             value=st.session_state.user_vol, key="mb_vol", on_change=sync_vol, args=("mb_vol",)
         )
 
-# 最終讀取統一的 session state 基礎變數值
+# 讀取最終綁定值
 user_bias = st.session_state.user_bias
 user_vol  = st.session_state.user_vol
 
@@ -664,7 +678,7 @@ if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disab
     st.rerun()
 
 # ============================================================
-# 6. 掃描流程
+# 6. 掃描流程（防禦性防護區）
 # ============================================================
 
 if st.session_state.is_scanning:
@@ -674,8 +688,15 @@ if st.session_state.is_scanning:
 
     status.text("📋 Step 1/3：載入股票清單...")
     bar.progress(0.03)
-    stock_map    = get_stock_market_list()
-    all_tickers  = [s["ticker"] for s in stock_map]
+    stock_map = get_stock_market_list()
+    
+    # 【核心安全機制】若連線失敗或抓回空值，強制關閉鎖定狀態，避免進度條死鎖
+    if not stock_map:
+        st.session_state.is_scanning = False
+        st.error("❌ 無法取得證交所股票編碼清單，請檢查網路連線或重新啟動應用重試。")
+        st.stop()
+
+    all_tickers   = [s["ticker"] for s in stock_map]
     total_tickers = len(all_tickers)
 
     history_map = {}
