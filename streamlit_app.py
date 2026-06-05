@@ -49,8 +49,6 @@ for key, default in [
     ('table_key',         0),
     ('user_bias',         3.0),
     ('user_vol',          500),
-    ('chart_mode',       'K線圖'),
-    ('chart_period',     '日'),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -438,95 +436,43 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df
 
-def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
-    """畫出有實際切換功能的金融圖表。
-    chart_mode: K線圖 / 走勢圖 / 技術指標
-    chart_period: 日 / 週 / 月
-    """
+def draw_k_line(ticker, name):
     code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
         yt  = yf.Ticker(ticker)
-        raw = yt.history(period="1y")
+        raw = yt.history(period="6mo")
         if raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
                                   "Close": "close", "Volume": "volume"}).reset_index()
-        df["date"]   = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        df["date"]   = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
 
-    df = df.copy()
-    df["date_dt"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date_dt")
-
-    # 週/月是真正重取樣，不只是 UI 顯示。
-    if chart_period in ["週", "月"]:
-        rule = "W-FRI" if chart_period == "週" else "ME"
-        df = (df.set_index("date_dt")
-                .resample(rule)
-                .agg({"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"})
-                .dropna()
-                .reset_index())
-        df["date"] = df["date_dt"].dt.strftime("%Y-%m-%d")
-
-    # 技術計算會因日/週/月切換而重新計算。
+    # [修正7] 先用全部資料計算 MA，再 tail(70) 截取顯示範圍
+    # 避免 tail(70) 後 MA60 只有最後 11 天有值的問題
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
     df['主力成本20'] = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
-    df['VOL_MA5'] = df['volume'].rolling(5).mean()
+    df = df.tail(70).copy()
 
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df['RSI14'] = 100 - (100 / (1 + rs))
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = ema12 - ema26
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD_HIST'] = df['DIF'] - df['DEA']
-    df['MACD_GOLD'] = (df['DIF'] > df['DEA']) & (df['DIF'].shift(1) <= df['DEA'].shift(1))
-    df['MACD_DEAD'] = (df['DIF'] < df['DEA']) & (df['DIF'].shift(1) >= df['DEA'].shift(1))
-
-    tail_n = 95 if chart_period == '日' else 78 if chart_period == '週' else 60
-    df = df.tail(tail_n).copy()
     if len(df) < 10:
         return None
 
-    up_color = '#26a69a'
-    down_color = '#ef4444'
-    colors = [up_color if df['close'].iloc[i] >= df['open'].iloc[i] else down_color for i in range(len(df))]
-    max_vol = float(df['volume'].max()) if df['volume'].max() > 0 else 1.0
+    colors = ['#22ab94' if df['close'].iloc[i] >= df['open'].iloc[i]
+              else '#f23645' for i in range(len(df))]
 
-    fig = go.Figure()
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06, row_heights=[0.7, 0.3])
 
-    # 成交量與量均線整合在同一張圖底部。
-    fig.add_trace(go.Bar(
-        x=df['date'], y=df['volume'], name='成交量', yaxis='y2',
-        marker_color=colors, opacity=0.58,
-        hovertemplate='<b>%{x}</b><br>成交量：%{y:,} 張<extra></extra>',
-    ))
-    fig.add_trace(go.Scatter(
-        x=df['date'], y=df['VOL_MA5'], yaxis='y2', mode='lines', name='成交量 MA5',
-        line=dict(color='#facc15', width=1.05), hoverinfo='skip'
-    ))
-
-    if chart_mode == '走勢圖':
-        fig.add_trace(go.Scatter(
-            x=df['date'], y=df['close'], mode='lines', name='收盤價',
-            line=dict(color='#22c55e', width=2.2),
-            hovertemplate='<b>%{x}</b><br>收盤：%{y:.2f}<extra></extra>'
-        ))
-    else:
-        fig.add_trace(go.Candlestick(
-            x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-            name=f'{name} ({code})',
-            increasing_line_color=up_color, increasing_fillcolor='rgba(38,166,154,.88)',
-            decreasing_line_color=down_color, decreasing_fillcolor='rgba(239,68,68,.88)',
-            hoverinfo='none', showlegend=False,
-        ))
+    fig.add_trace(go.Candlestick(
+        x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        name=f'{name} ({code})',
+        increasing_line_color='#22ab94', decreasing_line_color='#f23645',
+        hoverinfo='none', showlegend=True,
+    ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['close'], mode='none', name='', showlegend=False,
@@ -541,83 +487,80 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
             "45MA：%{customdata[5]:.2f}<br>"
             "60MA：%{customdata[6]:.2f}<br>"
             "主力成本20：%{customdata[7]:.2f}<br>"
-            "RSI14：%{customdata[8]:.1f}<br>"
-            "成交量：%{customdata[9]:,} 張"
+            "─────────────<br>"
+            "成交量：%{customdata[8]:,} 張"
             "<extra></extra>"
         ),
-        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'RSI14', 'volume']].values,
-    ))
+        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'volume']].values,
+    ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='#3b82f6', width=1.5), name='MA30', hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#f59e0b', width=1.5), name='MA45', hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#a855f7', width=1.5), name='MA60', hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=df['date'], y=df['主力成本20'], line=dict(color='#ef4444', width=1.35, dash='dash'), name='主力成本', hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'],
+                             line=dict(color='#2962ff', width=1.7), name='30MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'],
+                             line=dict(color='#f9a825', width=1.7), name='45MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'],
+                             line=dict(color='#ab47bc', width=1.7), name='60MA', hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['date'], y=df['主力成本20'],
+                             line=dict(color='#ffffff', width=1.2, dash='dot'), name='主力成本20', hoverinfo='skip'), row=1, col=1)
 
-    if chart_mode == '技術指標':
-        gold = df[df['MACD_GOLD']]
-        dead = df[df['MACD_DEAD']]
-        overbought = df[df['RSI14'] >= 70]
-        oversold = df[df['RSI14'] <= 30]
-        fig.add_trace(go.Scatter(
-            x=gold['date'], y=gold['low'] * 0.985, mode='markers', name='MACD 黃金交叉',
-            marker=dict(symbol='triangle-up', size=11, color='#22c55e', line=dict(width=1, color='#d8fff0')),
-            hovertemplate='<b>%{x}</b><br>MACD 黃金交叉<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=dead['date'], y=dead['high'] * 1.015, mode='markers', name='MACD 死亡交叉',
-            marker=dict(symbol='triangle-down', size=11, color='#ef4444', line=dict(width=1, color='#ffd6d6')),
-            hovertemplate='<b>%{x}</b><br>MACD 死亡交叉<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=overbought['date'], y=overbought['high'] * 1.028, mode='markers', name='RSI 過熱',
-            marker=dict(symbol='circle-open', size=9, color='#f59e0b', line=dict(width=2)),
-            hovertemplate='<b>%{x}</b><br>RSI 過熱：%{customdata:.1f}<extra></extra>', customdata=overbought['RSI14']
-        ))
-        fig.add_trace(go.Scatter(
-            x=oversold['date'], y=oversold['low'] * 0.972, mode='markers', name='RSI 低檔',
-            marker=dict(symbol='circle-open', size=9, color='#3b82f6', line=dict(width=2)),
-            hovertemplate='<b>%{x}</b><br>RSI 低檔：%{customdata:.1f}<extra></extra>', customdata=oversold['RSI14']
-        ))
+    fig.add_trace(go.Bar(
+        x=df['date'], y=df['volume'], name='成交量',
+        marker_color=colors, showlegend=False,
+        hovertemplate="<b>%{x}</b><br>成交量：%{y:,} 張<extra></extra>",
+    ), row=2, col=1)
 
     spike_cfg = dict(
-        type='category', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
-        zeroline=False, showspikes=True, spikemode='across', spikesnap='cursor',
-        spikecolor='rgba(59,130,246,0.65)', spikethickness=1, spikedash='dot',
-        showline=False,
+        type='category', showgrid=True, gridcolor='rgba(255,255,255,0.055)',
+        zeroline=False, showspikes=True, spikemode='across',
+        spikesnap='cursor', spikecolor='rgba(41,98,255,0.55)',
+        spikethickness=1, spikedash='dot', showline=False,
     )
 
     fig.update_layout(
-        height=610,
+        title=dict(
+            text=f'{name}．{ticker}',
+            font=dict(size=14, color='#e6edf3', family='Noto Sans TC, sans-serif'),
+            x=0, xanchor='left', pad=dict(l=8, t=4),
+        ),
+        xaxis_rangeslider_visible=False,
+        height=500,
         template='plotly_dark',
-        paper_bgcolor='#0b121b',
-        plot_bgcolor='#0b121b',
-        font=dict(color='#9aa7b8', size=11, family='Inter, Noto Sans TC, sans-serif'),
-        # 右側預留空間，避免價格刻度文字被截斷。
-        margin=dict(l=10, r=74, t=18, b=12),
+        paper_bgcolor='#0d1117',
+        plot_bgcolor='#0d1117',
+        font=dict(color="#8b949e", size=11),
+        legend=dict(
+            bgcolor='rgba(13,17,23,0.88)',
+            bordercolor='rgba(48,54,61,0.9)', borderwidth=1,
+            font=dict(size=10, color="#c9d1d9"),
+            orientation='h',
+            yanchor='bottom', y=0.29,
+            xanchor='left', x=0.01,
+        ),
+        margin=dict(l=8, r=8, t=36, b=8),
         hovermode='x unified',
         hoverlabel=dict(
-            bgcolor='#111a26', bordercolor='rgba(59,130,246,0.45)',
-            font=dict(size=12, color='#e6edf3', family='Roboto Mono, monospace'),
+            bgcolor='#161b22', bordercolor='rgba(41,98,255,0.45)',
+            font=dict(size=11, color='#e6edf3', family='Share Tech Mono, monospace'),
             namelength=0,
         ),
-        legend=dict(
-            orientation='h', yanchor='top', y=0.985, xanchor='left', x=0.012,
-            bgcolor='rgba(7,13,20,.25)', bordercolor='rgba(33,48,64,.65)', borderwidth=0,
-            font=dict(size=11, color='#cbd5e1'),
-        ),
+        hoverdistance=100,
+        spikedistance=-1,
         dragmode=False,
-        bargap=0.18,
-        xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickfont=dict(size=11), automargin=True),
-        yaxis=dict(
-            fixedrange=True, side='right', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
-            zeroline=False, tickfont=dict(size=11, color='#cbd5e1'), showspikes=False,
-            automargin=True, ticks='outside', ticklabelposition='outside right', separatethousands=True,
+        xaxis=dict(
+            **spike_cfg,
+            fixedrange=True,
+            showticklabels=False,
         ),
-        yaxis2=dict(
-            overlaying='y', side='left', range=[0, max_vol / 0.22],
-            showgrid=False, zeroline=False, showticklabels=False, fixedrange=True,
+        xaxis2=dict(
+            **spike_cfg,
+            matches='x',
+            fixedrange=True,
+            showticklabels=False,
         ),
     )
+
+    fig.update_yaxes(fixedrange=True, gridcolor='rgba(255,255,255,0.055)', showgrid=True,
+                     zeroline=False, showspikes=False, tickfont=dict(size=10))
     return fig
 
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
@@ -658,33 +601,25 @@ def get_tw_stock_news(code):
         return None
 
 # ============================================================
-# 3. 全域 CSS（TradingView 機構終端機風格）
+# 3. 全域 CSS（PC + 手機 RWD）
 # ============================================================
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Roboto+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@300;400;500;700;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
 
 :root {
-    --tv-bg: #070d14;
-    --tv-bg-2: #0b121b;
-    --tv-panel: #0f1722;
-    --tv-panel-2: #111c29;
-    --tv-card: #0c1520;
-    --tv-border: #213040;
-    --tv-border-2: #2d3e52;
-    --tv-text: #d8dee9;
-    --tv-muted: #8f9bad;
-    --tv-faint: #5d6b7d;
-    --tv-blue: #3b82f6;
-    --tv-blue-soft: rgba(59,130,246,.16);
-    --tv-green: #22c55e;
-    --tv-green-2: #26a69a;
-    --tv-red: #ef4444;
-    --tv-red-2: #f23645;
-    --tv-yellow: #facc15;
-    --tv-orange: #f59e0b;
-    --tv-purple: #a855f7;
+    --tv-bg: #0d1117;
+    --tv-panel: #161b22;
+    --tv-panel-2: #111820;
+    --tv-border: #30363d;
+    --tv-text: #e6edf3;
+    --tv-muted: #8b949e;
+    --tv-blue: #2962ff;
+    --tv-blue-soft: rgba(41, 98, 255, 0.16);
+    --tv-green: #22ab94;
+    --tv-red: #f23645;
+    --tv-yellow: #f9a825;
 }
 
 [data-testid='stSidebarCollapseButton'],
@@ -694,173 +629,161 @@ header[data-testid='stHeader'],
 [data-testid='stToolbar'] { display: none !important; }
 
 html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
-    background:
-        radial-gradient(circle at 15% 0%, rgba(59,130,246,.10), transparent 30%),
-        linear-gradient(180deg, #080e16 0%, #060b11 100%) !important;
+    background: var(--tv-bg) !important;
     color: var(--tv-text) !important;
     font-family: 'Inter','Noto Sans TC',sans-serif !important;
 }
-.block-container {
-    max-width: none !important;
-    padding: 78px 24px 2.2rem 24px !important;
-}
+.block-container { padding-top: 0.75rem !important; max-width: 1500px !important; }
 
-[data-testid='stSidebar'] { display:none !important; }
-
-/* top bar / left rail */
-.tv-topbar {
-    position: fixed; top: 0; left: 0; right: 0; height: 58px; z-index: 9999;
-    display: flex; align-items: center; justify-content: space-between; gap: 18px;
-    padding: 0 18px 0 20px;
-    background: rgba(7,13,20,.92);
-    border-bottom: 1px solid var(--tv-border);
-    backdrop-filter: blur(14px);
+[data-testid='stSidebar'] {
+    background: #0b1118 !important;
+    border-right: 1px solid var(--tv-border) !important;
 }
-.tv-brand { display:flex;align-items:center;gap:10px;font-size:20px;font-weight:900;color:#f3f6fb;letter-spacing:.8px;white-space:nowrap; }
-.tv-brand-icon { color: var(--tv-blue); font-size: 21px; }
-.tv-tabs { display:flex;align-items:center;gap:30px;height:100%; }
-.tv-tab { color:#b8c0cc;font-size:14px;font-weight:700;padding:19px 2px 16px;border-bottom:2px solid transparent; }
-.tv-tab.active { color:#e8eef7;border-color:var(--tv-blue);box-shadow:0 8px 20px rgba(59,130,246,.16); }
-.tv-top-meta { display:flex;align-items:center;gap:14px;color:#9aa7b8;font-family:'Roboto Mono',monospace;font-size:12px;white-space:nowrap; }
-.tv-leftnav {
-    position: fixed; left:0; top:58px; bottom:0; width:184px; z-index: 9998;
-    background: rgba(8,14,22,.95); border-right:1px solid var(--tv-border);
-    padding: 18px 14px; backdrop-filter: blur(14px);
-}
-.tv-navitem { display:flex;align-items:center;gap:12px;color:#9aa7b8;padding:13px 14px;border-radius:7px;margin-bottom:9px;font-weight:700;font-size:14px; }
-.tv-navitem.active { color:#e8eef7;background:rgba(59,130,246,.08);border:1px solid var(--tv-border-2); }
-.tv-navitem .ico { width:22px;text-align:center;font-size:19px;color:#9fb2c8; }
-.tv-market-mini { position:absolute;left:14px;right:14px;bottom:30px;background:#0b131d;border:1px solid var(--tv-border);border-radius:8px;padding:14px 15px; }
+[data-testid='stSidebar'] * { color: var(--tv-muted) !important; }
+[data-testid='stSidebar'] label { font-size: 12px !important; font-weight: 600 !important; letter-spacing: .3px !important; }
 
 [data-testid='stButton'] > button,
 [data-testid='stDownloadButton'] > button {
-    background: #111a26 !important;
+    background: #161b22 !important;
     color: var(--tv-text) !important;
     border: 1px solid var(--tv-border) !important;
-    border-radius: 6px !important;
+    border-radius: 8px !important;
     font-family: 'Inter','Noto Sans TC',sans-serif !important;
     font-size: 13px !important;
     font-weight: 700 !important;
-    padding: 10px 0 !important;
-    transition: all .16s ease !important;
+    letter-spacing: .2px !important;
+    padding: 11px 0 !important;
+    transition: all .18s ease !important;
 }
 [data-testid='stButton'] > button:hover,
 [data-testid='stDownloadButton'] > button:hover {
     border-color: var(--tv-blue) !important;
-    background: #172336 !important;
-    box-shadow: 0 0 0 3px rgba(59,130,246,.15) !important;
+    background: #1b2430 !important;
+    box-shadow: 0 0 0 3px rgba(41,98,255,.14) !important;
 }
 [data-testid='stButton'] > button:disabled { opacity: .35 !important; }
 
 [data-testid='stDataFrame'] {
     background: var(--tv-panel) !important;
     border: 1px solid var(--tv-border) !important;
-    border-radius: 9px !important;
+    border-radius: 10px !important;
     overflow: hidden !important;
 }
-[data-testid='stDataFrame'] * { font-family: 'Roboto Mono','Noto Sans TC',monospace !important; }
+[data-testid='stDataFrame'] * {
+    font-family: 'Roboto Mono','Noto Sans TC',monospace !important;
+}
 
-[data-testid='stPlotlyChart'] {
-    background: var(--tv-panel) !important;
+[data-testid='stProgress'] > div { background: #111820 !important; border-radius: 999px !important; height: 7px !important; }
+[data-testid='stProgress'] > div > div { background: linear-gradient(90deg, var(--tv-blue), #4f8cff) !important; border-radius: 999px !important; }
+
+[data-testid='stAlert'] {
+    background: rgba(41,98,255,.08) !important;
+    border: 1px solid rgba(41,98,255,.24) !important;
+    border-left: 4px solid var(--tv-blue) !important;
+    border-radius: 8px !important;
+}
+
+[data-testid='stSlider'] div[role='slider'] { background: var(--tv-blue) !important; }
+[data-testid='stNumberInput'] input {
+    background: #0d1117 !important;
     border: 1px solid var(--tv-border) !important;
-    border-radius: 9px !important;
-    padding: 8px !important;
+    color: var(--tv-text) !important;
+    border-radius: 8px !important;
+    font-family: 'Roboto Mono',monospace !important;
 }
 
-[data-testid='stProgress'] > div { background:#111a26 !important;border-radius:999px !important;height:7px !important; }
-[data-testid='stProgress'] > div > div { background:linear-gradient(90deg,var(--tv-blue),#66a3ff) !important;border-radius:999px !important; }
-[data-testid='stAlert'] { background:rgba(59,130,246,.08) !important;border:1px solid rgba(59,130,246,.25) !important;border-radius:8px !important; }
-[data-testid='stSlider'] div[role='slider'] { background:var(--tv-blue) !important; }
-[data-testid='stNumberInput'] input { background:#0b121b !important;border:1px solid var(--tv-border) !important;color:var(--tv-text) !important;border-radius:7px !important;font-family:'Roboto Mono',monospace !important; }
-
-.tv-panel, .tv-card, .quote-panel, .side-card {
-    background: linear-gradient(180deg, rgba(16,26,38,.98) 0%, rgba(10,18,28,.98) 100%);
+.tv-banner, .tv-card, .tv-panel {
+    background: linear-gradient(180deg, #161b22 0%, #111820 100%);
     border: 1px solid var(--tv-border);
-    border-radius: 9px;
-    box-shadow: 0 18px 40px rgba(0,0,0,.20);
+    border-radius: 12px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.18);
 }
-.tv-panel { padding: 14px 16px; }
-.tv-card { padding: 13px 15px; }
-.tv-label { color: var(--tv-muted); font-size: 11px; font-weight: 700; letter-spacing: .45px; text-transform: uppercase; }
-.tv-value { color: var(--tv-text); font-family:'Roboto Mono',monospace; font-size:25px; font-weight:800; margin-top:5px; }
-.tv-caption { color: var(--tv-muted); font-size: 12px; margin-top:4px; }
-.tv-section { color:#dce6f2;font-size:13px;font-weight:900;letter-spacing:.4px;margin:15px 0 9px;padding-left:10px;border-left:3px solid var(--tv-blue); }
-.tv-pill { border:1px solid var(--tv-border);background:#101a28;color:#bdc7d5;border-radius:5px;padding:6px 12px;font-size:13px;font-weight:700; }
-.tv-pill.active { background:rgba(59,130,246,.18);border-color:#315b9b;color:#e9f1ff; }
-.chart-control-label {font-size:11px;font-weight:800;color:var(--tv-muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;}
-.chart-control-box {border:1px solid var(--tv-border);background:#0d1622;border-radius:8px;padding:8px 10px;}
-.chart-control-box [data-testid='stRadio'] label {font-size:12px;color:#cbd5e1;font-weight:700;}
-.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] {gap:6px;}
-.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] label {border:1px solid var(--tv-border);background:#101a28;border-radius:5px;padding:4px 9px;margin-right:4px;}
+.tv-banner { padding: 18px 22px; margin-bottom: 14px; }
+.tv-title { font-size: 22px; font-weight: 800; color: var(--tv-text); letter-spacing: .2px; }
+.tv-sub { color: var(--tv-muted); font-size: 12px; margin-top: 3px; }
+.tv-pill { border: 1px solid var(--tv-border); background: rgba(41,98,255,.10); color: #8fb2ff; border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 700; }
+.tv-card { padding: 14px 16px; }
+.tv-label { color: var(--tv-muted); font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+.tv-value { color: var(--tv-text); font-family: 'Roboto Mono',monospace; font-size: 26px; font-weight: 700; margin-top: 5px; }
+.tv-caption { color: var(--tv-muted); font-size: 12px; margin-top: 4px; }
+.tv-section { color: var(--tv-text); font-size: 13px; font-weight: 800; letter-spacing: .5px; margin: 18px 0 9px; padding-left: 10px; border-left: 4px solid var(--tv-blue); }
+.news-card { background: #161b22 !important; border: 1px solid var(--tv-border) !important; border-radius: 10px !important; }
+.news-title:hover { color: #8fb2ff !important; }
 
-.quote-panel { padding: 6px 0 12px; margin-bottom: 10px; border: 0; box-shadow:none; background:transparent; }
-.quote-head { display:flex;align-items:center;gap:15px;flex-wrap:wrap; }
-.quote-title { font-size:25px;font-weight:900;color:#e6edf6;letter-spacing:.5px; }
-.quote-tag { background:#111a26;border:1px solid var(--tv-border);border-radius:6px;padding:8px 12px;color:#aeb9c7;font-weight:700;font-size:13px; }
-.quote-price { font-family:'Roboto Mono',monospace;font-size:40px;font-weight:800;color:var(--tv-green);line-height:1.1;margin-top:14px; }
-.quote-change { font-family:'Roboto Mono',monospace;font-size:18px;font-weight:700;margin-left:10px; }
-.quote-metrics { display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:18px;margin-top:13px;max-width:780px; }
-.metric-k { color:#8996a8;font-size:12px;font-weight:700; }
-.metric-v { color:#e5edf7;font-family:'Roboto Mono',monospace;font-size:16px;font-weight:700;margin-top:4px; }
-.chart-toolbar { display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 8px; }
-.chart-tabs { display:flex;gap:8px;align-items:center;flex-wrap:wrap; }
-.side-card { padding:15px 16px;margin-bottom:14px; }
-.side-title { display:flex;justify-content:space-between;align-items:center;color:#eef3fb;font-size:17px;font-weight:900;margin-bottom:12px; }
-.bias-chip { background:rgba(34,197,94,.16);color:#8ef0aa;border:1px solid rgba(34,197,94,.25);border-radius:5px;padding:4px 10px;font-size:12px;font-weight:800; }
-.report-row { display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid rgba(45,62,82,.45);padding:7px 0;color:#c8d1dd;font-size:13px; }
-.report-row span:last-child { font-family:'Roboto Mono',monospace;font-weight:700;color:#e8edf5;text-align:right; }
-.radar-check { color:#b9c4d2;font-size:13px;line-height:1.9; }
-.radar-check b { color:var(--tv-green);margin-right:8px; }
-.news-card { background:#0f1722 !important;border:1px solid var(--tv-border) !important;border-radius:9px !important; }
-.news-title:hover { color:#8fb7ff !important; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 999px; }
 
-/* Streamlit spacing cleanup */
-div[data-testid='stVerticalBlock'] { gap: .55rem !important; }
-hr { border-color: var(--tv-border) !important; }
-::-webkit-scrollbar { width:8px;height:8px; }
-::-webkit-scrollbar-track { background:#070d14; }
-::-webkit-scrollbar-thumb { background:#2d3e52;border-radius:999px; }
-
-@media (max-width: 1100px) {
-    .block-container { padding-left: 18px !important; padding-top: 72px !important; }
-    .tv-leftnav { display:none; }
-    .tv-tabs { display:none; }
-    .quote-metrics { grid-template-columns:repeat(2,1fr); }
-}
 @media (max-width: 768px) {
-    .block-container { padding:68px 10px 2rem !important; }
-    .tv-top-meta { display:none; }
-    .tv-brand { font-size:16px; }
-    .quote-price { font-size:32px; }
-    [data-testid='stPlotlyChart'] { min-height:420px !important; }
-    [data-testid='stDataFrame'] * { font-size:12px !important; }
+    .block-container { padding: .6rem .65rem 2rem !important; }
+    .banner-stats { display: none !important; }
+    .stat-grid { grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
+    .tv-title { font-size: 17px !important; }
+    [data-testid='stPlotlyChart'] { min-height: 390px !important; }
+    [data-testid='stDataFrame'] * { font-size: 12px !important; }
 }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 4. 交易終端機 Top Bar（保留實際資訊，移除無作用導航）
+# 4. Banner 頁頭
 # ============================================================
 
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
-_signal_count = len(st.session_state.scan_results) if isinstance(st.session_state.scan_results, pd.DataFrame) else 0
 st.markdown(f"""
-<div class="tv-topbar">
-  <div class="tv-brand"><span class="tv-brand-icon">◆</span> 台股智慧選股系統</div>
-  <div class="tv-top-meta">
-    <span>策略：MA30 &gt; MA45 &gt; MA60</span>
-    <span>目前訊號：{_signal_count}</span>
-    <span>更新時間：{_now_str}</span>
+<div class="tv-banner">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+    <div>
+      <div class="tv-title">Taiwan Stock Screener Pro</div>
+      <div class="tv-sub">Institutional MA Strategy Terminal · TWSE / TPEX · {_now_str} GMT+8</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span class="tv-pill">MA30 &gt; MA45 &gt; MA60</span>
+      <span class="tv-pill">Bias Filter</span>
+      <span class="tv-pill">Volume Gate</span>
+    </div>
+  </div>
+  <div class="banner-stats" style="display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;padding-top:13px;border-top:1px solid #30363d;">
+    <div class="tv-caption">◆ 全市場智慧掃描</div>
+    <div class="tv-caption">◆ 技術面多頭排列</div>
+    <div class="tv-caption">◆ PE / MoM / YoY 財務濾網</div>
+    <div class="tv-caption">◆ K 線與即時新聞整合</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. 篩選參數設定（實際可操作）
+# 5. Sidebar 參數設定
 # ============================================================
 
-# ── 主畫面篩選參數：這裡是實際會影響掃描結果的控制項 ──
-with st.expander("▸ 篩選參數", expanded=False):
+st.sidebar.markdown("""
+<div style="padding:8px 0 18px;">
+  <div style="font-family:Inter,Noto Sans TC,sans-serif;font-size:12px;font-weight:800;color:#e6edf3;letter-spacing:.5px;padding-bottom:12px;border-bottom:1px solid #30363d;margin-bottom:14px;">
+    ⚙ STRATEGY CONFIG
+  </div>
+  <div class="tv-panel" style="padding:12px 13px;margin-bottom:16px;box-shadow:none;">
+    <div class="tv-label">Signal Condition</div>
+    <div style="font-family:Roboto Mono,monospace;font-size:13px;font-weight:700;color:#8fb2ff;margin-top:7px;">MA30 &gt; MA45 &gt; MA60</div>
+    <div class="tv-caption">Bullish alignment · Bias filter</div>
+  </div>
+  <div class="tv-label">篩選參數</div>
+</div>
+""", unsafe_allow_html=True)
+
+# [修正2] 統一用 session_state 管理參數，sidebar 與主畫面 expander 共用同一份值
+sb_bias = st.sidebar.number_input(
+    "30MA 乖離上限 (%)", 0.1, 15.0,
+    value=st.session_state.user_bias, step=0.1, key="sb_bias"
+)
+sb_vol = st.sidebar.slider(
+    "最小成交量 (張)", 0, 3000,
+    value=st.session_state.user_vol, key="sb_vol"
+)
+st.session_state.user_bias = sb_bias
+st.session_state.user_vol  = sb_vol
+
+# ── 手機版：主畫面快速設定（與 sidebar 同步）──
+with st.expander("⚙ 篩選參數", expanded=False):
     mc1, mc2 = st.columns(2)
     with mc1:
         mb_bias = st.number_input(
@@ -966,31 +889,13 @@ if not st.session_state.scan_results.empty:
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
 
-    avg_pe = df['本益比'].dropna().mean() if '本益比' in df.columns else np.nan
-    avg_yoy = df['營收年增'].dropna().mean() if '營收年增' in df.columns else np.nan
-    avg_score = df['AI評分'].dropna().mean() if 'AI評分' in df.columns else np.nan
-    radar_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
-    avg_pe_txt = f"{avg_pe:.1f}" if pd.notna(avg_pe) else "N/A"
-    avg_yoy_txt = f"{avg_yoy:.1f}%" if pd.notna(avg_yoy) else "N/A"
-    avg_score_txt = f"{avg_score:.0f}" if pd.notna(avg_score) else "N/A"
-
-    # ── 統計卡片 ──
+    # ── 統計卡片：保留必要資訊，移除 Avg AI Score / Rocket Radar 卡片 ──
     st.markdown(f"""
-    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px;">
+    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px;">
       <div class="tv-card">
         <div class="tv-label">Total Signals</div>
         <div class="tv-value" style="color:#8fb2ff;">{total_found}</div>
         <div class="tv-caption">符合條件標的</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Avg AI Score</div>
-        <div class="tv-value" style="font-size:24px;color:#22ab94;">{avg_score_txt}</div>
-        <div class="tv-caption">綜合技術 / 量能 / 財務</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Rocket Radar</div>
-        <div class="tv-value" style="font-size:24px;color:#f9a825;">{radar_count}</div>
-        <div class="tv-caption">AI評分 ≥ 80 強勢標的</div>
       </div>
       <div class="tv-card">
         <div class="tv-label">Bias / Volume</div>
@@ -1009,8 +914,6 @@ if not st.session_state.scan_results.empty:
             file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
             mime='text/csv', use_container_width=True
         )
-
-    render_hot_industries(df)
 
     # ── 結果表格 ──
     show_cols      = ["code", "name", "AI評分", "飆股雷達", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "主力成本乖離(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
@@ -1068,141 +971,74 @@ if not st.session_state.scan_results.empty:
     """, unsafe_allow_html=True)
 
     # ============================================================
-    # 8. 個股總覽 / K 線 + 成交量整合圖 / 右側 AI 面板
+    # 8. K 線圖區
     # ============================================================
 
-    current_stock = df.iloc[st.session_state.current_idx]
-    report = build_ai_report(current_stock)
-    c_idx = st.session_state.current_idx
-    price = current_stock.get('收盤', np.nan)
-    chg = current_stock.get('漲跌幅(%)', np.nan)
-    chg_color = 'var(--tv-green)' if pd.notna(chg) and chg >= 0 else 'var(--tv-red)'
-    chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.2f}%"
-    prev_est = np.nan if pd.isna(price) or pd.isna(chg) or chg == -100 else price / (1 + chg / 100)
-    chg_amt = np.nan if pd.isna(prev_est) else price - prev_est
-    chg_amt_txt = 'N/A' if pd.isna(chg_amt) else f"{chg_amt:+.2f}"
-    score_val = current_stock.get('AI評分', np.nan)
-    score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
-    main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
-    cost_gap_txt = fmt_num(current_stock.get('主力成本乖離(%)', np.nan), '{:+.2f}%')
-    rsi_txt = fmt_num(current_stock.get('RSI14', np.nan), '{:.1f}')
-    macd_txt = fmt_num(current_stock.get('MACD柱', np.nan), '{:.3f}')
-    vol_ratio_txt = fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')
-    radar_items = [x for x in str(current_stock.get('飆股雷達', '')).split('、') if x and x != '觀察']
-    if not radar_items:
-        radar_items = ['等待更強共振訊號']
-
-    st.markdown(f"""
-    <div class="quote-panel">
-      <div class="quote-head">
-        <div style="font-size:24px;color:var(--tv-yellow);">☆</div>
-        <div class="quote-title">{current_stock['name']} · {current_stock['code']}.{ 'TW' if current_stock['ticker'].endswith('.TW') else 'TWO' }</div>
-        <div class="quote-tag">{current_stock.get('industry', '產業別')}</div>
-      </div>
-      <div>
-        <span class="quote-price">{fmt_num(price, '{:.2f}')}</span>
-        <span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span>
-      </div>
-      <div class="quote-metrics">
-        <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
-        <div><div class="metric-k">主力成本</div><div class="metric-v">{main_cost_txt}</div></div>
-        <div><div class="metric-k">成本乖離</div><div class="metric-v" style="color:{chg_color};">{cost_gap_txt}</div></div>
-        <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
-        <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
-      </div>
-    </div>
+    st.markdown("""
+    <div class="tv-section">K-LINE CHART · MA30 / MA45 / MA60</div>
     """, unsafe_allow_html=True)
 
-    left_area, right_area = st.columns([4.7, 1.25], gap="medium")
-
-    with left_area:
-        toolbar_left, toolbar_right = st.columns([3.2, 1.4])
-        with toolbar_left:
-            ctrl1, ctrl2 = st.columns([1.7, 1.0])
-            with ctrl1:
-                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>圖表模式</div>", unsafe_allow_html=True)
-                st.radio(
-                    "圖表模式", ["K線圖", "走勢圖", "技術指標"],
-                    key="chart_mode", horizontal=True, label_visibility="collapsed"
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-            with ctrl2:
-                st.markdown("<div class='chart-control-box'><div class='chart-control-label'>週期</div>", unsafe_allow_html=True)
-                st.radio(
-                    "週期", ["日", "週", "月"],
-                    key="chart_period", horizontal=True, label_visibility="collapsed"
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-        with toolbar_right:
-            nav1, nav2 = st.columns(2)
-            with nav1:
-                if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
-                    st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
-                    st.session_state.last_selected_row = None
-                    st.session_state.table_key += 1
-                    st.rerun()
-            with nav2:
-                if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
-                    st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-                    st.session_state.last_selected_row = None
-                    st.session_state.table_key += 1
-                    st.rerun()
-
-        k_fig = draw_k_line(
-            current_stock['ticker'], current_stock['name'],
-            st.session_state.chart_mode, st.session_state.chart_period
-        )
-        if k_fig:
-            st.plotly_chart(k_fig, use_container_width=True, config={
-                "displayModeBar": False,
-                "scrollZoom": False,
-                "doubleClick": False,
-                "showTips": False,
-            })
-        else:
-            st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
-
-    with right_area:
+    # ── 導航列 ──
+    c_idx = st.session_state.current_idx
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+    with nav_col1:
+        if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
+            st.session_state.current_idx      = (st.session_state.current_idx - 1) % total_found
+            st.session_state.last_selected_row = None
+            st.session_state.table_key        += 1
+            st.rerun()
+    with nav_col2:
         st.markdown(f"""
-        <div class="side-card">
-          <div class="side-title"><span>AI 分析報告</span><span class="bias-chip">{report['盤面強弱']}</span></div>
-          <div class="report-row"><span>強度評分</span><span style="color:var(--tv-green);">{score_txt}</span></div>
-          <div class="report-row"><span>主力成本</span><span>{main_cost_txt}</span></div>
-          <div class="report-row"><span>成本乖離</span><span>{cost_gap_txt}</span></div>
-          <div class="report-row"><span>RSI</span><span>{rsi_txt}</span></div>
-          <div class="report-row"><span>MACD柱</span><span>{macd_txt}</span></div>
-          <div style="color:#b8c4d3;font-size:13px;line-height:1.75;margin-top:12px;">{report['趨勢結構']}<br>{report['動能訊號']}</div>
-        </div>
-        <div class="side-card">
-          <div class="side-title"><span>主力成本</span></div>
-          <div style="font-family:Roboto Mono,monospace;font-size:27px;font-weight:800;color:var(--tv-green);">{main_cost_txt}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
-            <div><div class="tv-caption">現價</div><div class="metric-v" style="color:var(--tv-green);">{fmt_num(price, '{:.2f}')}</div></div>
-            <div><div class="tv-caption">浮動盈虧</div><div class="metric-v" style="color:{chg_color};">{cost_gap_txt}</div></div>
-          </div>
-          <div style="margin-top:14px;height:10px;border-radius:999px;background:linear-gradient(90deg,var(--tv-green) 0 24%, var(--tv-red) 24% 82%, #243446 82% 100%);"></div>
-          <div style="display:flex;justify-content:space-between;color:#a7b3c2;font-size:12px;margin-top:7px;"><span>靠近成本</span><span>持有區</span><span>偏離風險</span></div>
-        </div>
-        <div class="side-card">
-          <div class="side-title"><span>飆股雷達</span><span class="bias-chip">HOT</span></div>
-          <div class="radar-check">{''.join([f'<div><b>✓</b>{item}</div>' for item in radar_items[:6]])}</div>
-          <div style="display:flex;justify-content:space-between;align-items:end;margin-top:12px;">
-            <span class="tv-caption">綜合評分</span>
-            <span style="font-family:Roboto Mono,monospace;font-size:26px;font-weight:800;color:var(--tv-green);">{score_txt}</span>
+        <div class="tv-panel" style="padding:9px 12px;text-align:center;">
+          <div class="tv-label">SIGNAL {c_idx+1} / {total_found}</div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-top:4px;">
+            <span style="font-family:Roboto Mono,monospace;font-size:20px;font-weight:800;color:#8fb2ff;">{df.iloc[c_idx]['code']}</span>
+            <span style="color:#30363d;">|</span>
+            <span style="font-family:Noto Sans TC,sans-serif;font-size:15px;font-weight:700;color:#e6edf3;">{df.iloc[c_idx]['name']}</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
+    with nav_col3:
+        # [修正1] 移除重複的 dead code，只保留一次 rerun
+        if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
+            st.session_state.current_idx      = (st.session_state.current_idx + 1) % total_found
+            st.session_state.last_selected_row = None
+            st.session_state.table_key        += 1
+            st.rerun()
+
+    current_stock = df.iloc[st.session_state.current_idx]
+    k_fig = draw_k_line(current_stock['ticker'], current_stock['name'])
+    if k_fig:
+        st.plotly_chart(k_fig, use_container_width=True, config={
+            "displayModeBar": False,
+            "scrollZoom":     False,
+            "doubleClick":    False,
+            "showTips":       False,
+        })
+    else:
+        st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
     # ============================================================
-    # 9. AI 分析文字摘要
+    # 9. AI 分析報告 / 飆股雷達
     # ============================================================
+    report = build_ai_report(current_stock)
+    main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
     st.markdown(f"""
-    <div class="tv-section">AI ANALYSIS SUMMARY · 高機率劇本</div>
-    <div class="tv-panel" style="line-height:1.9;color:#c9d4e2;font-size:14px;margin-bottom:12px;">
-      <b style="color:#e8edf5;">主力成本：</b>{report['主力成本']}<br>
-      <b style="color:#e8edf5;">財務訊號：</b>{report['財務訊號']}<br>
-      <b style="color:var(--tv-yellow);">飆股雷達：</b>{report['飆股雷達']}<br>
-      <b style="color:#8fb7ff;">劇本：</b>{report['劇本']}
+    <div class="tv-section">AI ANALYSIS REPORT · 股票評分 / 主力成本 / 飆股雷達</div>
+    <div class="tv-panel" style="padding:16px 18px;margin-bottom:14px;">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px;">
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">AI Score</div><div class="tv-value" style="color:#8fb2ff;">{current_stock.get('AI評分', 'N/A')}</div><div class="tv-caption">0-100 綜合評分</div></div>
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">Main Cost</div><div class="tv-value" style="font-size:22px;color:#e6edf3;">{main_cost_txt}</div><div class="tv-caption">近20日量價加權成本</div></div>
+        <div class="tv-card" style="box-shadow:none;"><div class="tv-label">Strength</div><div class="tv-value" style="font-size:22px;color:#22ab94;">{report['盤面強弱']}</div><div class="tv-caption">目前盤面強弱</div></div>
+      </div>
+      <div style="line-height:1.9;color:#c9d1d9;font-size:14px;">
+        <b style="color:#e6edf3;">趨勢結構：</b>{report['趨勢結構']}<br>
+        <b style="color:#e6edf3;">主力成本：</b>{report['主力成本']}<br>
+        <b style="color:#e6edf3;">動能訊號：</b>{report['動能訊號']}<br>
+        <b style="color:#e6edf3;">財務訊號：</b>{report['財務訊號']}<br>
+        <b style="color:#f9a825;">飆股雷達：</b>{report['飆股雷達']}<br>
+        <b style="color:#8fb2ff;">高機率劇本：</b>{report['劇本']}
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
