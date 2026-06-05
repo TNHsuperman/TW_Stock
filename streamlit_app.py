@@ -993,7 +993,7 @@ if not st.session_state.scan_results.empty:
         )
 
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "AI評分", "飆股雷達", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "主力成本乖離(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
 
@@ -1005,7 +1005,7 @@ if not st.session_state.scan_results.empty:
     event = st.dataframe(
         df_display.style.map(
             color_tw_style,
-            subset=[c for c in ['漲跌幅(%)', '主力成本乖離(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
+            subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
         ),
         use_container_width=True,
         hide_index=True,
@@ -1016,14 +1016,12 @@ if not st.session_state.scan_results.empty:
             "代碼":        st.column_config.TextColumn("代碼",    width=70),
             "名稱":        st.column_config.TextColumn("名稱",    width=100),
             "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
-            "飆股雷達":    st.column_config.TextColumn("飆股雷達", width=180),
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
                                                             help=f"上限 {user_bias}%",
                                                             format="%.2f%%", min_value=0, max_value=user_bias),
             "主力成本":    st.column_config.NumberColumn("主力成本", width=90, format="%.2f"),
-            "主力成本乖離(%)": st.column_config.NumberColumn("成本乖離", width=85, format="%.1f%%"),
             "量比20日":    st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
             "RSI14":       st.column_config.NumberColumn("RSI", width=65, format="%.1f"),
