@@ -189,16 +189,69 @@ def _to_float_or_nan(value):
     except Exception:
         return np.nan
 
+def _extract_pe_from_goodinfo_html(html: str) -> float:
+    """
+    從 Goodinfo 個股概況頁擷取 PER 欄位，也就是本益比。
+    來源頁面格式：StockDetail.asp?STOCK_ID=台股代號
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    def norm_text(x):
+        return re.sub(r"\s+", " ", str(x).replace("\xa0", " ")).strip()
+
+    def valid_pe(x):
+        pe = _to_float_or_nan(x)
+        return pe if pd.notna(pe) and pe > 0 else np.nan
+
+    # 方法 1：表格儲存格定位。通常 PER 會在表格欄名，下一格就是數值。
+    cells = [norm_text(c.get_text(" ", strip=True)) for c in soup.find_all(["th", "td"])]
+    cells = [c for c in cells if c]
+    for i, c in enumerate(cells):
+        if c.upper() == "PER":
+            # 先找同一張交易資料表中 PER 後方最接近的數字
+            for nxt in cells[i + 1:i + 6]:
+                pe = valid_pe(nxt)
+                if pd.notna(pe):
+                    return pe
+
+    # 方法 2：Goodinfo 有時會將「成交均價 PBR PER PEG」與下一列數值合併成純文字。
+    lines = [norm_text(s) for s in soup.get_text("\n").splitlines()]
+    lines = [x for x in lines if x]
+    for i, line in enumerate(lines):
+        if re.search(r"\bPBR\b.*\bPER\b.*\bPEG\b", line, re.I):
+            # 下一列通常包含：成交張數 成交金額 成交筆數 成交均張 成交均價 PBR PER PEG
+            for nxt in lines[i + 1:i + 5]:
+                tokens = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", nxt)
+                nums = []
+                for token in tokens:
+                    pe = _to_float_or_nan(token)
+                    if pd.notna(pe):
+                        nums.append(pe)
+                # 最後三個通常為 PBR / PER / PEG，所以 PER 是倒數第二個。
+                if len(nums) >= 3:
+                    pe = nums[-2]
+                    if pd.notna(pe) and pe > 0:
+                        return pe
+
+    # 方法 3：最後保險，搜尋 PER 鄰近文字。
+    all_text = norm_text(soup.get_text(" "))
+    m = re.search(r"\bPER\b\D{0,40}([0-9]+(?:\.[0-9]+)?)", all_text, re.I)
+    if m:
+        pe = valid_pe(m.group(1))
+        if pd.notna(pe):
+            return pe
+
+    return np.nan
+
+
 def _extract_pe_from_yahoo_html(html: str) -> float:
     """
-    從 Yahoo 股市個股頁擷取本益比。
-    yfinance 對台股經常回傳 None，因此這裡以 Yahoo 頁面文字作為第二資料源。
+    從 Yahoo 股市個股頁擷取本益比，僅作為 Goodinfo 失敗時的備援來源。
     """
     soup = BeautifulSoup(html, "html.parser")
     lines = [s.get_text(" ", strip=True) for s in soup.find_all(["li", "div", "span", "td"])]
     lines = [x for x in lines if x]
 
-    # 先處理「本益比 12.34」或「本益比(TTM) 12.34」這類同列文字
     for line in lines:
         if "本益比" in line or "PE" in line.upper():
             m = re.search(r"(?:本益比(?:\s*\(TTM\))?|PE(?:\s*Ratio)?)\D{0,30}([0-9]+(?:\.[0-9]+)?)", line, re.I)
@@ -207,7 +260,6 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
                 if pd.notna(pe) and pe > 0:
                     return pe
 
-    # 再處理「本益比」與數字分散在相鄰標籤的情況
     for i, line in enumerate(lines):
         if "本益比" in line or "PE" in line.upper():
             for nxt in lines[i + 1:i + 8]:
@@ -218,16 +270,41 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
                         return pe
     return np.nan
 
+
 def fetch_pe(ticker: str) -> float:
     """
     台股本益比取得順序：
-    1) yfinance trailingPE / forwardPE
-    2) yfinance 價格 ÷ trailingEps 手動換算
-    3) Yahoo 股市個股頁文字解析
+    1) Goodinfo 個股概況頁 PER 欄位
+    2) yfinance trailingPE / forwardPE
+    3) yfinance 價格 ÷ trailingEps 手動換算
+    4) Yahoo 股市個股頁文字解析
     """
     code = ticker.split('.')[0]
 
-    # 1 / 2: yfinance
+    # 1: Goodinfo PER 欄位。本益比以使用者指定網站為主。
+    try:
+        session = requests.Session()
+        session.verify = False
+        goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
+        headers = get_headers()
+        headers.update({
+            "Referer": "https://goodinfo.tw/tw/index.asp",
+            "Host": "goodinfo.tw",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
+        resp = session.get(goodinfo_url, headers=headers, timeout=12)
+        # Goodinfo 頁面常見 Big5/UTF-8 混用，優先採 apparent_encoding。
+        if resp.encoding is None or resp.encoding.lower() in ["iso-8859-1", "ascii"]:
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        if resp.status_code == 200 and resp.text:
+            pe = _extract_pe_from_goodinfo_html(resp.text)
+            if pd.notna(pe) and pe > 0:
+                return pe
+    except Exception:
+        pass
+
+    # 2 / 3: yfinance 備援
     try:
         yt = yf.Ticker(ticker)
         info = yt.info or {}
@@ -243,7 +320,7 @@ def fetch_pe(ticker: str) -> float:
     except Exception:
         pass
 
-    # 3: Yahoo 股市頁面 fallback
+    # 4: Yahoo 股市頁面備援
     try:
         quote_url = f"https://tw.stock.yahoo.com/quote/{code}"
         quote_resp = requests.get(quote_url, headers=get_headers(), timeout=10)
@@ -255,6 +332,7 @@ def fetch_pe(ticker: str) -> float:
         pass
 
     return np.nan
+
 
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
