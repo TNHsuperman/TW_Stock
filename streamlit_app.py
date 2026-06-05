@@ -1155,20 +1155,7 @@ if not st.session_state.scan_results.empty:
         """, unsafe_allow_html=True)
 
     # ============================================================
-    # 9. AI 分析文字摘要
-    # ============================================================
-    st.markdown(f"""
-    <div class="tv-section">AI ANALYSIS SUMMARY · 高機率劇本</div>
-    <div class="tv-panel" style="line-height:1.9;color:#c9d4e2;font-size:14px;margin-bottom:12px;">
-      <b style="color:#e8edf5;">主力成本：</b>{report['主力成本']}<br>
-      <b style="color:#e8edf5;">財務訊號：</b>{report['財務訊號']}<br>
-      <b style="color:var(--tv-yellow);">飆股雷達：</b>{report['飆股雷達']}<br>
-      <b style="color:#8fb7ff;">劇本：</b>{report['劇本']}
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ============================================================
-    # 10. 新聞
+    # 9. 新聞
     # ============================================================
     st.markdown(f"""
     <div class="tv-section">LIVE NEWS · {current_stock['name']} ({current_stock['code']})</div>
