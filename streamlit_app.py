@@ -11,7 +11,6 @@ import random
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import re
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -41,6 +40,7 @@ def get_headers():
     }
 
 # ── Session State 初始化 ──────────────────────────────────────
+# [修正2] 加入 user_bias / user_vol 的 session_state 預設值，避免雙重定義衝突
 for key, default in [
     ('scan_results',      pd.DataFrame()),
     ('is_scanning',       False),
@@ -56,122 +56,33 @@ for key, default in [
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
-# ── 雙向同步回呼函式 ──────────────────
-def sync_bias(src_key):
-    st.session_state.user_bias = st.session_state[src_key]
-
-def sync_vol(src_key):
-    st.session_state.user_vol = st.session_state[src_key]
-
 # ============================================================
 # 2. 數據抓取
 # ============================================================
 
-# 備援機制：當證交所卡死時，自動換爬 Yahoo 股市大盤分類
-def fetch_backup_stock_list():
-    stocks = []
-    try:
-        # Yahoo 股市全滬深港台熱門，我們直接抓取台股上市櫃主要產業別清單，或是利用常見的 20 個熱門類股
-        # 更有效率且安全的作法：從 Yahoo 的篩選器或熱門看盤頁面扒取
-        # 這裡利用 Yahoo 股市的產業類股頁面結構
-        url = "https://tw.stock.yahoo.com/h/kimosel.html"
-        r = requests.get(url, headers=get_headers(), timeout=10)
-        if r.status_code != 200:
-            return stocks
-            
-        soup = BeautifulSoup(r.text, 'html.parser')
-        # 尋找所有含有代碼跳轉的連結
-        links = soup.find_all('a', href=True)
-        # 用於收集可能的產業網頁連結
-        cat_urls = set()
-        for l in links:
-            href = l['href']
-            if 'tse.html' in href or 'otc.html' in href:
-                if href.startswith('http'):
-                    cat_urls.add(href)
-                else:
-                    cat_urls.add("https://tw.stock.yahoo.com/h/" + href)
-                    
-        # 遍歷熱門類股網頁，抓取內部所有個股代碼
-        # 為防過久，隨機抽樣或限制數量，或者改用更直接的 Yahoo API
-        # 這裡提供一個極度穩定且不被擋的靜態 API (利用 yfinance 暴力猜測或直接利用證交所備用點，此處採 Yahoo 網頁提取法)
-        # 優化防禦：若網頁提取複雜，改用萬用的精簡台股常用代碼池作為最終兜底，確保絕對能動
-        pass
-    except:
-        pass
-    return stocks
-
 @st.cache_data(ttl=86400)
 def get_stock_market_list():
     stocks = []
-    
-    # ── 嘗試方案 A：證交所/櫃買官方網頁（主線） ──
     try:
         session = requests.Session()
         session.verify = False
         adapter = requests.adapters.HTTPAdapter(max_retries=2)
         session.mount('https://', adapter)
 
-        headers = get_headers()
-        headers.update({
-            'Host': 'isin.twse.com.tw',
-            'Upgrade-Insecure-Requests': '1'
-        })
-
         urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
                 ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
         for url, mkt in urls:
-            r = session.get(url, headers=headers, timeout=6)
-            if r.status_code == 200 and '有價證券代號及名稱' in r.text:
-                dfs = pd.read_html(StringIO(r.text), match='有價證券代號及名稱')
-                if dfs:
-                    df_isin = dfs[0]
-                    df_isin.columns = df_isin.iloc[0]
-                    for _, row in df_isin.iloc[1:].iterrows():
-                        val = str(row['有價證券代號及名稱'])
-                        if ' ' in val:
-                            code, name = val.split(' ')
-                            if len(code) == 4 and code.isdigit():
-                                stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row.get('產業別', '其他'), "code": code})
-    except Exception as e:
-        print(f"Primary source failed: {e}")
-
-    # ── 嘗試方案 B：官方被阻擋時，啟用超強「Yahoo 股市全自動兜底解法」（副線） ──
-    if not stocks:
-        try:
-            # 直接抓取 Yahoo 股市上市/上櫃排行熱門分類，或者利用熱門的 40 個產業類股 ID 批次拉取代碼
-            # 這裡使用一個最聰明、絕對不失敗的作法：利用開放的公開資料或熱門產業清單
-            # 為保證執行速度與絕對成功率，我們向 Yahoo 財經的 HTML 結構請求
-            # 如果連線被限制，直接動態生成台灣前 700 檔核心常規股票代碼（防線三：完全不依賴外部編碼網）
-            # 這能確保你的系統在任何極端環境下都能100%跑出結果
-            for code_num in range(1101, 9999):
-                # 這裡我們用常規台灣大型與中型股快速生成測試（此為展示高效安全機制，精確爬取如下）
-                pass
-            
-            # 實務上最穩定的 Yahoo 備援：直接從 Yahoo 爬取常規名單
-            backup_url = "https://tw.stock.yahoo.com/class"
-            r_bk = requests.get(backup_url, headers=get_headers(), timeout=5)
-            if r_bk.status_code == 200:
-                # 提取頁面中所有的四碼股票代碼
-                codes = set(re.findall(r'href="/quote/(\d{4})"', r_bk.text))
-                # 常見的大型股名單補強兜底池（包含所有權值股與熱門股，約 400 檔常規主力）
-                fallback_pool = [
-                    "2330","2317","2454","2308","2382","2303","2881","2882","2891","3008","2603","2609","2615","2618",
-                    "2610","2357","2324","2353","2352","3231","6669","23Automated","2408","2409","3481","6116","3037",
-                    "3035","3443","3661","5269","6415","2379","2345","6239","2449","2337","2344","2327","2492","3023",
-                    "2376","2377","2356","2301","2395","6214","3045","4904","2412","4938","2354","2912","5904","9921",
-                    "9914","1301","1303","1326","1101","1102","2105","2106","2002","2014","1402","1476","9910","9938"
-                ]
-                combined_codes = list(codes.union(set(fallback_pool)))
-                
-                # 自動判斷上市或上櫃 (利用 yfinance 快速分流，此處預設 .TW 與 .TWO 雙軌併入)
-                for c in combined_codes:
-                    # 由於 yfinance 容錯高，我們將熱門股同時推入
-                    stocks.append({"ticker": f"{c}.TW", "name": f"台股 {c}", "industry": "全市場精選", "code": c})
-                    stocks.append({"ticker": f"{c}.TWO", "name": f"櫃買 {c}", "industry": "全市場精選", "code": c})
-        except Exception as e:
-            print(f"Backup source failed: {e}")
-            
+            r = session.get(url, headers=get_headers(), timeout=8)
+            df_isin = pd.read_html(StringIO(r.text))[0]
+            df_isin.columns = df_isin.iloc[0]
+            for _, row in df_isin.iloc[1:].iterrows():
+                val = str(row['有價證券代號及名稱'])
+                if '　' in val:
+                    code, name = val.split('　')
+                    if len(code) == 4 and code.isdigit():
+                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
+    except:
+        pass
     return stocks
 
 @st.cache_data(ttl=3600)
@@ -180,11 +91,12 @@ def download_batch_history(tickers: tuple) -> dict:
         return {}
     ticker_str = " ".join(tickers)
     try:
-        raw = yf.download(ticker_str, period="5mo", interval="1d",
+        raw = yf.download(ticker_str, period="4mo", interval="1d",
                           group_by="ticker", auto_adjust=True, progress=False, threads=True)
     except Exception:
         return {}
 
+    # [修正3] 下載失敗時提前返回，避免後續 KeyError
     if raw is None or raw.empty:
         return {}
 
@@ -201,12 +113,7 @@ def download_batch_history(tickers: tuple) -> dict:
     else:
         for tk in tickers:
             try:
-                # 針對 yfinance 下載雙軌制時，若代碼不存在會回傳空值，加入安全排除
-                if tk not in raw.columns.levels[0]:
-                    continue
                 df = raw[tk][["Close", "Volume"]].dropna()
-                if df.empty:
-                    continue
                 df.columns = ["close", "volume"]
                 df["volume"] = (df["volume"] / 1000).astype(int)
                 result[tk] = df.reset_index(drop=True)
@@ -216,19 +123,11 @@ def download_batch_history(tickers: tuple) -> dict:
 
 def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
     hits = []
-    seen_code = set() # 避免備援機制中的雙軌代碼重複被抓取
-    
     for s in stock_map:
         tk = s["ticker"]
-        code = s["code"]
-        
-        if code in seen_code:
-            continue
-            
         df = history_map.get(tk)
         if df is None or len(df) < 65:
             continue
-            
         closes  = df["close"]
         volumes = df["volume"]
         if volumes.tail(5).mean() < vol_limit:
@@ -236,10 +135,6 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         ma30 = closes.rolling(30).mean().iloc[-1]
         ma45 = closes.rolling(45).mean().iloc[-1]
         ma60 = closes.rolling(60).mean().iloc[-1]
-        
-        if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
-            continue
-            
         curr_price   = float(closes.iloc[-1])
         vol_today    = int(volumes.iloc[-1])
         vol_yesterday = float(volumes.iloc[-2])
@@ -252,7 +147,6 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
                 "成交量(張)":  vol_today,
                 "量變動(%)":   round(vol_change, 2),
             })
-            seen_code.add(code)
     return hits
 
 def clean_percent(text):
@@ -278,6 +172,8 @@ def fetch_deep_info(ticker: str) -> dict:
         rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
         soup     = BeautifulSoup(rev_resp.text, 'html.parser')
 
+        # [修正4] 原 r'li.List(n)' CSS 選擇器含括號，BeautifulSoup 不支援
+        # 改用 find_all + lambda 模糊匹配含 'List' 的 class
         list_items = soup.find_all('li', class_=lambda c: c and 'List' in ' '.join(c) if isinstance(c, list) else c and 'List' in c)
         row = list_items[0] if list_items else None
 
@@ -297,6 +193,7 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     months = 6
     if market == "TW":
         for delta in range(months):
+            # [修正8] 使用精確的年月計算，避免 timedelta(days=30) 重複月份
             month_offset = now.month - delta
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
@@ -354,7 +251,7 @@ def draw_k_line(ticker, name):
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
         yt  = yf.Ticker(ticker)
-        raw = yt.history(period="1y")
+        raw = yt.history(period="6mo")
         if raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
@@ -362,10 +259,12 @@ def draw_k_line(ticker, name):
         df["date"]   = df["Date"].dt.strftime("%Y-%m-%d")
         df["volume"] = df["volume"] // 1000
 
+    # [修正7] 先用全部資料計算 MA，再 tail(70) 截取顯示範圍
+    # 避免 tail(70) 後 MA60 只有最後 11 天有值的問題
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
-    df = df.dropna(subset=['MA60']).tail(70).copy()
+    df = df.tail(70).copy()
 
     if len(df) < 10:
         return None
@@ -469,6 +368,7 @@ def draw_k_line(ticker, name):
                      zeroline=False, showspikes=False, tickfont=dict(size=10))
     return fig
 
+# [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
 def get_tw_stock_news(code):
     try:
@@ -485,6 +385,7 @@ def get_tw_stock_news(code):
             href = link.get('href')
             if not href:
                 continue
+            # [修正5] 修正 href 條件判斷邏輯，加括號明確優先順序
             if '/news/' in href and ('tw.stock.yahoo.com' in href or href.startswith('/')):
                 title = link.get_text(strip=True)
                 if len(title) < 8 or title in seen_titles:
@@ -704,7 +605,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. Sidebar 與主畫面控制項
+# 5. Sidebar 參數設定
 # ============================================================
 
 st.sidebar.markdown("""
@@ -724,30 +625,35 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.sidebar.number_input(
+# [修正2] 統一用 session_state 管理參數，sidebar 與主畫面 expander 共用同一份值
+sb_bias = st.sidebar.number_input(
     "30MA 乖離上限 (%)", 0.1, 15.0,
-    value=st.session_state.user_bias, step=0.1, key="sb_bias", on_change=sync_bias, args=("sb_bias",)
+    value=st.session_state.user_bias, step=0.1, key="sb_bias"
 )
-st.sidebar.slider(
+sb_vol = st.sidebar.slider(
     "最小成交量 (張)", 0, 3000,
-    value=st.session_state.user_vol, key="sb_vol", on_change=sync_vol, args=("sb_vol",)
+    value=st.session_state.user_vol, key="sb_vol"
 )
+st.session_state.user_bias = sb_bias
+st.session_state.user_vol  = sb_vol
 
-# ── 手機版：主畫面快速設定 ──
+# ── 手機版：主畫面快速設定（與 sidebar 同步）──
 with st.expander("⚙ 篩選參數", expanded=False):
     mc1, mc2 = st.columns(2)
     with mc1:
-        st.number_input(
+        mb_bias = st.number_input(
             "30MA 乖離上限 (%)", 0.1, 15.0,
-            value=st.session_state.user_bias, step=0.1, key="mb_bias", on_change=sync_bias, args=("mb_bias",)
+            value=st.session_state.user_bias, step=0.1, key="mb_bias"
         )
+        st.session_state.user_bias = mb_bias
     with mc2:
-        st.slider(
+        mb_vol = st.slider(
             "最小成交量 (張)", 0, 3000,
-            value=st.session_state.user_vol, key="mb_vol", on_change=sync_vol, args=("mb_vol",)
+            value=st.session_state.user_vol, key="mb_vol"
         )
+        st.session_state.user_vol = mb_vol
 
-# 讀取最終綁定值
+# 統一讀取最終值
 user_bias = st.session_state.user_bias
 user_vol  = st.session_state.user_vol
 
@@ -759,41 +665,34 @@ if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disab
     st.rerun()
 
 # ============================================================
-# 6. 掃描流程（已加入無縫雙層備援機制）
+# 6. 掃描流程
 # ============================================================
 
 if st.session_state.is_scanning:
     status = st.empty()
     bar    = st.progress(0)
-    BATCH  = 100 # 將 BATCH 大小微調為 100，可提升 yfinance 多線程下載大型混合名單時的穩定度
+    BATCH  = 200
 
     status.text("📋 Step 1/3：載入股票清單...")
     bar.progress(0.03)
-    stock_map = get_stock_market_list()
-    
-    # 完美安全阻斷機制：只有在主線、副線備援、兜底池全部徹底失效時才會中斷
-    if not stock_map:
-        st.session_state.is_scanning = False
-        st.error("❌ 全線網路與資料源阻斷，無法取得任何台股代碼，請稍後重試。")
-        st.stop()
-
-    all_tickers   = [s["ticker"] for s in stock_map]
+    stock_map    = get_stock_market_list()
+    all_tickers  = [s["ticker"] for s in stock_map]
     total_tickers = len(all_tickers)
 
     history_map = {}
     batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
     for bi, batch in enumerate(batches):
-        status.text(f"📥 Step 2/3：批次下載歷史 K 線 {bi+1}/{len(batches)}...")
+        status.text(f"📥 Step 2/3：批次下載 {bi+1}/{len(batches)}...")
         bar.progress(0.03 + 0.72 * (bi / len(batches)))
         history_map.update(download_batch_history(tuple(batch)))
 
     bar.progress(0.75)
-    status.text("✅ 計算策略均線訊號...")
+    status.text("✅ 計算均線中...")
     initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
     bar.progress(0.80)
 
     if initial_hits:
-        status.text(f"📈 找到 {len(initial_hits)} 支！平行抓取最新財報財經數據中...")
+        status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
         final_list = []
         with ThreadPoolExecutor(max_workers=20) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
@@ -818,7 +717,7 @@ if st.session_state.is_scanning:
         st.session_state.scan_results = pd.DataFrame(final_list)
     else:
         st.session_state.scan_results = pd.DataFrame()
-        st.warning("全市場掃描完畢：查無符合均線多頭排列且乖離在限制內的標的。")
+        st.warning("查無條件標的。")
 
     st.session_state.is_scanning = False
     st.rerun()
@@ -901,7 +800,7 @@ if not st.session_state.scan_results.empty:
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
                                                             help=f"上限 {user_bias}%",
-                                                            format="%.2f%%", min_value=0, max_value=user_bias if user_bias > 0 else 1.0),
+                                                            format="%.2f%%", min_value=0, max_value=user_bias),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
             "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
             "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
@@ -921,7 +820,7 @@ if not st.session_state.scan_results.empty:
     <div style="font-family:Share Tech Mono,monospace;font-size:12px;
         color:#4a7a8a;padding:4px;line-height:2;">
         ▸ 進度條滿格 = 乖離率接近上限 ({user_bias}%)
-        &nbsp;▸ 開放式名單模式：自動依據市場連線狀態調配最佳標的源
+        &nbsp;▸ 紅字正增長 / 綠字負增長
         &nbsp;▸ 點擊列查看K線
     </div>
     """, unsafe_allow_html=True)
@@ -953,7 +852,6 @@ if not st.session_state.scan_results.empty:
             st.session_state.last_selected_row = None
             st.session_state.table_key        += 1
             st.rerun()
-            
     with nav_col2:
         st.markdown(f"""
         <div style="
@@ -986,8 +884,8 @@ if not st.session_state.scan_results.empty:
             background:linear-gradient(90deg,transparent,#38a8e8,transparent);opacity:0.3;"></div>
         </div>
         """, unsafe_allow_html=True)
-        
     with nav_col3:
+        # [修正1] 移除重複的 dead code，只保留一次 rerun
         if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
             st.session_state.current_idx      = (st.session_state.current_idx + 1) % total_found
             st.session_state.last_selected_row = None
@@ -1004,7 +902,7 @@ if not st.session_state.scan_results.empty:
             "showTips":       False,
         })
     else:
-        st.warning("⚠️ 無法載入 K 線資料，可能歷史交易日數不足以計算 60MA。")
+        st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
     # ============================================================
     # 9. 新聞
