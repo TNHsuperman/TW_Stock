@@ -348,14 +348,15 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 
 
 
-# ── Goodinfo PER 快取與高速擷取 ───────────────────────────────
-PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "goodinfo_per_cache.json")
+# ── 官方 API 本益比高速擷取 ───────────────────────────────
+# 改用 TWSE / TPEx 官方一次性批次資料，不再逐檔爬 Goodinfo。
+# 優點：速度快、穩定、不容易被擋；掃描時只要抓上市 + 上櫃兩包資料。
+PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "official_pe_cache.json")
 PE_CACHE_LOCK = threading.Lock()
-PE_CACHE_VERSION = "20260609_goodinfo_per_detail_flow_v2"
-GOODINFO_THREAD_LOCAL = threading.local()
+PE_CACHE_VERSION = "20260609_twse_tpex_official_pe_v1"
 
 
-def _today_key() -> str:
+def _pe_cache_today_key() -> str:
     return get_tw_now().strftime("%Y-%m-%d")
 
 
@@ -368,203 +369,224 @@ def _load_pe_disk_cache() -> dict:
                 return data
     except Exception:
         pass
-    return {"version": PE_CACHE_VERSION, "items": {}}
+    return {"version": PE_CACHE_VERSION, "date": "", "items": {}}
 
 
-def _save_pe_disk_cache(cache: dict) -> None:
+def _save_pe_disk_cache(items: dict, source: str = "official") -> None:
     try:
+        payload = {
+            "version": PE_CACHE_VERSION,
+            "date": _pe_cache_today_key(),
+            "source": source,
+            "updated_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "items": items,
+        }
         tmp = PE_CACHE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, PE_CACHE_FILE)
     except Exception:
         pass
 
 
-def _get_cached_pe(code: str, allow_stale: bool = False) -> float:
-    """先讀本機快取；今天資料直接用，網路失敗時允許用舊資料。"""
-    with PE_CACHE_LOCK:
-        cache = _load_pe_disk_cache()
-        item = cache.get("items", {}).get(str(code))
-    if not isinstance(item, dict):
+def _clean_pe_value(value) -> float:
+    """將官方資料的本益比欄位轉成 float；'-'、'N/A'、空值會回傳 NaN。"""
+    if value is None:
+        return np.nan
+    text = str(value).strip()
+    if text in ["", "-", "--", "N/A", "NA", "None", "nan", "NaN", "除權息"]:
+        return np.nan
+    text = text.replace(",", "").replace("倍", "").replace("％", "%")
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return np.nan
+    try:
+        pe = float(m.group(0))
+        return pe if np.isfinite(pe) and pe > 0 else np.nan
+    except Exception:
         return np.nan
 
-    pe = _to_float_or_nan(item.get("pe"))
-    if pd.isna(pe) or pe <= 0:
-        return np.nan
 
-    if item.get("date") == _today_key() or allow_stale:
-        return round(float(pe), 2)
-    return np.nan
-
-
-def _set_cached_pe(code: str, pe: float, source: str = "goodinfo") -> None:
-    pe = _to_float_or_nan(pe)
-    if pd.isna(pe) or pe <= 0:
-        return
-    with PE_CACHE_LOCK:
-        cache = _load_pe_disk_cache()
-        cache.setdefault("items", {})[str(code)] = {
-            "pe": round(float(pe), 2),
-            "date": _today_key(),
-            "source": source,
-            "updated_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        _save_pe_disk_cache(cache)
-
-
-def _get_goodinfo_session() -> requests.Session:
-    """
-    每個 thread 重用一個 Session。
-    這比每支股票都重建連線、重打 Goodinfo 首頁快很多，也比較不容易被擋。
-    """
-    sess = getattr(GOODINFO_THREAD_LOCAL, "session", None)
-    if sess is None:
-        sess = requests.Session()
-        sess.verify = False
-        sess.headers.update({
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            # 不要求 br，避免部分環境 brotli 解壓或編碼判斷異常。
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Cache-Control": "max-age=0",
-        })
-        sess.cookies.update({
-            "IS_TOUCH_DEVICE": "F",
-            "SCREEN_SIZE": "WIDTH=1920&HEIGHT=1080",
-        })
-        GOODINFO_THREAD_LOCAL.session = sess
-    return sess
-
-
-def _decode_goodinfo_response(resp: requests.Response) -> str:
-    """Goodinfo 常見 cp950/big5；用多種編碼嘗試，保留 ASCII 欄位 PER/PBR/PEG。"""
-    content = resp.content or b""
-    encodings = [resp.encoding, resp.apparent_encoding, "cp950", "big5", "utf-8"]
-    seen = set()
-    for enc in encodings:
-        if not enc or enc in seen:
-            continue
-        seen.add(enc)
-        try:
-            html = content.decode(enc, errors="ignore")
-            if "PER" in html or "個股概況" in html or "本益比" in html or "成交價" in html:
-                return html
-        except Exception:
-            pass
-    return resp.text or content.decode("cp950", errors="ignore")
-
-
-def _fetch_goodinfo_html(url: str, referer: str = "https://goodinfo.tw/tw/index.asp", timeout: int = 8) -> str:
-    sess = _get_goodinfo_session()
-    headers = {"Referer": referer}
-    try:
-        resp = sess.get(url, headers=headers, timeout=timeout)
-        if resp.status_code == 200 and resp.content:
-            html = _decode_goodinfo_response(resp)
-            # 被擋或回簡化頁時，通常沒有 PER/PBR/PEG 與個股資料。
-            if "PER" in html or "PBR" in html or "本益比" in html:
-                return html
-    except Exception:
-        pass
-
-    # 只在第一次失敗時補一次首頁 cookie，不再每支股票都先打首頁。
-    try:
-        sess.get("https://goodinfo.tw/tw/index.asp", timeout=5)
-        resp = sess.get(url, headers=headers, timeout=timeout)
-        if resp.status_code == 200 and resp.content:
-            return _decode_goodinfo_response(resp)
-    except Exception:
-        pass
+def _find_record_code(record: dict) -> str:
+    """兼容 TWSE / TPEx OpenAPI 中英文欄位名稱。"""
+    if not isinstance(record, dict):
+        return ""
+    for k, v in record.items():
+        key = str(k).lower()
+        if key in ["code", "stockno", "stock_id", "stockid", "securitiescompanycode"]:
+            s = re.sub(r"\D", "", str(v))
+            if len(s) == 4:
+                return s
+        if any(word in str(k) for word in ["股票代號", "證券代號", "有價證券代號", "代號"]):
+            s = re.sub(r"\D", "", str(v))
+            if len(s) == 4:
+                return s
+    # 有些資料第一欄就是代號，但 key 名稱不固定。
+    for v in record.values():
+        s = re.sub(r"\D", "", str(v).strip())
+        if len(s) == 4:
+            return s
     return ""
 
 
-def _extract_pe_from_goodinfo_flow_html(html: str) -> float:
-    """
-    從 Goodinfo 本益比(PER)河流圖頁抓目前 PER。
-    例：26W24 1110 0 0% 34.94 31.77 → 最後一個數字 31.77 即目前 PER。
-    """
-    if not html:
+def _find_record_pe(record: dict) -> float:
+    """兼容 TWSE / TPEx OpenAPI 本益比欄位名稱。"""
+    if not isinstance(record, dict):
         return np.nan
-    soup = BeautifulSoup(html, "html.parser")
-    lines = [re.sub(r"\s+", " ", x.replace("\xa0", " ")).strip()
-             for x in soup.get_text("\n", strip=True).split("\n")]
-    lines = [x for x in lines if x]
 
-    # 先找「詳細資料」後的第一筆週/月/季資料，避免抓到頁首摘要中的其他數字。
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if "本益比(PER)河流" in line and "詳細資料" in line:
-            start_idx = i
-            break
+    preferred_keys = []
+    for k in record.keys():
+        key = str(k).strip()
+        low = key.lower()
+        if key == "本益比" or low in ["per", "peratio", "peratio", "pe", "peratio"]:
+            preferred_keys.append(k)
+        elif "本益比" in key or "pe" == low or "per" == low or "peratio" in low or "p/e" in low:
+            preferred_keys.append(k)
 
-    period_pat = re.compile(r"^(\d{2}(?:W\d{1,2}|Q\d|M\d{1,2}|Y\d{2}))\s*(.*)$", re.I)
-    for line in lines[start_idx:start_idx + 160]:
-        m = period_pat.match(line)
-        if not m:
-            continue
-        rest = m.group(2)
-        nums = re.findall(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", rest)
-        vals = [_to_float_or_nan(x) for x in nums]
-        vals = [float(x) for x in vals if pd.notna(x)]
-        # 通常順序：收盤、漲跌價、漲跌幅、近四季EPS、目前PER。
-        if len(vals) >= 5:
-            pe = vals[4]
-            if 0 < pe < 500:
-                return round(float(pe), 2)
-        elif len(vals) >= 2:
-            pe = vals[-1]
-            if 0 < pe < 500:
-                return round(float(pe), 2)
+    for k in preferred_keys:
+        pe = _clean_pe_value(record.get(k))
+        if pd.notna(pe):
+            return round(float(pe), 2)
     return np.nan
+
+
+def _merge_pe_records(items: dict, rows, source_name: str = "") -> int:
+    """把 list[dict] 形式資料合併進 items。"""
+    count = 0
+    if not isinstance(rows, list):
+        return count
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        code = _find_record_code(rec)
+        pe = _find_record_pe(rec)
+        if code and pd.notna(pe):
+            items[code] = round(float(pe), 2)
+            count += 1
+    return count
+
+
+def _fetch_json(url: str, timeout: int = 8):
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=timeout, verify=False)
+        if r.status_code != 200 or not r.content:
+            return None
+        # 官方 API 多為 UTF-8，但保留容錯。
+        try:
+            return r.json()
+        except Exception:
+            txt = r.content.decode(r.apparent_encoding or "utf-8", errors="ignore")
+            return json.loads(txt)
+    except Exception:
+        return None
+
+
+def _load_twse_pe(items: dict) -> int:
+    """上市本益比：優先用 TWSE OpenAPI；失敗再用依日期查詢 API 回補。"""
+    before = len(items)
+
+    # 1) TWSE OpenAPI：通常直接回傳最新交易日全上市個股本益比。
+    data = _fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d", timeout=8)
+    if isinstance(data, list):
+        _merge_pe_records(items, data, "TWSE OpenAPI")
+
+    if len(items) > before:
+        return len(items) - before
+
+    # 2) 備援：TWSE 舊式 JSON，需指定日期；往前找最近 14 天，避開假日與尚未收盤更新。
+    now = get_tw_now()
+    for d in range(0, 14):
+        query_date = (now - timedelta(days=d)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/exchangeReport/BWIBBU_d?response=json&date={query_date}&selectType=ALL"
+        payload = _fetch_json(url, timeout=8)
+        if not isinstance(payload, dict):
+            continue
+        fields = payload.get("fields") or []
+        data_rows = payload.get("data") or []
+        if not fields or not data_rows:
+            continue
+        rows = []
+        for row in data_rows:
+            if isinstance(row, list):
+                rows.append({str(fields[i]): row[i] for i in range(min(len(fields), len(row)))})
+        _merge_pe_records(items, rows, "TWSE date API")
+        if len(items) > before:
+            return len(items) - before
+    return 0
+
+
+def _load_tpex_pe(items: dict) -> int:
+    """上櫃本益比：使用 TPEx OpenAPI。"""
+    before = len(items)
+
+    candidate_urls = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis?response=json",
+    ]
+    for url in candidate_urls:
+        data = _fetch_json(url, timeout=8)
+        if isinstance(data, list):
+            _merge_pe_records(items, data, "TPEx OpenAPI")
+        elif isinstance(data, dict):
+            for key in ["data", "Data", "aaData", "tables"]:
+                if isinstance(data.get(key), list):
+                    _merge_pe_records(items, data.get(key), "TPEx OpenAPI")
+        if len(items) > before:
+            return len(items) - before
+    return 0
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def load_official_pe_map(force_refresh: bool = False) -> dict:
+    """
+    一次載入上市 + 上櫃本益比對照表。
+    掃描期間每支股票只查 dict，不再逐檔 HTTP request，因此速度會比 Goodinfo 快非常多。
+    """
+    if not force_refresh:
+        with PE_CACHE_LOCK:
+            cache = _load_pe_disk_cache()
+        if cache.get("date") == _pe_cache_today_key() and isinstance(cache.get("items"), dict) and cache["items"]:
+            return {str(k): _clean_pe_value(v) for k, v in cache["items"].items()}
+
+    items = {}
+    _load_twse_pe(items)
+    _load_tpex_pe(items)
+
+    # 若今日 API 因網路或交易所更新時間問題失敗，使用舊快取避免整欄 PE 變 None。
+    if not items:
+        with PE_CACHE_LOCK:
+            old_cache = _load_pe_disk_cache()
+        old_items = old_cache.get("items", {}) if isinstance(old_cache, dict) else {}
+        if isinstance(old_items, dict) and old_items:
+            return {str(k): _clean_pe_value(v) for k, v in old_items.items()}
+
+    with PE_CACHE_LOCK:
+        _save_pe_disk_cache(items, source="TWSE_TPEx_OfficialAPI")
+    return {str(k): _clean_pe_value(v) for k, v in items.items()}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pe(ticker: str) -> float:
     """
-    高速穩定版 Goodinfo PER 擷取。
+    本益比來源改為官方批次資料：
+    - 上市：TWSE BWIBBU_d
+    - 上櫃：TPEx tpex_mainboard_peratio_analysis
 
-    抓取順序：
-    1. 今日本機快取。
-    2. Goodinfo StockDetail 個股概況頁的 PBR / PER / PEG。
-    3. Goodinfo ShowK_ChartFlow 本益比(PER)河流圖，目前 PER。
-    4. Goodinfo 舊快取。
-
-    注意：不混用 yfinance / Yahoo PE，避免來源不同造成數字對不起來。
+    不再逐檔爬 Goodinfo，速度快且穩定。若官方值為 '-' 或尚未揭露，才顯示空值。
     """
     code = ticker.split('.')[0]
+    pe_map = load_official_pe_map(False)
+    pe = _clean_pe_value(pe_map.get(code))
+    if pd.notna(pe):
+        return round(float(pe), 2)
 
-    cached = _get_cached_pe(code, allow_stale=False)
-    if pd.notna(cached):
-        return cached
-
-    detail_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
-    flow_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?CHT_CAT=WEEK&RPT_CAT=PER&STOCK_ID={code}"
-
-    # 路徑 1：個股概況頁，最符合你指定的 PER 欄位。
-    html = _fetch_goodinfo_html(detail_url, timeout=8)
-    pe = _extract_pe_from_goodinfo_html(html)
-    if pd.notna(pe) and pe > 0:
-        pe = round(float(pe), 2)
-        _set_cached_pe(code, pe, source="goodinfo_StockDetail_PER")
-        return pe
-
-    # 路徑 2：同為 Goodinfo 的 PER 河流圖頁。當 StockDetail 被簡化或拆表時，用這個頁面的目前 PER 補值。
-    html = _fetch_goodinfo_html(flow_url, referer=detail_url, timeout=8)
-    pe = _extract_pe_from_goodinfo_flow_html(html)
-    if pd.notna(pe) and pe > 0:
-        pe = round(float(pe), 2)
-        _set_cached_pe(code, pe, source="goodinfo_PER_Flow")
-        return pe
-
-    # Goodinfo 偶發慢或擋流量時，使用舊快取維持畫面速度。
-    stale = _get_cached_pe(code, allow_stale=True)
-    if pd.notna(stale):
-        return stale
-
+    # 最後備援：若官方 API 暫時無此代號，讀舊快取；仍不逐檔爬頁。
+    with PE_CACHE_LOCK:
+        old_cache = _load_pe_disk_cache()
+    old_items = old_cache.get("items", {}) if isinstance(old_cache, dict) else {}
+    pe = _clean_pe_value(old_items.get(code))
+    if pd.notna(pe):
+        return round(float(pe), 2)
     return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
@@ -1438,7 +1460,8 @@ if st.session_state.is_scanning:
     bar.progress(0.80)
 
     if initial_hits:
-        status.text(f"📈 找到 {len(initial_hits)} 支！高速抓取財報 / Goodinfo PER 中...")
+        status.text(f"📈 找到 {len(initial_hits)} 支！載入官方本益比快取與營收資料中...")
+        load_official_pe_map(False)
         final_list = []
         with ThreadPoolExecutor(max_workers=6) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
