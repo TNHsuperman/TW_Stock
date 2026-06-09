@@ -12,6 +12,8 @@ import re
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit.components.v1 as components
+import uuid
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -865,6 +867,99 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     )
     return fig
 
+
+def render_kline_chart_with_axis_price(fig, height=640):
+    """用 HTML 方式渲染 Plotly，額外加入 TradingView 類似的游標價位標籤。
+
+    Plotly 原生 spikeline 可以畫水平線，但不會在右側價格軸產生動態價位標籤；
+    這裡用一層輕量 JS 讀取游標位置並換算 Y 軸價格，顯示在圖表右側。
+    """
+    div_id = f"kline_{uuid.uuid4().hex}"
+    wrap_id = f"wrap_{uuid.uuid4().hex}"
+    line_id = f"hline_{uuid.uuid4().hex}"
+    label_id = f"ylabel_{uuid.uuid4().hex}"
+
+    fig.update_layout(height=height, autosize=True)
+    plot_html = fig.to_html(
+        full_html=False,
+        include_plotlyjs=True,
+        div_id=div_id,
+        config={
+            "displayModeBar": False,
+            "scrollZoom": False,
+            "doubleClick": False,
+            "showTips": False,
+            "responsive": True,
+        },
+    )
+
+    html = f"""
+    <div id="{wrap_id}" style="position:relative;width:100%;height:{height}px;background:#0b121b;overflow:hidden;">
+      {plot_html}
+      <div id="{line_id}" style="display:none;position:absolute;height:0;border-top:1px dashed rgba(203,213,225,.88);pointer-events:none;z-index:9998;"></div>
+      <div id="{label_id}" style="display:none;position:absolute;min-width:58px;padding:3px 8px;border-radius:4px;background:#2563eb;color:#ffffff;font-family:Roboto Mono,Consolas,monospace;font-size:12px;font-weight:700;text-align:center;line-height:18px;box-shadow:0 0 0 1px rgba(191,219,254,.45),0 6px 18px rgba(0,0,0,.35);pointer-events:none;z-index:9999;"></div>
+    </div>
+    <script>
+    (function() {{
+      const gd = document.getElementById("{div_id}");
+      const wrap = document.getElementById("{wrap_id}");
+      const hline = document.getElementById("{line_id}");
+      const ylabel = document.getElementById("{label_id}");
+
+      function formatPrice(v) {{
+        if (!isFinite(v)) return "";
+        const abs = Math.abs(v);
+        const digits = abs >= 1000 ? 0 : abs >= 100 ? 1 : 2;
+        return v.toLocaleString(undefined, {{ minimumFractionDigits: digits, maximumFractionDigits: digits }});
+      }}
+
+      function hideGuide() {{
+        hline.style.display = "none";
+        ylabel.style.display = "none";
+      }}
+
+      function updateGuide(ev) {{
+        if (!gd || !gd._fullLayout || !gd._fullLayout.yaxis) return;
+        const dragLayer = gd.querySelector('.nsewdrag');
+        if (!dragLayer) return;
+
+        const plotRect = dragLayer.getBoundingClientRect();
+        const wrapRect = wrap.getBoundingClientRect();
+        if (ev.clientX < plotRect.left || ev.clientX > plotRect.right || ev.clientY < plotRect.top || ev.clientY > plotRect.bottom) {{
+          hideGuide();
+          return;
+        }}
+
+        const yAxis = gd._fullLayout.yaxis;
+        const py = ev.clientY - plotRect.top;
+        const price = yAxis.p2l(py);
+        const top = plotRect.top - wrapRect.top + py;
+        const left = plotRect.left - wrapRect.left;
+        const right = plotRect.right - wrapRect.left;
+
+        hline.style.display = "block";
+        hline.style.left = left + "px";
+        hline.style.top = top + "px";
+        hline.style.width = (plotRect.right - plotRect.left) + "px";
+
+        ylabel.textContent = formatPrice(price);
+        ylabel.style.display = "block";
+        ylabel.style.top = (top - 12) + "px";
+        ylabel.style.left = Math.min(right + 6, wrapRect.width - 72) + "px";
+      }}
+
+      function bind() {{
+        if (!gd || !gd._fullLayout) {{ setTimeout(bind, 150); return; }}
+        gd.addEventListener('mousemove', updateGuide);
+        gd.addEventListener('mouseleave', hideGuide);
+        window.addEventListener('resize', hideGuide);
+      }}
+      bind();
+    }})();
+    </script>
+    """
+    components.html(html, height=height + 8, scrolling=False)
+
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
 def get_tw_stock_news(code):
@@ -1356,12 +1451,8 @@ if not st.session_state.scan_results.empty:
             chart_mode='K線圖', chart_period='日'
         )
         if k_fig:
-            st.plotly_chart(k_fig, use_container_width=True, config={
-                "displayModeBar": False,
-                "scrollZoom": False,
-                "doubleClick": False,
-                "showTips": False,
-            })
+            # 使用自訂 HTML 渲染，讓滑鼠水平準線右側可顯示即時對應股價。
+            render_kline_chart_with_axis_price(k_fig, height=640)
 
             # 預載前後兩檔，點擊上一支 / 下一支時多數情況可直接從快取取圖，不再顯示 Running get_kline_data。
             try:
