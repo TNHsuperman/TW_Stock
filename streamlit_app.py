@@ -69,31 +69,156 @@ def get_tw_now():
 # 2. 數據抓取
 # ============================================================
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_market_list():
-    stocks = []
-    try:
-        session = requests.Session()
-        session.verify = False
-        adapter = requests.adapters.HTTPAdapter(max_retries=2)
-        session.mount('https://', adapter)
+    """快速載入台股清單。
 
-        urls = [('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', "TW"),
-                ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', "TWO")]
-        for url, mkt in urls:
-            r = session.get(url, headers=get_headers(), timeout=8)
+    舊版卡在 get_stock_market_list() 的主因通常是 isin.twse.com.tw + pd.read_html
+    解析整頁 HTML 太慢或連線被拖住。這版改成：
+    1) 先讀本機每日快取，幾乎秒開。
+    2) 再抓 TWSE / TPEx OpenAPI JSON，避免 read_html 大表格解析。
+    3) OpenAPI 失敗時才用舊 ISIN HTML 備援，且 timeout 較短。
+    """
+    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache.json')
+    today = get_tw_now().strftime('%Y-%m-%d')
+
+    def load_local_cache(allow_stale=False):
+        try:
+            if not os.path.exists(cache_file):
+                return []
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if allow_stale or payload.get('date') == today:
+                data = payload.get('data', [])
+                if isinstance(data, list) and len(data) > 100:
+                    return data
+        except Exception:
+            pass
+        return []
+
+    def save_local_cache(data):
+        try:
+            if data and len(data) > 100:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump({'date': today, 'data': data}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    cached = load_local_cache(allow_stale=False)
+    if cached:
+        return cached
+
+    session = requests.Session()
+    session.verify = False
+    adapter = requests.adapters.HTTPAdapter(max_retries=0, pool_connections=20, pool_maxsize=20)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+    def pick(row, names, default=''):
+        for n in names:
+            if n in row and row.get(n) not in [None, '', 'null', 'None']:
+                return str(row.get(n)).strip()
+        return default
+
+    def clean_code(code):
+        m = re.search(r'\d{4}', str(code))
+        return m.group(0) if m else ''
+
+    def parse_openapi_rows(rows, market_suffix, market_type):
+        out = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            code = clean_code(pick(row, ['Code', '證券代號', '公司代號', '有價證券代號', 'SecuritiesCompanyCode', '股票代號']))
+            name = pick(row, ['Name', '證券名稱', '公司簡稱', '公司名稱', '有價證券名稱', 'CompanyName', '股票名稱'])
+            industry = pick(row, ['產業別', '產業類別', 'Industry', 'industry'], '未分類')
+            if len(code) == 4 and code.isdigit() and name:
+                out.append({
+                    'ticker': f'{code}.{market_suffix}',
+                    'name': name.replace(' ', ''),
+                    'industry': industry or '未分類',
+                    'code': code,
+                    '市場別': market_type,
+                })
+        return out
+
+    stocks = []
+
+    # 先用 OpenAPI JSON，速度遠快於 ISIN HTML。
+    openapi_sources = [
+        # 上市：公司基本資料，有產業別。
+        ('https://openapi.twse.com.tw/v1/opendata/t187ap03_L', 'TW', '上市'),
+        # 上櫃：公司基本資料，有產業別。
+        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O', 'TWO', '上櫃'),
+        # 備援：上市每日行情，通常一定有代碼名稱，但可能沒有產業別。
+        ('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', 'TW', '上市'),
+        # 備援：上櫃每日行情。
+        ('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes', 'TWO', '上櫃'),
+    ]
+
+    seen = set()
+    for url, suffix, market_type in openapi_sources:
+        try:
+            r = session.get(url, headers=get_headers(), timeout=(2.5, 5))
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            rows = r.json()
+            parsed = parse_openapi_rows(rows, suffix, market_type)
+            for s in parsed:
+                key = s['ticker']
+                # 若基本資料已經有產業別，不要被每日行情的未分類覆蓋。
+                if key not in seen:
+                    stocks.append(s)
+                    seen.add(key)
+            if len(stocks) >= 1200:
+                # 已足夠涵蓋上市櫃，多半不用再跑慢速備援。
+                pass
+        except Exception:
+            continue
+
+    if len(stocks) > 500:
+        stocks = sorted(stocks, key=lambda x: x['code'])
+        save_local_cache(stocks)
+        return stocks
+
+    # OpenAPI 失敗才走舊 ISIN 備援；限制 timeout，避免卡太久。
+    try:
+        urls = [
+            ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=2', 'TW', '上市'),
+            ('https://isin.twse.com.tw/isin/C_public.jsp?strMode=4', 'TWO', '上櫃'),
+        ]
+        for url, mkt, market_type in urls:
+            r = session.get(url, headers=get_headers(), timeout=(2.5, 6))
+            if r.status_code != 200 or not r.text.strip():
+                continue
             df_isin = pd.read_html(StringIO(r.text))[0]
             df_isin.columns = df_isin.iloc[0]
             for _, row in df_isin.iloc[1:].iterrows():
-                val = str(row['有價證券代號及名稱'])
+                val = str(row.get('有價證券代號及名稱', ''))
                 if '　' in val:
-                    code, name = val.split('　')
+                    code, name = val.split('　', 1)
                     if len(code) == 4 and code.isdigit():
-                        market_type = "上市" if mkt == "TW" else "上櫃" if mkt == "TWO" else "興櫃"
-                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code, "市場別": market_type})
-    except:
+                        key = f'{code}.{mkt}'
+                        if key in seen:
+                            continue
+                        stocks.append({
+                            'ticker': key,
+                            'name': str(name).strip(),
+                            'industry': str(row.get('產業別', '未分類')).strip() or '未分類',
+                            'code': code,
+                            '市場別': market_type,
+                        })
+                        seen.add(key)
+    except Exception:
         pass
-    return stocks
+
+    if len(stocks) > 100:
+        stocks = sorted(stocks, key=lambda x: x['code'])
+        save_local_cache(stocks)
+        return stocks
+
+    # 最後保底：回傳舊快取，即使不是今天，也比直接卡住或空白好。
+    return load_local_cache(allow_stale=True)
 
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
