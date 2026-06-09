@@ -831,7 +831,11 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
         font=dict(color='#9aa7b8', size=11, family='Inter, Noto Sans TC, sans-serif'),
         # 右側預留空間，避免價格刻度文字被截斷。
         margin=dict(l=10, r=74, t=18, b=12),
-        hovermode='x unified',
+        # 使用 closest + x/y spikelines，讓滑鼠移到圖上時有近似 TradingView 的十字準線。
+        # Y 軸 spikeline 會顯示水平價位線，右側價格軸會對應目前游標附近價位。
+        hovermode='closest',
+        hoverdistance=80,
+        spikedistance=-1,
         hoverlabel=dict(
             bgcolor='#111a26', bordercolor='rgba(59,130,246,0.45)',
             font=dict(size=12, color='#e6edf3', family='Roboto Mono, monospace'),
@@ -847,7 +851,11 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
         xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickmode='array', tickvals=tick_vals, ticktext=tick_text, tickangle=0, tickfont=dict(size=11), automargin=True),
         yaxis=dict(
             fixedrange=True, side='right', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
-            zeroline=False, tickfont=dict(size=11, color='#cbd5e1'), showspikes=False,
+            zeroline=False, tickfont=dict(size=11, color='#cbd5e1'),
+            # 水平準線：滑鼠移到 K 線圖上時，顯示對應價位的水平線。
+            showspikes=True, spikemode='across+toaxis', spikesnap='cursor',
+            spikecolor='rgba(148,163,184,0.82)', spikethickness=1, spikedash='dot',
+            hoverformat='.2f',
             automargin=True, ticks='outside', ticklabelposition='outside right', separatethousands=True,
         ),
         yaxis2=dict(
