@@ -353,7 +353,7 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 # 優點：速度快、穩定、不容易被擋；掃描時只要抓上市 + 上櫃兩包資料。
 PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "official_pe_cache.json")
 PE_CACHE_LOCK = threading.Lock()
-PE_CACHE_VERSION = "20260609_twse_tpex_official_pe_v1"
+PE_CACHE_VERSION = "20260609_official_tpex_oldapi_yahoo_fallback_v2"
 
 
 def _pe_cache_today_key() -> str:
@@ -516,9 +516,17 @@ def _load_twse_pe(items: dict) -> int:
 
 
 def _load_tpex_pe(items: dict) -> int:
-    """上櫃本益比：使用 TPEx OpenAPI。"""
+    """
+    上櫃本益比：先用 TPEx OpenAPI；若特定股票缺值，再用櫃買舊版 peratio_analysis 批次 JSON 回補。
+
+    3324 雙鴻這類上櫃股票有時在 openapi/v1/tpex_mainboard_peratio_analysis
+    欄位結構或資料更新時間不穩，容易合併不到本益比。舊版 pera_result.php
+    是櫃買網站「個股本益比、殖利率、股價淨值比」頁面使用的批次資料，
+    一次可抓整個上櫃市場，速度仍比逐檔爬 Goodinfo 快很多。
+    """
     before = len(items)
 
+    # 1) 新版 TPEx OpenAPI。
     candidate_urls = [
         "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
         "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis?response=json",
@@ -531,9 +539,38 @@ def _load_tpex_pe(items: dict) -> int:
             for key in ["data", "Data", "aaData", "tables"]:
                 if isinstance(data.get(key), list):
                     _merge_pe_records(items, data.get(key), "TPEx OpenAPI")
-        if len(items) > before:
-            return len(items) - before
-    return 0
+
+    # 2) 舊版櫃買批次 JSON 回補。這個來源對 3324 雙鴻較穩。
+    now = get_tw_now()
+    for d in range(0, 14):
+        dt = now - timedelta(days=d)
+        roc_date = f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
+        urls = [
+            f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?l=zh-tw&o=json&d={roc_date}&c=&s=0,asc",
+            f"https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?l=zh-tw&d={roc_date}&c=&s=0,asc",
+        ]
+        for url in urls:
+            payload = _fetch_json(url, timeout=8)
+            if not isinstance(payload, dict):
+                continue
+            rows = payload.get("aaData") or payload.get("data") or payload.get("Data") or []
+            if not isinstance(rows, list) or not rows:
+                continue
+
+            parsed_rows = []
+            for row in rows:
+                # 常見格式：股票代號, 公司名稱, 本益比, 每股股利, 股利年度, 殖利率, 股價淨值比, 財報年/季
+                if isinstance(row, list) and len(row) >= 3:
+                    parsed_rows.append({"股票代號": row[0], "本益比": row[2]})
+                elif isinstance(row, dict):
+                    parsed_rows.append(row)
+            _merge_pe_records(items, parsed_rows, "TPEx old pera_result")
+
+            # 只要該日期有抓到一批資料，就不用再往前找。
+            if len(parsed_rows) >= 100:
+                return len(items) - before
+
+    return len(items) - before
 
 
 @st.cache_data(ttl=43200, show_spinner=False)
@@ -565,28 +602,85 @@ def load_official_pe_map(force_refresh: bool = False) -> dict:
     return {str(k): _clean_pe_value(v) for k, v in items.items()}
 
 
+def _extract_twstock_yahoo_pe_from_html(html: str) -> float:
+    """從 Yahoo 台股頁面解析本益比。只作為官方資料缺值時的單檔備援。"""
+    if not html:
+        return np.nan
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    patterns = [
+        # 例：32.03 (84.33)本益比
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:\([^)]*\))?\s*本益比",
+        # 例：本益比 32.03
+        r"本益比\s*(?:\([^)]*\))?\s*([0-9]+(?:\.[0-9]+)?)",
+        # 例：PE Ratio 32.03
+        r"PE\s*(?:Ratio)?\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            pe = _clean_pe_value(m.group(1))
+            if pd.notna(pe):
+                return round(float(pe), 2)
+    return np.nan
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_yahoo_tw_pe(code: str, market_suffix: str) -> float:
+    """
+    官方批次資料缺值時的快速單檔備援。
+    Yahoo 台股頁面會顯示本益比，例如 3324.TWO 頁面可讀到「本益比」。
+    只在官方 map 找不到時才呼叫，因此不會拖慢整體掃描。
+    """
+    ticker = f"{code}.{market_suffix}"
+    urls = [
+        f"https://tw.stock.yahoo.com/quote/{ticker}",
+        f"https://tw.stock.yahoo.com/quote/{ticker}/profile",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
+            if r.status_code != 200 or not r.text:
+                continue
+            pe = _extract_twstock_yahoo_pe_from_html(r.text)
+            if pd.notna(pe):
+                return round(float(pe), 2)
+        except Exception:
+            continue
+    return np.nan
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pe(ticker: str) -> float:
     """
-    本益比來源改為官方批次資料：
-    - 上市：TWSE BWIBBU_d
-    - 上櫃：TPEx tpex_mainboard_peratio_analysis
+    本益比取得順序：
+    1. 官方批次資料：TWSE / TPEx，一次抓整包，速度最快。
+    2. 舊快取：避免官方 API 當下失敗造成整欄空值。
+    3. Yahoo 台股單檔備援：只針對官方缺值的少數股票補值，例如 3324 雙鴻。
 
-    不再逐檔爬 Goodinfo，速度快且穩定。若官方值為 '-' 或尚未揭露，才顯示空值。
+    這樣可以保留批次速度，又能解決部分上櫃股 PE 缺值。
     """
     code = ticker.split('.')[0]
+    market_suffix = "TW" if ticker.endswith(".TW") else "TWO"
+
     pe_map = load_official_pe_map(False)
     pe = _clean_pe_value(pe_map.get(code))
     if pd.notna(pe):
         return round(float(pe), 2)
 
-    # 最後備援：若官方 API 暫時無此代號，讀舊快取；仍不逐檔爬頁。
     with PE_CACHE_LOCK:
         old_cache = _load_pe_disk_cache()
     old_items = old_cache.get("items", {}) if isinstance(old_cache, dict) else {}
     pe = _clean_pe_value(old_items.get(code))
     if pd.notna(pe):
         return round(float(pe), 2)
+
+    # 官方缺值時才抓 Yahoo，避免每檔都逐頁爬造成變慢。
+    pe = fetch_yahoo_tw_pe(code, market_suffix)
+    if pd.notna(pe):
+        return round(float(pe), 2)
+
     return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
