@@ -351,7 +351,8 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 # ── Goodinfo PER 快取與高速擷取 ───────────────────────────────
 PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "goodinfo_per_cache.json")
 PE_CACHE_LOCK = threading.Lock()
-PE_CACHE_VERSION = "20260609_fast_goodinfo_per_v1"
+PE_CACHE_VERSION = "20260609_goodinfo_per_detail_flow_v2"
+GOODINFO_THREAD_LOCAL = threading.local()
 
 
 def _today_key() -> str:
@@ -397,7 +398,7 @@ def _get_cached_pe(code: str, allow_stale: bool = False) -> float:
     return np.nan
 
 
-def _set_cached_pe(code: str, pe: float) -> None:
+def _set_cached_pe(code: str, pe: float, source: str = "goodinfo") -> None:
     pe = _to_float_or_nan(pe)
     if pd.isna(pe) or pe <= 0:
         return
@@ -406,23 +407,133 @@ def _set_cached_pe(code: str, pe: float) -> None:
         cache.setdefault("items", {})[str(code)] = {
             "pe": round(float(pe), 2),
             "date": _today_key(),
-            "source": "goodinfo_PER",
+            "source": source,
             "updated_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         _save_pe_disk_cache(cache)
 
 
+def _get_goodinfo_session() -> requests.Session:
+    """
+    每個 thread 重用一個 Session。
+    這比每支股票都重建連線、重打 Goodinfo 首頁快很多，也比較不容易被擋。
+    """
+    sess = getattr(GOODINFO_THREAD_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.verify = False
+        sess.headers.update({
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            # 不要求 br，避免部分環境 brotli 解壓或編碼判斷異常。
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "max-age=0",
+        })
+        sess.cookies.update({
+            "IS_TOUCH_DEVICE": "F",
+            "SCREEN_SIZE": "WIDTH=1920&HEIGHT=1080",
+        })
+        GOODINFO_THREAD_LOCAL.session = sess
+    return sess
+
+
+def _decode_goodinfo_response(resp: requests.Response) -> str:
+    """Goodinfo 常見 cp950/big5；用多種編碼嘗試，保留 ASCII 欄位 PER/PBR/PEG。"""
+    content = resp.content or b""
+    encodings = [resp.encoding, resp.apparent_encoding, "cp950", "big5", "utf-8"]
+    seen = set()
+    for enc in encodings:
+        if not enc or enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            html = content.decode(enc, errors="ignore")
+            if "PER" in html or "個股概況" in html or "本益比" in html or "成交價" in html:
+                return html
+        except Exception:
+            pass
+    return resp.text or content.decode("cp950", errors="ignore")
+
+
+def _fetch_goodinfo_html(url: str, referer: str = "https://goodinfo.tw/tw/index.asp", timeout: int = 8) -> str:
+    sess = _get_goodinfo_session()
+    headers = {"Referer": referer}
+    try:
+        resp = sess.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            html = _decode_goodinfo_response(resp)
+            # 被擋或回簡化頁時，通常沒有 PER/PBR/PEG 與個股資料。
+            if "PER" in html or "PBR" in html or "本益比" in html:
+                return html
+    except Exception:
+        pass
+
+    # 只在第一次失敗時補一次首頁 cookie，不再每支股票都先打首頁。
+    try:
+        sess.get("https://goodinfo.tw/tw/index.asp", timeout=5)
+        resp = sess.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            return _decode_goodinfo_response(resp)
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_pe_from_goodinfo_flow_html(html: str) -> float:
+    """
+    從 Goodinfo 本益比(PER)河流圖頁抓目前 PER。
+    例：26W24 1110 0 0% 34.94 31.77 → 最後一個數字 31.77 即目前 PER。
+    """
+    if not html:
+        return np.nan
+    soup = BeautifulSoup(html, "html.parser")
+    lines = [re.sub(r"\s+", " ", x.replace("\xa0", " ")).strip()
+             for x in soup.get_text("\n", strip=True).split("\n")]
+    lines = [x for x in lines if x]
+
+    # 先找「詳細資料」後的第一筆週/月/季資料，避免抓到頁首摘要中的其他數字。
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if "本益比(PER)河流" in line and "詳細資料" in line:
+            start_idx = i
+            break
+
+    period_pat = re.compile(r"^(\d{2}(?:W\d{1,2}|Q\d|M\d{1,2}|Y\d{2}))\s*(.*)$", re.I)
+    for line in lines[start_idx:start_idx + 160]:
+        m = period_pat.match(line)
+        if not m:
+            continue
+        rest = m.group(2)
+        nums = re.findall(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", rest)
+        vals = [_to_float_or_nan(x) for x in nums]
+        vals = [float(x) for x in vals if pd.notna(x)]
+        # 通常順序：收盤、漲跌價、漲跌幅、近四季EPS、目前PER。
+        if len(vals) >= 5:
+            pe = vals[4]
+            if 0 < pe < 500:
+                return round(float(pe), 2)
+        elif len(vals) >= 2:
+            pe = vals[-1]
+            if 0 < pe < 500:
+                return round(float(pe), 2)
+    return np.nan
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pe(ticker: str) -> float:
     """
-    高速版 Goodinfo PER 擷取。
+    高速穩定版 Goodinfo PER 擷取。
 
-    改善重點：
-    - 不再每支股票都先打 Goodinfo 首頁建立 cookie。
-    - 不再每支股票重試 3 次、20 秒 timeout。
-    - 優先讀取本機每日快取；同一天已抓過直接回傳。
-    - 若 Goodinfo 暫時擋請求或逾時，回傳舊快取，避免整個掃描卡住。
-    - 仍只使用 Goodinfo StockDetail 頁面的 PER 欄位，不混用 yfinance / Yahoo PE。
+    抓取順序：
+    1. 今日本機快取。
+    2. Goodinfo StockDetail 個股概況頁的 PBR / PER / PEG。
+    3. Goodinfo ShowK_ChartFlow 本益比(PER)河流圖，目前 PER。
+    4. Goodinfo 舊快取。
+
+    注意：不混用 yfinance / Yahoo PE，避免來源不同造成數字對不起來。
     """
     code = ticker.split('.')[0]
 
@@ -430,60 +541,26 @@ def fetch_pe(ticker: str) -> float:
     if pd.notna(cached):
         return cached
 
-    goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://goodinfo.tw/tw/index.asp",
-        "Host": "goodinfo.tw",
-        "Connection": "close",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-    }
-    cookies = {
-        "IS_TOUCH_DEVICE": "F",
-        "SCREEN_SIZE": "WIDTH=1920&HEIGHT=1080",
-    }
+    detail_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
+    flow_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?CHT_CAT=WEEK&RPT_CAT=PER&STOCK_ID={code}"
 
-    # 只做短 timeout 快速嘗試。第一次掃描大量股票時，速度比首頁+3次重試快非常多。
-    for timeout_sec in (5, 8):
-        try:
-            resp = requests.get(
-                goodinfo_url,
-                headers=headers,
-                cookies=cookies,
-                timeout=timeout_sec,
-                verify=False,
-            )
-            if resp.status_code != 200 or not resp.content:
-                continue
+    # 路徑 1：個股概況頁，最符合你指定的 PER 欄位。
+    html = _fetch_goodinfo_html(detail_url, timeout=8)
+    pe = _extract_pe_from_goodinfo_html(html)
+    if pd.notna(pe) and pe > 0:
+        pe = round(float(pe), 2)
+        _set_cached_pe(code, pe, source="goodinfo_StockDetail_PER")
+        return pe
 
-            html = None
-            # Goodinfo 常見為 Big5/cp950，但有時 requests 會誤判，手動依序解碼。
-            for enc in ("utf-8", "cp950", "big5", resp.apparent_encoding):
-                if not enc:
-                    continue
-                try:
-                    candidate = resp.content.decode(enc, errors="ignore")
-                    if "PER" in candidate or "個股概況" in candidate or "成交價" in candidate:
-                        html = candidate
-                        break
-                except Exception:
-                    pass
-            if html is None:
-                html = resp.text
+    # 路徑 2：同為 Goodinfo 的 PER 河流圖頁。當 StockDetail 被簡化或拆表時，用這個頁面的目前 PER 補值。
+    html = _fetch_goodinfo_html(flow_url, referer=detail_url, timeout=8)
+    pe = _extract_pe_from_goodinfo_flow_html(html)
+    if pd.notna(pe) and pe > 0:
+        pe = round(float(pe), 2)
+        _set_cached_pe(code, pe, source="goodinfo_PER_Flow")
+        return pe
 
-            pe = _extract_pe_from_goodinfo_html(html)
-            if pd.notna(pe) and pe > 0:
-                pe = round(float(pe), 2)
-                _set_cached_pe(code, pe)
-                return pe
-        except Exception:
-            pass
-
-    # Goodinfo 偶發慢或擋流量時，不要拖慢整個掃描；用舊快取維持畫面速度。
+    # Goodinfo 偶發慢或擋流量時，使用舊快取維持畫面速度。
     stale = _get_cached_pe(code, allow_stale=True)
     if pd.notna(stale):
         return stale
@@ -1363,7 +1440,7 @@ if st.session_state.is_scanning:
     if initial_hits:
         status.text(f"📈 找到 {len(initial_hits)} 支！高速抓取財報 / Goodinfo PER 中...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 bar.progress(0.80 + 0.19 * j / len(initial_hits))
