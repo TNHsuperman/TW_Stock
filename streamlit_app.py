@@ -15,6 +15,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit.components.v1 as components
 import uuid
+import os
+import json
+import threading
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -344,56 +347,122 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
     return np.nan
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+
+# ── Goodinfo PER 快取與高速擷取 ───────────────────────────────
+PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "goodinfo_per_cache.json")
+PE_CACHE_LOCK = threading.Lock()
+PE_CACHE_VERSION = "20260609_fast_goodinfo_per_v1"
+
+
+def _today_key() -> str:
+    return get_tw_now().strftime("%Y-%m-%d")
+
+
+def _load_pe_disk_cache() -> dict:
+    try:
+        if os.path.exists(PE_CACHE_FILE):
+            with open(PE_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("version") == PE_CACHE_VERSION:
+                return data
+    except Exception:
+        pass
+    return {"version": PE_CACHE_VERSION, "items": {}}
+
+
+def _save_pe_disk_cache(cache: dict) -> None:
+    try:
+        tmp = PE_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, PE_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _get_cached_pe(code: str, allow_stale: bool = False) -> float:
+    """先讀本機快取；今天資料直接用，網路失敗時允許用舊資料。"""
+    with PE_CACHE_LOCK:
+        cache = _load_pe_disk_cache()
+        item = cache.get("items", {}).get(str(code))
+    if not isinstance(item, dict):
+        return np.nan
+
+    pe = _to_float_or_nan(item.get("pe"))
+    if pd.isna(pe) or pe <= 0:
+        return np.nan
+
+    if item.get("date") == _today_key() or allow_stale:
+        return round(float(pe), 2)
+    return np.nan
+
+
+def _set_cached_pe(code: str, pe: float) -> None:
+    pe = _to_float_or_nan(pe)
+    if pd.isna(pe) or pe <= 0:
+        return
+    with PE_CACHE_LOCK:
+        cache = _load_pe_disk_cache()
+        cache.setdefault("items", {})[str(code)] = {
+            "pe": round(float(pe), 2),
+            "date": _today_key(),
+            "source": "goodinfo_PER",
+            "updated_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _save_pe_disk_cache(cache)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pe(ticker: str) -> float:
     """
-    只以 Goodinfo 個股概況頁的 PER 欄位作為本益比來源。
+    高速版 Goodinfo PER 擷取。
 
-    修正版重點：
-    1. 先開 Goodinfo 首頁建立 cookie，再開 StockDetail。
-    2. 最多重試 3 次，降低 Goodinfo 偶發空白頁 / 簡化頁造成的 None。
-    3. 加強 PBR / PER / PEG 欄位解析，支援表格、純文字、儲存格逐行拆開三種型態。
+    改善重點：
+    - 不再每支股票都先打 Goodinfo 首頁建立 cookie。
+    - 不再每支股票重試 3 次、20 秒 timeout。
+    - 優先讀取本機每日快取；同一天已抓過直接回傳。
+    - 若 Goodinfo 暫時擋請求或逾時，回傳舊快取，避免整個掃描卡住。
+    - 仍只使用 Goodinfo StockDetail 頁面的 PER 欄位，不混用 yfinance / Yahoo PE。
     """
     code = ticker.split('.')[0]
-    goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
 
-    base_headers = {
+    cached = _get_cached_pe(code, allow_stale=False)
+    if pd.notna(cached):
+        return cached
+
+    goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
+    headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://goodinfo.tw/tw/index.asp",
         "Host": "goodinfo.tw",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
+        "Connection": "close",
         "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+    }
+    cookies = {
+        "IS_TOUCH_DEVICE": "F",
+        "SCREEN_SIZE": "WIDTH=1920&HEIGHT=1080",
     }
 
-    for attempt in range(3):
+    # 只做短 timeout 快速嘗試。第一次掃描大量股票時，速度比首頁+3次重試快非常多。
+    for timeout_sec in (5, 8):
         try:
-            session = requests.Session()
-            session.verify = False
-            session.cookies.set("IS_TOUCH_DEVICE", "F", domain="goodinfo.tw")
-            session.cookies.set("SCREEN_SIZE", "WIDTH=1920&HEIGHT=1080", domain="goodinfo.tw")
-
-            # 先進首頁，讓 Goodinfo 建立基本 cookie。失敗不直接中止，仍嘗試個股頁。
-            try:
-                session.get("https://goodinfo.tw/tw/index.asp", headers=base_headers, timeout=10)
-                time.sleep(0.15 + random.random() * 0.25)
-            except Exception:
-                pass
-
-            headers = dict(base_headers)
-            headers["User-Agent"] = random.choice(USER_AGENTS)
-            resp = session.get(goodinfo_url, headers=headers, timeout=20)
+            resp = requests.get(
+                goodinfo_url,
+                headers=headers,
+                cookies=cookies,
+                timeout=timeout_sec,
+                verify=False,
+            )
             if resp.status_code != 200 or not resp.content:
-                time.sleep(0.5 + attempt * 0.5)
                 continue
 
-            # Goodinfo 常見編碼為 Big5 / cp950，resp.text 有時會誤判，這裡主動處理。
             html = None
-            for enc in ["utf-8", "cp950", "big5", resp.apparent_encoding]:
+            # Goodinfo 常見為 Big5/cp950，但有時 requests 會誤判，手動依序解碼。
+            for enc in ("utf-8", "cp950", "big5", resp.apparent_encoding):
                 if not enc:
                     continue
                 try:
@@ -402,18 +471,22 @@ def fetch_pe(ticker: str) -> float:
                         html = candidate
                         break
                 except Exception:
-                    continue
+                    pass
             if html is None:
                 html = resp.text
 
             pe = _extract_pe_from_goodinfo_html(html)
             if pd.notna(pe) and pe > 0:
-                return round(float(pe), 2)
-
-            # 若頁面疑似被 Goodinfo 回簡化頁，稍等後再重試。
-            time.sleep(0.6 + attempt * 0.6 + random.random() * 0.3)
+                pe = round(float(pe), 2)
+                _set_cached_pe(code, pe)
+                return pe
         except Exception:
-            time.sleep(0.6 + attempt * 0.6 + random.random() * 0.3)
+            pass
+
+    # Goodinfo 偶發慢或擋流量時，不要拖慢整個掃描；用舊快取維持畫面速度。
+    stale = _get_cached_pe(code, allow_stale=True)
+    if pd.notna(stale):
+        return stale
 
     return np.nan
 
@@ -1288,9 +1361,9 @@ if st.session_state.is_scanning:
     bar.progress(0.80)
 
     if initial_hits:
-        status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
+        status.text(f"📈 找到 {len(initial_hits)} 支！高速抓取財報 / Goodinfo PER 中...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=10) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 bar.progress(0.80 + 0.19 * j / len(initial_hits))
