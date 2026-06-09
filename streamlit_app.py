@@ -89,7 +89,8 @@ def get_stock_market_list():
                 if '　' in val:
                     code, name = val.split('　')
                     if len(code) == 4 and code.isdigit():
-                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code})
+                        market_type = "上市" if mkt == "TW" else "上櫃" if mkt == "TWO" else "興櫃"
+                        stocks.append({"ticker": f"{code}.{mkt}", "name": name, "industry": row['產業別'], "code": code, "市場別": market_type})
     except:
         pass
     return stocks
@@ -1568,6 +1569,7 @@ if st.session_state.is_scanning:
                     "code":     base["code"],
                     "name":     base["name"],
                     "industry": base["industry"],
+                    "市場別":     base.get("市場別", "上市" if str(base.get("ticker", "")).endswith(".TW") else "上櫃" if str(base.get("ticker", "")).endswith(".TWO") else "興櫃"),
                     "收盤":       base["收盤"],
                     "漲跌幅(%)":   base.get("漲跌幅(%)", np.nan),
                     "乖離30MA(%)": base["乖離30MA(%)"],
@@ -1634,9 +1636,9 @@ if not st.session_state.scan_results.empty:
         )
 
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "市場別", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
-    df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
+    df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股", "市場別": "市場"})
 
     def color_tw_style(val):
         if pd.isna(val): return ''
@@ -1656,6 +1658,7 @@ if not st.session_state.scan_results.empty:
         column_config={
             "代碼":        st.column_config.TextColumn("代碼",    width=70),
             "名稱":        st.column_config.TextColumn("名稱",    width=100),
+            "市場":        st.column_config.TextColumn("市場",    width=70),
             "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
@@ -1664,7 +1667,6 @@ if not st.session_state.scan_results.empty:
                                                             format="%.2f%%", min_value=0, max_value=user_bias),
             "量比20日":    st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
-            "RSI14":       st.column_config.NumberColumn("RSI", width=65, format="%.1f"),
             "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
             "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
             "本益比":      st.column_config.NumberColumn("PE",     width=65, format="%.1f"),
