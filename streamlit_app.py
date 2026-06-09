@@ -79,8 +79,49 @@ def get_stock_market_list():
     2) 再抓 TWSE / TPEx OpenAPI JSON，避免 read_html 大表格解析。
     3) OpenAPI 失敗時才用舊 ISIN HTML 備援，且 timeout 較短。
     """
-    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache.json')
+    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v2_industry_fixed.json')
     today = get_tw_now().strftime('%Y-%m-%d')
+
+
+    INDUSTRY_CODE_MAP = {
+        '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維',
+        '05': '電機機械', '06': '電器電纜', '07': '化學生技醫療', '08': '玻璃陶瓷',
+        '09': '造紙工業', '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業',
+        '14': '建材營造', '15': '航運業', '16': '觀光餐旅', '17': '金融保險業',
+        '18': '貿易百貨業', '20': '其他業', '21': '化學工業', '22': '生技醫療業',
+        '23': '油電燃氣業', '24': '半導體業', '25': '電腦及週邊設備業', '26': '光電業',
+        '27': '通信網路業', '28': '電子零組件業', '29': '電子通路業', '30': '資訊服務業',
+        '31': '其他電子業', '32': '文化創意業', '33': '農業科技業', '34': '電子商務',
+        '35': '綠能環保', '36': '數位雲端', '37': '運動休閒', '38': '居家生活',
+        '80': '管理股票', '91': '存託憑證', '92': 'ETF', '93': '受益證券', '94': '認購售權證',
+    }
+
+    def normalize_industry(value):
+        """將 TWSE/TPEx OpenAPI 回傳的產業代碼轉成中文產業別。"""
+        txt = str(value or '').strip()
+        if txt in ['', '-', 'None', 'null', 'nan']:
+            return '未分類'
+        # 有些 OpenAPI 只給 05 / 36 這類產業代碼。
+        code = txt.zfill(2) if txt.isdigit() and len(txt) <= 2 else txt
+        if code in INDUSTRY_CODE_MAP:
+            return INDUSTRY_CODE_MAP[code]
+        # 有些欄位可能是「36 數位雲端」或「36,數位雲端」。
+        m = re.match(r'^(\d{1,2})\s*[、,，\-:：]?\s*(.*)$', txt)
+        if m:
+            c = m.group(1).zfill(2)
+            tail = m.group(2).strip()
+            if tail and not tail.isdigit():
+                return tail
+            return INDUSTRY_CODE_MAP.get(c, txt)
+        return txt
+
+    def normalize_stock_name(value):
+        """上櫃 OpenAPI 有時只提供公司全名，這裡轉成較適合表格的股票簡稱。"""
+        name = str(value or '').strip().replace(' ', '')
+        for suffix in ['股份有限公司', '有限公司']:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        return name
 
     def load_local_cache(allow_stale=False):
         try:
@@ -91,6 +132,10 @@ def get_stock_market_list():
             if allow_stale or payload.get('date') == today:
                 data = payload.get('data', [])
                 if isinstance(data, list) and len(data) > 100:
+                    for item in data:
+                        if isinstance(item, dict):
+                            item['industry'] = normalize_industry(item.get('industry', '未分類'))
+                            item['name'] = normalize_stock_name(item.get('name', ''))
                     return data
         except Exception:
             pass
@@ -114,6 +159,47 @@ def get_stock_market_list():
     session.mount('https://', adapter)
     session.mount('http://', adapter)
 
+
+    INDUSTRY_CODE_MAP = {
+        '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維',
+        '05': '電機機械', '06': '電器電纜', '07': '化學生技醫療', '08': '玻璃陶瓷',
+        '09': '造紙工業', '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業',
+        '14': '建材營造', '15': '航運業', '16': '觀光餐旅', '17': '金融保險業',
+        '18': '貿易百貨業', '20': '其他業', '21': '化學工業', '22': '生技醫療業',
+        '23': '油電燃氣業', '24': '半導體業', '25': '電腦及週邊設備業', '26': '光電業',
+        '27': '通信網路業', '28': '電子零組件業', '29': '電子通路業', '30': '資訊服務業',
+        '31': '其他電子業', '32': '文化創意業', '33': '農業科技業', '34': '電子商務',
+        '35': '綠能環保', '36': '數位雲端', '37': '運動休閒', '38': '居家生活',
+        '80': '管理股票', '91': '存託憑證', '92': 'ETF', '93': '受益證券', '94': '認購售權證',
+    }
+
+    def normalize_industry(value):
+        """將 TWSE/TPEx OpenAPI 回傳的產業代碼轉成中文產業別。"""
+        txt = str(value or '').strip()
+        if txt in ['', '-', 'None', 'null', 'nan']:
+            return '未分類'
+        # 有些 OpenAPI 只給 05 / 36 這類產業代碼。
+        code = txt.zfill(2) if txt.isdigit() and len(txt) <= 2 else txt
+        if code in INDUSTRY_CODE_MAP:
+            return INDUSTRY_CODE_MAP[code]
+        # 有些欄位可能是「36 數位雲端」或「36,數位雲端」。
+        m = re.match(r'^(\d{1,2})\s*[、,，\-:：]?\s*(.*)$', txt)
+        if m:
+            c = m.group(1).zfill(2)
+            tail = m.group(2).strip()
+            if tail and not tail.isdigit():
+                return tail
+            return INDUSTRY_CODE_MAP.get(c, txt)
+        return txt
+
+    def normalize_stock_name(value):
+        """上櫃 OpenAPI 有時只提供公司全名，這裡轉成較適合表格的股票簡稱。"""
+        name = str(value or '').strip().replace(' ', '')
+        for suffix in ['股份有限公司', '有限公司']:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        return name
+
     def pick(row, names, default=''):
         for n in names:
             if n in row and row.get(n) not in [None, '', 'null', 'None']:
@@ -130,12 +216,12 @@ def get_stock_market_list():
             if not isinstance(row, dict):
                 continue
             code = clean_code(pick(row, ['Code', '證券代號', '公司代號', '有價證券代號', 'SecuritiesCompanyCode', '股票代號']))
-            name = pick(row, ['Name', '證券名稱', '公司簡稱', '公司名稱', '有價證券名稱', 'CompanyName', '股票名稱'])
-            industry = pick(row, ['產業別', '產業類別', 'Industry', 'industry'], '未分類')
+            name = pick(row, ['Name', '證券名稱', '公司簡稱', '有價證券名稱', '股票名稱', '公司名稱', 'CompanyName'])
+            industry = normalize_industry(pick(row, ['產業別', '產業類別', 'Industry', 'industry'], '未分類'))
             if len(code) == 4 and code.isdigit() and name:
                 out.append({
                     'ticker': f'{code}.{market_suffix}',
-                    'name': name.replace(' ', ''),
+                    'name': normalize_stock_name(name),
                     'industry': industry or '未分類',
                     'code': code,
                     '市場別': market_type,
@@ -203,8 +289,8 @@ def get_stock_market_list():
                             continue
                         stocks.append({
                             'ticker': key,
-                            'name': str(name).strip(),
-                            'industry': str(row.get('產業別', '未分類')).strip() or '未分類',
+                            'name': normalize_stock_name(name),
+                            'industry': normalize_industry(row.get('產業別', '未分類')), 
                             'code': code,
                             '市場別': market_type,
                         })
