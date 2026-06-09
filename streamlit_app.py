@@ -695,7 +695,6 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     df['MA30'] = df['close'].rolling(30).mean()
     df['MA45'] = df['close'].rolling(45).mean()
     df['MA60'] = df['close'].rolling(60).mean()
-    df['主力成本20'] = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
     df['VOL_MA5'] = df['volume'].rolling(5).mean()
 
     delta = df['close'].diff()
@@ -761,18 +760,16 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
             "30MA：%{customdata[4]:.2f}<br>"
             "45MA：%{customdata[5]:.2f}<br>"
             "60MA：%{customdata[6]:.2f}<br>"
-            "主力成本20：%{customdata[7]:.2f}<br>"
-            "RSI14：%{customdata[8]:.1f}<br>"
-            "成交量：%{customdata[9]:,} 張"
+            "RSI14：%{customdata[7]:.1f}<br>"
+            "成交量：%{customdata[8]:,} 張"
             "<extra></extra>"
         ),
-        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', '主力成本20', 'RSI14', 'volume']].values,
+        customdata=df[['open', 'close', 'high', 'low', 'MA30', 'MA45', 'MA60', 'RSI14', 'volume']].values,
     ))
 
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA30'], line=dict(color='#3b82f6', width=1.5), name='MA30', hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA45'], line=dict(color='#f59e0b', width=1.5), name='MA45', hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df['date'], y=df['MA60'], line=dict(color='#a855f7', width=1.5), name='MA60', hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=df['date'], y=df['主力成本20'], line=dict(color='#ef4444', width=1.35, dash='dash'), name='主力成本', hoverinfo='skip'))
 
     if chart_mode == '技術指標':
         gold = df[df['MACD_GOLD']]
@@ -799,6 +796,25 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
             marker=dict(symbol='circle-open', size=9, color='#3b82f6', line=dict(width=2)),
             hovertemplate='<b>%{x}</b><br>RSI 低檔：%{customdata:.1f}<extra></extra>', customdata=oversold['RSI14']
         ))
+
+    # 讓 X 軸日期不要每天都顯示：日線顯示每月第一個交易日，週線/月線則等距顯示。
+    if chart_period == '日':
+        tick_base = df.assign(_ym=df['date_dt'].dt.to_period('M'))
+        tick_rows = tick_base.drop_duplicates('_ym', keep='first')
+        tick_vals = tick_rows['date'].tolist()
+        tick_text = []
+        prev_year = None
+        for d in tick_rows['date_dt']:
+            if prev_year != d.year:
+                tick_text.append(d.strftime('%Y-%m'))
+                prev_year = d.year
+            else:
+                tick_text.append(d.strftime('%m月'))
+    else:
+        step = max(1, len(df) // 8)
+        tick_rows = df.iloc[::step]
+        tick_vals = tick_rows['date'].tolist()
+        tick_text = [d.strftime('%Y-%m') for d in tick_rows['date_dt']]
 
     spike_cfg = dict(
         type='category', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
@@ -828,7 +844,7 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
         ),
         dragmode=False,
         bargap=0.18,
-        xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickfont=dict(size=11), automargin=True),
+        xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickmode='array', tickvals=tick_vals, ticktext=tick_text, tickangle=0, tickfont=dict(size=11), automargin=True),
         yaxis=dict(
             fixedrange=True, side='right', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
             zeroline=False, tickfont=dict(size=11, color='#cbd5e1'), showspikes=False,
@@ -1214,7 +1230,7 @@ if not st.session_state.scan_results.empty:
         )
 
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "主力成本", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "RSI14", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股"})
 
@@ -1242,7 +1258,6 @@ if not st.session_state.scan_results.empty:
             "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
                                                             help=f"上限 {user_bias}%",
                                                             format="%.2f%%", min_value=0, max_value=user_bias),
-            "主力成本":    st.column_config.NumberColumn("主力成本", width=90, format="%.2f"),
             "量比20日":    st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
             "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
             "RSI14":       st.column_config.NumberColumn("RSI", width=65, format="%.1f"),
@@ -1304,8 +1319,6 @@ if not st.session_state.scan_results.empty:
       </div>
       <div class="quote-metrics">
         <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
-        <div><div class="metric-k">主力成本</div><div class="metric-v">{main_cost_txt}</div></div>
-        <div><div class="metric-k">成本乖離</div><div class="metric-v" style="color:{chg_color};">{cost_gap_txt}</div></div>
         <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
         <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
       </div>
@@ -1359,21 +1372,9 @@ if not st.session_state.scan_results.empty:
         <div class="side-card">
           <div class="side-title"><span>AI 分析報告</span><span class="bias-chip">{report['盤面強弱']}</span></div>
           <div class="report-row"><span>強度評分</span><span style="color:var(--tv-green);">{score_txt}</span></div>
-          <div class="report-row"><span>主力成本</span><span>{main_cost_txt}</span></div>
-          <div class="report-row"><span>成本乖離</span><span>{cost_gap_txt}</span></div>
           <div class="report-row"><span>RSI</span><span>{rsi_txt}</span></div>
           <div class="report-row"><span>MACD柱</span><span>{macd_txt}</span></div>
           <div style="color:#b8c4d3;font-size:13px;line-height:1.75;margin-top:12px;">{report['趨勢結構']}<br>{report['動能訊號']}</div>
-        </div>
-        <div class="side-card">
-          <div class="side-title"><span>主力成本</span></div>
-          <div style="font-family:Roboto Mono,monospace;font-size:27px;font-weight:800;color:var(--tv-green);">{main_cost_txt}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
-            <div><div class="tv-caption">現價</div><div class="metric-v" style="color:var(--tv-green);">{fmt_num(price, '{:.2f}')}</div></div>
-            <div><div class="tv-caption">浮動盈虧</div><div class="metric-v" style="color:{chg_color};">{cost_gap_txt}</div></div>
-          </div>
-          <div style="margin-top:14px;height:10px;border-radius:999px;background:linear-gradient(90deg,var(--tv-green) 0 24%, var(--tv-red) 24% 82%, #243446 82% 100%);"></div>
-          <div style="display:flex;justify-content:space-between;color:#a7b3c2;font-size:12px;margin-top:7px;"><span>靠近成本</span><span>持有區</span><span>偏離風險</span></div>
         </div>
         <div class="side-card">
           <div class="side-title"><span>飆股雷達</span><span class="bias-chip">HOT</span></div>
