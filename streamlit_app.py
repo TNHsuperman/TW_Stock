@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 import random
 import re
+import time
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -225,16 +226,19 @@ def _extract_pe_from_goodinfo_html(html: str) -> float:
         return vals
 
     # 方法 0：直接從 Goodinfo 純文字結構抓。這是最穩定的方式。
-    # 例：
+    # 例 A：同一列
     # 成交張數 成交金額 成交筆數 成交均張 成交均價 PBR PER PEG
     # 1,196 7,098萬 1,110 1.08張/筆 59.37 1.7 15.71 1.35
+    # 例 B：每個儲存格都被拆成一行：PBR / PER / PEG / 1,196 / 7,098萬 / ... / 1.7 / 15.71 / 1.35
     text_lines = [norm_text(x) for x in soup.get_text("\n", strip=True).split("\n")]
     text_lines = [x for x in text_lines if x]
+
+    # 0-1：PBR / PER / PEG 在同一行，下一行或後續數字列的最後三個數字通常為 PBR / PER / PEG。
     for i, line in enumerate(text_lines):
         compact = re.sub(r"\s+", " ", line.upper()).strip()
         if "PBR" in compact and "PER" in compact and "PEG" in compact:
             # 優先抓下一個有足夠數字的文字列。
-            for nxt in text_lines[i + 1:i + 6]:
+            for nxt in text_lines[i + 1:i + 8]:
                 nums = numbers_from_text(nxt)
                 if len(nums) >= 3:
                     return round(float(nums[-2]), 2)
@@ -242,6 +246,18 @@ def _extract_pe_from_goodinfo_html(html: str) -> float:
             # 有些情況表頭與數值被合在同一列。
             nums = numbers_from_text(line)
             if len(nums) >= 3:
+                return round(float(nums[-2]), 2)
+
+    # 0-2：PBR / PER / PEG 被拆成多個文字節點時，改用 token 序列掃描。
+    upper_tokens = [x.upper() for x in text_lines]
+    for i in range(len(upper_tokens) - 2):
+        if upper_tokens[i] == "PBR" and upper_tokens[i + 1] == "PER" and upper_tokens[i + 2] == "PEG":
+            nums = []
+            # 往後多抓幾格，因為 Goodinfo 的下一列前面還有成交張數、成交金額、成交均價等欄位。
+            for token in text_lines[i + 3:i + 25]:
+                nums.extend(numbers_from_text(token))
+            if len(nums) >= 3:
+                # 最後三個數字為 PBR / PER / PEG，取中間 PER。
                 return round(float(nums[-2]), 2)
 
     # 方法 1：逐列掃描表格，找到 PER 表頭後，抓下一列同欄位。
@@ -328,60 +344,78 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
     return np.nan
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pe(ticker: str) -> float:
     """
     只以 Goodinfo 個股概況頁的 PER 欄位作為本益比來源。
 
-    URL 格式：
-    https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID=XXXX
-
-    注意：若 Goodinfo 防爬、連線失敗、或該公司無有效 PER，本函式會回傳 NaN，
-    不再改用 yfinance / Yahoo 備援，避免與 Goodinfo 畫面數值不一致。
+    修正版重點：
+    1. 先開 Goodinfo 首頁建立 cookie，再開 StockDetail。
+    2. 最多重試 3 次，降低 Goodinfo 偶發空白頁 / 簡化頁造成的 None。
+    3. 加強 PBR / PER / PEG 欄位解析，支援表格、純文字、儲存格逐行拆開三種型態。
     """
     code = ticker.split('.')[0]
     goodinfo_url = f"https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={code}"
 
-    try:
-        session = requests.Session()
-        session.verify = False
-        headers = get_headers()
-        headers.update({
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://goodinfo.tw/tw/index.asp",
-            "Host": "goodinfo.tw",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        })
-        # Goodinfo 對沒有瀏覽器狀態的請求較容易回簡化頁或空白區塊，補上常見 cookie。
-        session.cookies.set("IS_TOUCH_DEVICE", "F", domain="goodinfo.tw")
-        session.cookies.set("SCREEN_SIZE", "WIDTH=1920&HEIGHT=1080", domain="goodinfo.tw")
-        resp = session.get(goodinfo_url, headers=headers, timeout=15)
-        if resp.status_code != 200 or not resp.content:
-            return np.nan
+    base_headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://goodinfo.tw/tw/index.asp",
+        "Host": "goodinfo.tw",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
-        # Goodinfo 常見編碼為 Big5 / cp950，resp.text 有時會誤判，這裡主動處理。
-        html = None
-        for enc in ["utf-8", "cp950", "big5", resp.apparent_encoding]:
-            if not enc:
-                continue
+    for attempt in range(3):
+        try:
+            session = requests.Session()
+            session.verify = False
+            session.cookies.set("IS_TOUCH_DEVICE", "F", domain="goodinfo.tw")
+            session.cookies.set("SCREEN_SIZE", "WIDTH=1920&HEIGHT=1080", domain="goodinfo.tw")
+
+            # 先進首頁，讓 Goodinfo 建立基本 cookie。失敗不直接中止，仍嘗試個股頁。
             try:
-                candidate = resp.content.decode(enc, errors="ignore")
-                if "PER" in candidate or "個股概況" in candidate or "成交價" in candidate:
-                    html = candidate
-                    break
+                session.get("https://goodinfo.tw/tw/index.asp", headers=base_headers, timeout=10)
+                time.sleep(0.15 + random.random() * 0.25)
             except Exception:
-                continue
-        if html is None:
-            html = resp.text
+                pass
 
-        return _extract_pe_from_goodinfo_html(html)
-    except Exception:
-        return np.nan
+            headers = dict(base_headers)
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+            resp = session.get(goodinfo_url, headers=headers, timeout=20)
+            if resp.status_code != 200 or not resp.content:
+                time.sleep(0.5 + attempt * 0.5)
+                continue
+
+            # Goodinfo 常見編碼為 Big5 / cp950，resp.text 有時會誤判，這裡主動處理。
+            html = None
+            for enc in ["utf-8", "cp950", "big5", resp.apparent_encoding]:
+                if not enc:
+                    continue
+                try:
+                    candidate = resp.content.decode(enc, errors="ignore")
+                    if "PER" in candidate or "個股概況" in candidate or "成交價" in candidate:
+                        html = candidate
+                        break
+                except Exception:
+                    continue
+            if html is None:
+                html = resp.text
+
+            pe = _extract_pe_from_goodinfo_html(html)
+            if pd.notna(pe) and pe > 0:
+                return round(float(pe), 2)
+
+            # 若頁面疑似被 Goodinfo 回簡化頁，稍等後再重試。
+            time.sleep(0.6 + attempt * 0.6 + random.random() * 0.3)
+        except Exception:
+            time.sleep(0.6 + attempt * 0.6 + random.random() * 0.3)
+
+    return np.nan
 
 def fetch_deep_info(ticker: str) -> dict:
     code = ticker.split('.')[0]
@@ -1256,7 +1290,7 @@ if st.session_state.is_scanning:
     if initial_hits:
         status.text(f"📈 找到 {len(initial_hits)} 支！抓取財報數據中...")
         final_list = []
-        with ThreadPoolExecutor(max_workers=20) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
             for j, f in enumerate(as_completed(f_deep), 1):
                 bar.progress(0.80 + 0.19 * j / len(initial_hits))
