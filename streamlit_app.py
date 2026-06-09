@@ -579,7 +579,7 @@ def render_hot_industries(df: pd.DataFrame):
             </div>
             """, unsafe_allow_html=True)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
     rows = []
     now  = get_tw_now()
@@ -637,6 +637,27 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df
+
+
+
+def warm_kline_data_async(stocks):
+    """背景預載前後股票 K 線資料，減少點 PREV / NEXT 時等待。"""
+    if not stocks:
+        return
+
+    def _worker(items):
+        for tk in items:
+            try:
+                code = str(tk).split(".")[0]
+                market = "TW" if str(tk).endswith(".TW") else "TWO"
+                get_kline_data(code, market)
+            except Exception:
+                pass
+
+    try:
+        threading.Thread(target=_worker, args=(list(stocks),), daemon=True).start()
+    except Exception:
+        pass
 
 def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     """畫出有實際切換功能的金融圖表。
@@ -1320,6 +1341,16 @@ if not st.session_state.scan_results.empty:
                 "doubleClick": False,
                 "showTips": False,
             })
+
+            # 預載前後兩檔，點擊上一支 / 下一支時多數情況可直接從快取取圖，不再顯示 Running get_kline_data。
+            try:
+                preload_tickers = []
+                for offset in (-1, 1):
+                    preload_idx = (st.session_state.current_idx + offset) % total_found
+                    preload_tickers.append(df.iloc[preload_idx]['ticker'])
+                warm_kline_data_async(preload_tickers)
+            except Exception:
+                pass
         else:
             st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
