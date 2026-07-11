@@ -377,11 +377,11 @@ def download_batch_history(tickers: tuple) -> dict:
         return {}
     ticker_str = " ".join(tickers)
 
-    # [修正] 先以多執行緒（快）在子行程嘗試；若子行程崩潰或無資料，
-    # 改用單執行緒（穩，但較慢）重試一次，犧牲一點速度換穩定性。
-    raw, crashed = _isolated_call(_yf_download_worker, (ticker_str, True), timeout=60)
-    if crashed or raw is None or (hasattr(raw, "empty") and raw.empty):
-        raw, _ = _isolated_call(_yf_download_worker, (ticker_str, False), timeout=90)
+    # [修正] 先以多執行緒（快）在子行程嘗試；只有在子行程「真的崩潰」時
+    # 才改用單執行緒重試（穩，但較慢）。查無資料不重試，避免白等。
+    raw, crashed = _isolated_call(_yf_download_worker, (ticker_str, True), timeout=45)
+    if crashed:
+        raw, _ = _isolated_call(_yf_download_worker, (ticker_str, False), timeout=60)
 
     # [修正3] 下載失敗時提前返回，避免後續 KeyError
     if raw is None or raw.empty:
@@ -1611,6 +1611,55 @@ def get_tw_stock_news(code):
 # 2.5 [新功能] 大盤濾網 / 排除清單 / 出場守則 / 策略回測
 # ============================================================
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_todays_volume_map() -> dict:
+    """[加速] 用官方 API 一次抓上市+上櫃全部個股「今日成交量(張)」。
+
+    用途：掃描前預過濾。若一檔股票今日成交量連門檻的 20% 都不到，
+    5 日均量幾乎不可能達標，直接跳過不下載歷史資料，
+    可大幅減少 yfinance 批次下載量（通常能砍掉一半以上的股票）。
+    任一來源失敗回傳部分或空 dict，掃描流程自動退回全量下載（fail-open）。
+    """
+    vol_map = {}
+
+    def to_lots(value):
+        """成交股數 → 張；容錯各種字串格式。"""
+        try:
+            txt = str(value).replace(',', '').strip()
+            if txt in ['', '-', '--', 'N/A', 'None']:
+                return None
+            return float(txt) / 1000.0
+        except Exception:
+            return None
+
+    VOLUME_KEYS = ['TradeVolume', 'TradingShares', '成交股數', '成交量', 'TradingVolume']
+
+    def collect(url):
+        data = _fetch_json(url, timeout=8)
+        rows = data if isinstance(data, list) else []
+        if isinstance(data, dict):
+            for key in ['data', 'Data', 'aaData', 'tables']:
+                if isinstance(data.get(key), list):
+                    rows = data[key]
+                    break
+        for rec in rows:
+            if not isinstance(rec, dict):
+                continue
+            code = _find_record_code(rec)
+            if not code:
+                continue
+            for vk in VOLUME_KEYS:
+                if vk in rec:
+                    lots = to_lots(rec[vk])
+                    if lots is not None:
+                        vol_map[code] = lots
+                        break
+
+    collect("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+    collect("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes")
+    return vol_map
+
+
 def _yf_twii_worker():
     """子行程工作函式：抓取加權指數並直接算好摘要數值再回傳（回傳值需可被 pickle，
     plain dict 比整包 DataFrame 更輕量、更安全）。"""
@@ -2176,18 +2225,51 @@ if st.session_state.is_scanning:
         excluded_codes |= excl_sets['attention']
     attention_codes = excl_sets['attention']
 
-    status.text("📋 Step 2/4：載入股票清單...")
+    status.text("📋 Step 2/4：載入股票清單與預過濾...")
     bar.progress(0.03)
-    stock_map    = get_stock_market_list()
-    all_tickers  = [s["ticker"] for s in stock_map]
-    total_tickers = len(all_tickers)
+    stock_map = get_stock_market_list()
+    total_universe = len(stock_map)
 
+    # [加速1] 下載前先過濾：非個股類型 / 00 開頭 / 處置全額交割股，
+    # 這些原本要等下載完才在 calc_ma_signals 剔除，白白浪費下載時間。
+    stock_map = [
+        s for s in stock_map
+        if s.get('industry') not in NON_STOCK_INDUSTRIES
+        and not str(s.get('code', '')).startswith('00')
+        and s.get('code') not in excluded_codes
+    ]
+
+    # [加速2] 成交量預過濾：今日成交量連門檻 20% 都不到的股票，
+    # 5 日均量幾乎不可能達標，直接跳過不下載。官方 API 抓不到時自動退回全量。
+    if user_vol > 0:
+        vol_map = get_todays_volume_map()
+        if vol_map:
+            threshold = max(1.0, user_vol * 0.2)
+            stock_map = [
+                s for s in stock_map
+                if vol_map.get(s['code']) is None or vol_map[s['code']] >= threshold
+            ]
+
+    all_tickers   = [s["ticker"] for s in stock_map]
+    total_tickers = len(all_tickers)
+    status.text(f"📋 Step 2/4：預過濾完成，{total_universe} → {total_tickers} 檔需下載歷史資料")
+
+    # [加速3] 批次並行下載：3 個批次同時進行（每批仍在獨立子行程中隔離），
+    # 相較逐批序列下載約可縮短至 1/2 ~ 1/3 時間。
     history_map = {}
     batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
-    for bi, batch in enumerate(batches):
-        status.text(f"📥 Step 3/4：批次下載 {bi+1}/{len(batches)}...")
-        bar.progress(0.03 + 0.72 * (bi / len(batches)))
-        history_map.update(download_batch_history(tuple(batch)))
+    if batches:
+        done = 0
+        with ThreadPoolExecutor(max_workers=3) as dl_ex:
+            futures = {dl_ex.submit(download_batch_history, tuple(b)): bi for bi, b in enumerate(batches)}
+            for f in as_completed(futures):
+                done += 1
+                status.text(f"📥 Step 3/4：批次下載 {done}/{len(batches)}（3 批並行）...")
+                bar.progress(0.05 + 0.70 * (done / len(batches)))
+                try:
+                    history_map.update(f.result() or {})
+                except Exception:
+                    pass
 
     bar.progress(0.75)
     status.text("✅ Step 4/4：計算均線與排除警示股中...")
