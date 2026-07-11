@@ -1545,6 +1545,12 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.tv-card{padding:16px}.tv-label{color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.06em}.tv-value{font-family:'Roboto Mono',monospace;font-size:25px;font-weight:800;margin-top:6px;color:var(--text)}.tv-caption{color:var(--muted);font-size:12px;margin-top:5px}
 .tv-section{font-size:17px;font-weight:800;color:#f4f8ff;margin:22px 0 10px}.quote-panel{padding:18px 20px;margin:18px 0 12px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(8,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}.quote-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.quote-title{font-size:24px;font-weight:800}.quote-tag,.bias-chip{border:1px solid var(--border);background:#13243a;border-radius:999px;padding:5px 10px;color:#b9c9dc;font-size:12px;font-weight:700}.quote-price{font-family:'Roboto Mono',monospace;font-size:38px;font-weight:800;color:var(--green);line-height:1.25}.quote-change{font-family:'Roboto Mono',monospace;font-size:17px;font-weight:700;margin-left:8px}.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(110px,1fr));gap:12px;margin-top:12px;max-width:700px}.metric-k{color:var(--muted);font-size:11px;font-weight:700}.metric-v{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-top:3px}
 .side-card{padding:16px;margin-bottom:12px}.side-title{display:flex;justify-content:space-between;gap:8px;font-size:16px;font-weight:800;margin-bottom:10px}.report-row{display:flex;justify-content:space-between;border-bottom:1px solid rgba(35,58,85,.65);padding:8px 0;color:#c7d5e6;font-size:13px}.radar-check{font-size:13px;line-height:1.9;color:#c6d4e5}.radar-check b{color:var(--green);margin-right:7px}
+
+[data-baseweb='tab-list']{gap:8px;background:rgba(13,26,43,.78);border:1px solid var(--border);border-radius:14px;padding:7px;margin:4px 0 18px;overflow-x:auto;}
+[data-baseweb='tab']{height:46px;border-radius:10px;padding:0 18px;color:var(--muted)!important;font-weight:800!important;white-space:nowrap;}
+[data-baseweb='tab'][aria-selected='true']{background:linear-gradient(135deg,#3978e8,#4c8dff)!important;color:#fff!important;box-shadow:0 8px 20px rgba(57,120,232,.25);}
+[data-baseweb='tab-highlight']{display:none!important;}
+[data-baseweb='tab-panel']{padding-top:2px;}
 [data-testid='stDataFrame']{overflow:hidden!important}[data-testid='stDataFrame'] *{font-family:'Roboto Mono','Noto Sans TC',monospace!important}.news-card{background:linear-gradient(180deg,rgba(16,33,56,.9),rgba(9,20,35,.96))!important;border-radius:12px!important}.news-title:hover{color:#8eb6ff!important}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#07111f}::-webkit-scrollbar-thumb{background:#29425f;border-radius:999px}
 @media(max-width:1000px){.block-container{padding:16px 14px 40px!important}.workflow,.stat-grid{grid-template-columns:repeat(2,1fr)}.app-hero{align-items:flex-start}.app-meta{display:none}}
@@ -1575,18 +1581,32 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. 篩選條件與掃描操作
+# 5. 五頁簽工作台
 # ============================================================
-st.markdown('<div class="section-head"><div><div class="section-title">1. 設定掃描條件</div><div class="section-help">條件越嚴格，結果通常越少；初次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
-with st.container():
-    st.markdown('<div class="control-shell">', unsafe_allow_html=True)
-    with st.expander("掃描條件與說明", expanded=True):
+user_bias = st.session_state.user_bias
+user_vol = st.session_state.user_vol
+
+tab_scan, tab_list, tab_chart, tab_ai, tab_news = st.tabs([
+    "🔍 選股掃描",
+    "📋 候選清單",
+    "📈 個股圖表",
+    "🤖 AI 分析",
+    "📰 個股新聞",
+])
+
+# ------------------------------------------------------------
+# TAB 1：選股掃描
+# ------------------------------------------------------------
+with tab_scan:
+    st.markdown('<div class="section-head"><div><div class="section-title">設定掃描條件</div><div class="section-help">條件越嚴格，候選股票通常越少；第一次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="control-shell">', unsafe_allow_html=True)
         note_col, bias_col, vol_col = st.columns([1.6, 1, 1], gap="large")
         with note_col:
             st.markdown("""
             <div class="control-note">
-              <b>策略條件</b><br>
-              先找出 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，再限制股價不可離 30 日均線太遠，並排除成交量不足的標的。
+              <b>選股策略</b><br>
+              尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，限制股價不可距離 30 日均線過遠，並排除成交量不足的標的。
             </div>
             """, unsafe_allow_html=True)
         with bias_col:
@@ -1603,327 +1623,339 @@ with st.container():
                 help="排除流動性較低的股票。"
             )
             st.session_state.user_vol = mb_vol
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-user_bias = st.session_state.user_bias
-user_vol = st.session_state.user_vol
+    user_bias = st.session_state.user_bias
+    user_vol = st.session_state.user_vol
+    scan_left, scan_right = st.columns([3, 1])
+    with scan_left:
+        st.caption(f"目前條件：30MA 乖離 ≤ {user_bias:.1f}%｜成交量 ≥ {user_vol:,} 張｜MA30 > MA45 > MA60")
+    with scan_right:
+        scan_clicked = st.button(
+            "開始全市場掃描", use_container_width=True,
+            disabled=st.session_state.is_scanning, type="primary", key="scan_market"
+        )
 
-scan_left, scan_right = st.columns([3, 1])
-with scan_left:
-    st.caption(f"目前條件：30MA 乖離 ≤ {user_bias:.1f}%｜成交量 ≥ {user_vol:,} 張｜均線 MA30 > MA45 > MA60")
-with scan_right:
-    scan_clicked = st.button(
-        "開始全市場掃描", use_container_width=True,
-        disabled=st.session_state.is_scanning, type="primary"
-    )
-if scan_clicked:
-    st.session_state.is_scanning = True
-    st.session_state.current_idx = 0
-    st.session_state.last_selected_row = None
-    st.rerun()
+    if scan_clicked:
+        st.session_state.is_scanning = True
+        st.session_state.current_idx = 0
+        st.session_state.last_selected_row = None
+        st.rerun()
 
-# ============================================================
-# 6. 掃描流程
-# ============================================================
+    if st.session_state.is_scanning:
+        status = st.empty()
+        bar = st.progress(0)
+        BATCH = 200
 
-if st.session_state.is_scanning:
-    status = st.empty()
-    bar    = st.progress(0)
-    BATCH  = 200
+        status.info("步驟 1/3：正在載入上市櫃股票清單…")
+        bar.progress(0.03)
+        stock_map = get_stock_market_list()
+        all_tickers = [s["ticker"] for s in stock_map]
+        total_tickers = len(all_tickers)
 
-    status.info("步驟 1/3：正在載入上市櫃股票清單…")
-    bar.progress(0.03)
-    stock_map    = get_stock_market_list()
-    all_tickers  = [s["ticker"] for s in stock_map]
-    total_tickers = len(all_tickers)
+        history_map = {}
+        batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
+        for bi, batch in enumerate(batches):
+            status.info(f"步驟 2/3：下載歷史行情批次 {bi+1}/{len(batches)}…")
+            bar.progress(0.03 + 0.72 * (bi / max(1, len(batches))))
+            history_map.update(download_batch_history(tuple(batch)))
 
-    history_map = {}
-    batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
-    for bi, batch in enumerate(batches):
-        status.info(f"步驟 2/3：下載歷史行情批次 {bi+1}/{len(batches)}…")
-        bar.progress(0.03 + 0.72 * (bi / len(batches)))
-        history_map.update(download_batch_history(tuple(batch)))
+        bar.progress(0.75)
+        status.info("步驟 3/3：正在計算均線、量能與候選股票…")
+        initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
+        bar.progress(0.80)
 
-    bar.progress(0.75)
-    status.info("步驟 3/3：正在計算均線、量能與候選股票…")
-    initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
-    bar.progress(0.80)
+        if initial_hits:
+            status.info(f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
+            load_official_pe_map(False)
+            final_list = []
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
+                for j, f in enumerate(as_completed(f_deep), 1):
+                    bar.progress(0.80 + 0.19 * j / len(initial_hits))
+                    deep_res = f.result()
+                    base = f_deep[f]
+                    row_data = {
+                        "ticker": base["ticker"], "code": base["code"], "name": base["name"],
+                        "industry": base["industry"],
+                        "市場別": base.get("市場別", "上市" if str(base.get("ticker", "")).endswith(".TW") else "上櫃" if str(base.get("ticker", "")).endswith(".TWO") else "興櫃"),
+                        "收盤": base["收盤"], "漲跌幅(%)": base.get("漲跌幅(%)", np.nan),
+                        "乖離30MA(%)": base["乖離30MA(%)"], "成交量(張)": base["成交量(張)"],
+                        "量變動(%)": base["量變動(%)"], "量比20日": base.get("量比20日", np.nan),
+                        "主力成本": base.get("主力成本", np.nan),
+                        "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
+                        "RSI14": base.get("RSI14", np.nan), "MACD柱": base.get("MACD柱", np.nan),
+                        "突破20日高": base.get("突破20日高", False), "接近60日高": base.get("接近60日高", False),
+                        "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"],
+                    }
+                    score, radar = calc_stock_score(row_data)
+                    row_data["AI評分"] = score
+                    row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
+                    final_list.append(row_data)
+            bar.progress(1.0)
+            st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False).reset_index(drop=True)
+            status.success(f"掃描完成，共找到 {len(st.session_state.scan_results)} 檔候選股票。")
+        else:
+            st.session_state.scan_results = pd.DataFrame()
+            status.warning("查無符合目前條件的股票，請放寬乖離或成交量條件後再試。")
 
-    if initial_hits:
-        status.info(f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
-        load_official_pe_map(False)
-        final_list = []
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
-            for j, f in enumerate(as_completed(f_deep), 1):
-                bar.progress(0.80 + 0.19 * j / len(initial_hits))
-                deep_res = f.result()
-                base     = f_deep[f]
-                row_data = {
-                    "ticker":   base["ticker"],
-                    "code":     base["code"],
-                    "name":     base["name"],
-                    "industry": base["industry"],
-                    "市場別":     base.get("市場別", "上市" if str(base.get("ticker", "")).endswith(".TW") else "上櫃" if str(base.get("ticker", "")).endswith(".TWO") else "興櫃"),
-                    "收盤":       base["收盤"],
-                    "漲跌幅(%)":   base.get("漲跌幅(%)", np.nan),
-                    "乖離30MA(%)": base["乖離30MA(%)"],
-                    "成交量(張)":  base["成交量(張)"],
-                    "量變動(%)":   base["量變動(%)"],
-                    "量比20日":    base.get("量比20日", np.nan),
-                    "主力成本":    base.get("主力成本", np.nan),
-                    "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
-                    "RSI14":      base.get("RSI14", np.nan),
-                    "MACD柱":     base.get("MACD柱", np.nan),
-                    "突破20日高":  base.get("突破20日高", False),
-                    "接近60日高":  base.get("接近60日高", False),
-                    "本益比":      deep_res["pe"],
-                    "營收月增":    deep_res["mom"],
-                    "營收年增":    deep_res["yoy"],
-                }
-                score, radar = calc_stock_score(row_data)
-                row_data["AI評分"] = score
-                row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
-                final_list.append(row_data)
-        bar.progress(1.0)
-        st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False).reset_index(drop=True)
-    else:
-        st.session_state.scan_results = pd.DataFrame()
-        st.warning("查無條件標的。")
+        st.session_state.is_scanning = False
+        st.rerun()
 
-    st.session_state.is_scanning = False
-    st.rerun()
+    if not st.session_state.scan_results.empty:
+        scan_df = st.session_state.scan_results
+        avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
+        strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
+        st.markdown(f"""
+        <div class="stat-grid" style="margin-top:18px;">
+          <div class="tv-card"><div class="tv-label">最近掃描結果</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">符合條件股票</div></div>
+          <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">候選清單</div><div class="tv-caption">切換第二個頁簽選股</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif not st.session_state.is_scanning:
+        st.markdown("""
+        <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:18px;">
+          <div style="font-size:40px;margin-bottom:12px;">🔎</div>
+          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「候選清單」頁簽。</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# ============================================================
-# 7. 結果顯示
-# ============================================================
-
-if not st.session_state.scan_results.empty:
-    df          = st.session_state.scan_results.copy()
+# 共用結果與目前股票
+has_results = isinstance(st.session_state.scan_results, pd.DataFrame) and not st.session_state.scan_results.empty
+if has_results:
+    df = st.session_state.scan_results.copy()
     total_found = len(df)
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
-
-    avg_score = df['AI評分'].mean() if 'AI評分' in df.columns else np.nan
-    strong_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
-    st.markdown('<div class="section-head"><div><div class="section-title">2. 掃描結果</div><div class="section-help">點擊表格任一列，即可在下方查看該股票的完整分析。</div></div></div>', unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="stat-grid">
-      <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{total_found}</div><div class="tv-caption">本次候選股票</div></div>
-      <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
-      <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
-      <div class="tv-card"><div class="tv-label">本次條件</div><div class="tv-value" style="font-size:18px">{user_bias:.1f}% / {user_vol:,}</div><div class="tv-caption">乖離上限 / 最小成交量</div></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── 下載按鈕 ──
-    col_spacer, col_dl = st.columns([3, 1])
-    with col_dl:
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="下載掃描結果 CSV", data=csv,
-            file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
-            mime='text/csv', use_container_width=True
-        )
-
-    # ── 結果表格 ──
-    show_cols      = ["code", "name", "市場別", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
-    available_cols = [c for c in show_cols if c in df.columns]
-    df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股", "市場別": "市場"})
-
-    def color_tw_style(val):
-        if pd.isna(val): return ''
-        color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
-        return f'color: {color}; font-weight: bold'
-
-    st.markdown('<div class="section-head"><div><div class="section-title">候選股票清單</div><div class="section-help">可左右捲動查看更多欄位，點擊列可切換個股。</div></div></div>', unsafe_allow_html=True)
-
-    event = st.dataframe(
-        df_display.style.map(
-            color_tw_style,
-            subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
-        ),
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key=f"stock_table_{st.session_state.table_key}",
-        column_config={
-            "代碼":        st.column_config.TextColumn("代碼",    width=70),
-            "名稱":        st.column_config.TextColumn("名稱",    width=100),
-            "市場":        st.column_config.TextColumn("市場",    width=70),
-            "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
-            "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
-            "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
-            "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120,
-                                                            help=f"上限 {user_bias}%",
-                                                            format="%.2f%%", min_value=0, max_value=user_bias),
-            "量比20日":    st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
-            "量變動(%)":   st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
-            "營收月增":    st.column_config.NumberColumn("月增",   width=75, format="%.1f%%"),
-            "營收年增":    st.column_config.NumberColumn("年增",   width=75, format="%.1f%%"),
-            "本益比":      st.column_config.NumberColumn("PE",     width=65, format="%.1f"),
-            "成交量(張)":  st.column_config.NumberColumn("成交量", width=95, format="%d"),
-            "類股":        st.column_config.TextColumn("產業別",  width=120),
-        }
-    )
-
-    if event and "selection" in event and event["selection"]["rows"]:
-        clicked_row = event["selection"]["rows"][0]
-        if clicked_row != st.session_state.last_selected_row:
-            st.session_state.current_idx      = clicked_row
-            st.session_state.last_selected_row = clicked_row
-
-    st.markdown(f"""
-    <div class="tv-caption" style="padding:6px 2px 2px;">
-        30MA 乖離進度條越滿，代表越接近設定上限 {user_bias}%；正數以綠色表示、負數以紅色表示。
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ============================================================
-    # 8. 個股總覽 / K 線 + 成交量整合圖 / 右側 AI 面板
-    # ============================================================
-
     current_stock = df.iloc[st.session_state.current_idx]
-    report = build_ai_report(current_stock)
-    c_idx = st.session_state.current_idx
-    price = current_stock.get('收盤', np.nan)
-    chg = current_stock.get('漲跌幅(%)', np.nan)
-    chg_color = 'var(--tv-green)' if pd.notna(chg) and chg >= 0 else 'var(--tv-red)'
-    chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.2f}%"
-    prev_est = np.nan if pd.isna(price) or pd.isna(chg) or chg == -100 else price / (1 + chg / 100)
-    chg_amt = np.nan if pd.isna(prev_est) else price - prev_est
-    chg_amt_txt = 'N/A' if pd.isna(chg_amt) else f"{chg_amt:+.2f}"
-    score_val = current_stock.get('AI評分', np.nan)
-    score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
-    main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
-    cost_gap_txt = fmt_num(current_stock.get('主力成本乖離(%)', np.nan), '{:+.2f}%')
-    rsi_txt = fmt_num(current_stock.get('RSI14', np.nan), '{:.1f}')
-    macd_txt = fmt_num(current_stock.get('MACD柱', np.nan), '{:.3f}')
-    vol_ratio_txt = fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')
-    radar_items = [x for x in str(current_stock.get('飆股雷達', '')).split('、') if x and x != '觀察']
-    if not radar_items:
-        radar_items = ['等待更強共振訊號']
+else:
+    df = pd.DataFrame()
+    total_found = 0
+    current_stock = None
 
-    st.markdown(f"""
-    <div class="section-head"><div><div class="section-title">3. 個股分析</div><div class="section-help">可用上一檔／下一檔快速瀏覽候選股票。</div></div></div><div class="quote-panel">
-      <div class="quote-head">
-        <div style="font-size:24px;color:var(--tv-yellow);">☆</div>
-        <div class="quote-title">{current_stock['name']} · {current_stock['code']}.{ 'TW' if current_stock['ticker'].endswith('.TW') else 'TWO' }</div>
-        <div class="quote-tag">{current_stock.get('industry', '產業別')}</div>
-      </div>
-      <div>
-        <span class="quote-price">{fmt_num(price, '{:.2f}')}</span>
-        <span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span>
-      </div>
-      <div class="quote-metrics">
-        <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
-        <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
-        <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    left_area, right_area = st.columns([4.7, 1.25], gap="medium")
-
-    with left_area:
-        nav_spacer, nav1, nav2 = st.columns([3.2, 0.9, 0.9])
-        with nav1:
-            if st.button("← 上一檔", use_container_width=True, key="btn_prev"):
-                st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
-                st.session_state.last_selected_row = None
-                st.session_state.table_key += 1
-                st.rerun()
-        with nav2:
-            if st.button("下一檔 →", use_container_width=True, key="btn_next"):
-                st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-                st.session_state.last_selected_row = None
-                st.session_state.table_key += 1
-                st.rerun()
-
-        # 固定顯示日 K 線圖：移除「圖表模式」與「週期」切換控制，只保留 K 線圖本體。
-        k_fig = draw_k_line(
-            current_stock['ticker'], current_stock['name'],
-            chart_mode='K線圖', chart_period='日'
-        )
-        if k_fig:
-            # 使用自訂 HTML 渲染，讓滑鼠水平準線右側可顯示即時對應股價。
-            render_kline_chart_with_axis_price(k_fig, height=640)
-
-            # 預載前後兩檔，點擊上一支 / 下一支時多數情況可直接從快取取圖，不再顯示 Running get_kline_data。
-            try:
-                preload_tickers = []
-                for offset in (-1, 1):
-                    preload_idx = (st.session_state.current_idx + offset) % total_found
-                    preload_tickers.append(df.iloc[preload_idx]['ticker'])
-                warm_kline_data_async(preload_tickers)
-            except Exception:
-                pass
-        else:
-            st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
-
-    with right_area:
+# ------------------------------------------------------------
+# TAB 2：候選清單
+# ------------------------------------------------------------
+with tab_list:
+    if has_results:
+        avg_score = df['AI評分'].mean() if 'AI評分' in df.columns else np.nan
+        strong_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
         st.markdown(f"""
-        <div class="side-card">
-          <div class="side-title"><span>AI 綜合分析</span><span class="bias-chip">{report['盤面強弱']}</span></div>
-          <div class="report-row"><span>強度評分</span><span style="color:var(--tv-green);">{score_txt}</span></div>
-          <div class="report-row"><span>RSI</span><span>{rsi_txt}</span></div>
-          <div class="report-row"><span>MACD柱</span><span>{macd_txt}</span></div>
-          <div style="color:#b8c4d3;font-size:13px;line-height:1.75;margin-top:12px;">{report['趨勢結構']}<br>{report['動能訊號']}</div>
+        <div class="stat-grid">
+          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{total_found}</div><div class="tv-caption">本次候選股票</div></div>
+          <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">其他頁簽同步顯示</div></div>
         </div>
-        <div class="side-card">
-          <div class="side-title"><span>飆股雷達</span><span class="bias-chip">HOT</span></div>
-          <div class="radar-check">{''.join([f'<div><b>✓</b>{item}</div>' for item in radar_items[:6]])}</div>
-          <div style="display:flex;justify-content:space-between;align-items:end;margin-top:12px;">
-            <span class="tv-caption">綜合評分</span>
-            <span style="font-family:Roboto Mono,monospace;font-size:26px;font-weight:800;color:var(--tv-green);">{score_txt}</span>
+        """, unsafe_allow_html=True)
+
+        filter_col, dl_col = st.columns([3, 1])
+        with filter_col:
+            quick_filter = st.selectbox(
+                "快速篩選", ["全部候選", "AI 評分 80 分以上", "營收年增為正", "量比 1.5 倍以上", "突破 20 日高"],
+                key="candidate_filter"
+            )
+        view_df = df.copy()
+        if quick_filter == "AI 評分 80 分以上":
+            view_df = view_df[view_df['AI評分'] >= 80]
+        elif quick_filter == "營收年增為正":
+            view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0]
+        elif quick_filter == "量比 1.5 倍以上":
+            view_df = view_df[pd.to_numeric(view_df['量比20日'], errors='coerce') >= 1.5]
+        elif quick_filter == "突破 20 日高":
+            view_df = view_df[view_df['突破20日高'] == True]
+
+        with dl_col:
+            csv = view_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("下載目前清單 CSV", csv, f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv', 'text/csv', use_container_width=True)
+
+        show_cols = ["code", "name", "市場別", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+        available_cols = [c for c in show_cols if c in view_df.columns]
+        df_display = view_df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股", "市場別": "市場"})
+
+        def color_tw_style(val):
+            if pd.isna(val): return ''
+            color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
+            return f'color: {color}; font-weight: bold'
+
+        st.markdown('<div class="section-head"><div><div class="section-title">候選股票清單</div><div class="section-help">點擊任一列，圖表、AI 分析與新聞頁簽會同步切換。</div></div></div>', unsafe_allow_html=True)
+        event = st.dataframe(
+            df_display.style.map(color_tw_style, subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
+            use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
+            key=f"stock_table_{st.session_state.table_key}",
+            column_config={
+                "代碼": st.column_config.TextColumn("代碼", width=70), "名稱": st.column_config.TextColumn("名稱", width=100),
+                "市場": st.column_config.TextColumn("市場", width=70),
+                "AI評分": st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
+                "收盤": st.column_config.NumberColumn("價格", width=75, format="%.2f"),
+                "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
+                "乖離30MA(%)": st.column_config.ProgressColumn("30MA乖離", width=120, help=f"上限 {user_bias}%", format="%.2f%%", min_value=0, max_value=user_bias),
+                "量比20日": st.column_config.NumberColumn("量比", width=70, format="%.2fx"),
+                "量變動(%)": st.column_config.NumberColumn("量變動", width=80, format="%.1f%%"),
+                "營收月增": st.column_config.NumberColumn("月增", width=75, format="%.1f%%"),
+                "營收年增": st.column_config.NumberColumn("年增", width=75, format="%.1f%%"),
+                "本益比": st.column_config.NumberColumn("PE", width=65, format="%.1f"),
+                "成交量(張)": st.column_config.NumberColumn("成交量", width=95, format="%d"),
+                "類股": st.column_config.TextColumn("產業別", width=120),
+            }
+        )
+        if event and "selection" in event and event["selection"]["rows"]:
+            clicked_view_row = event["selection"]["rows"][0]
+            selected_code = str(view_df.iloc[clicked_view_row]['code'])
+            matches = df.index[df['code'].astype(str) == selected_code].tolist()
+            if matches:
+                st.session_state.current_idx = matches[0]
+                st.session_state.last_selected_row = clicked_view_row
+                current_stock = df.iloc[st.session_state.current_idx]
+
+        st.caption(f"目前選擇：{current_stock['code']} {current_stock['name']}。切換到個股圖表、AI 分析或個股新聞即可查看。")
+    else:
+        st.info("目前沒有候選股票。請先到「選股掃描」頁簽執行掃描。")
+
+# ------------------------------------------------------------
+# TAB 3：個股圖表
+# ------------------------------------------------------------
+with tab_chart:
+    if has_results:
+        selector_options = [f"{r['code']}｜{r['name']}" for _, r in df.iterrows()]
+        selected_label = st.selectbox("選擇股票", selector_options, index=st.session_state.current_idx, key="chart_stock_selector")
+        selected_idx = selector_options.index(selected_label)
+        if selected_idx != st.session_state.current_idx:
+            st.session_state.current_idx = selected_idx
+            current_stock = df.iloc[selected_idx]
+
+        price = current_stock.get('收盤', np.nan)
+        chg = current_stock.get('漲跌幅(%)', np.nan)
+        chg_color = 'var(--green)' if pd.notna(chg) and chg >= 0 else 'var(--red)'
+        chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.2f}%"
+        prev_est = np.nan if pd.isna(price) or pd.isna(chg) or chg == -100 else price / (1 + chg / 100)
+        chg_amt = np.nan if pd.isna(prev_est) else price - prev_est
+        chg_amt_txt = 'N/A' if pd.isna(chg_amt) else f"{chg_amt:+.2f}"
+        score_val = current_stock.get('AI評分', np.nan)
+        score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
+        vol_ratio_txt = fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')
+
+        st.markdown(f"""
+        <div class="quote-panel">
+          <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div></div>
+          <div><span class="quote-price">{fmt_num(price, '{:.2f}')}</span><span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span></div>
+          <div class="quote-metrics">
+            <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
+            <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
+            <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
           </div>
         </div>
         """, unsafe_allow_html=True)
 
-    # ============================================================
-    # 9. 新聞
-    # ============================================================
-    st.markdown(f"""
-    <div class="tv-section">個股即時新聞 · {current_stock['name']} ({current_stock['code']})</div>
-    """, unsafe_allow_html=True)
+        nav_space, nav1, nav2 = st.columns([3.4, 0.8, 0.8])
+        with nav1:
+            if st.button("← 上一檔", use_container_width=True, key="chart_prev"):
+                st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
+                st.rerun()
+        with nav2:
+            if st.button("下一檔 →", use_container_width=True, key="chart_next"):
+                st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
+                st.rerun()
 
-    news_list = get_tw_stock_news(current_stock['code'])
-    if news_list:
-        for n in news_list:
-            badge_bg = (
-                "rgba(34,171,148,0.14)"  if "利多" in n["sentiment"]
-                else "rgba(242,54,69,0.14)" if "利空" in n["sentiment"]
-                else "rgba(41,98,255,0.12)"
-            )
-            st.markdown(f"""
-            <div class="news-card" style="
-                background:linear-gradient(135deg,rgba(4,14,26,0.8),rgba(2,8,15,0.9));
-                border:1px solid rgba(40,80,100,0.2);
-                border-left:2px solid {n['color']};
-                border-radius:10px;padding:13px 16px;margin-bottom:9px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
-                <span style="background:{badge_bg};color:{n['color']};border:1px solid {n['color']}40;
-                  padding:2px 10px;border-radius:999px;font-family:Roboto Mono,monospace;
-                  font-size:11px;letter-spacing:1px;">{n['sentiment']}</span>
-                <span style="font-family:Roboto Mono,monospace;color:#8b949e;font-size:11px;">{n['publisher']}</span>
-              </div>
-              <a class="news-title" href="{n['link']}" target="_blank" style="
-                text-decoration:none;color:#e6edf3;
-                font-family:Noto Sans TC,sans-serif;
-                font-size:14px;font-weight:400;line-height:1.6;letter-spacing:0.5px;">
-                {n['title']}</a>
-            </div>
-            """, unsafe_allow_html=True)
+        k_fig = draw_k_line(current_stock['ticker'], current_stock['name'], chart_mode='K線圖', chart_period='日')
+        if k_fig:
+            render_kline_chart_with_axis_price(k_fig, height=680)
+            try:
+                preload_tickers = [df.iloc[(st.session_state.current_idx + offset) % total_found]['ticker'] for offset in (-1, 1)]
+                warm_kline_data_async(preload_tickers)
+            except Exception:
+                pass
+        else:
+            st.warning("無法載入 K 線資料，請稍後再試。")
     else:
-        st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
+        st.info("尚無可顯示的股票。請先執行選股掃描。")
 
-else:
-    if not st.session_state.is_scanning:
-        st.markdown("""
-        <div class="tv-panel" style="text-align:center;padding:46px 22px;margin-top:18px;">
-          <div style="font-size:40px;margin-bottom:12px;">🔎</div>
-          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">確認上方條件後，按下「開始全市場掃描」。<br>完成後會顯示候選清單、K 線、AI 分析與個股新聞。</div>
+# ------------------------------------------------------------
+# TAB 4：AI 分析
+# ------------------------------------------------------------
+with tab_ai:
+    if has_results:
+        selector_options_ai = [f"{r['code']}｜{r['name']}" for _, r in df.iterrows()]
+        selected_ai = st.selectbox("選擇股票", selector_options_ai, index=st.session_state.current_idx, key="ai_stock_selector")
+        ai_idx = selector_options_ai.index(selected_ai)
+        if ai_idx != st.session_state.current_idx:
+            st.session_state.current_idx = ai_idx
+            current_stock = df.iloc[ai_idx]
+
+        report = build_ai_report(current_stock)
+        score_val = current_stock.get('AI評分', np.nan)
+        score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
+        rsi_txt = fmt_num(current_stock.get('RSI14', np.nan), '{:.1f}')
+        macd_txt = fmt_num(current_stock.get('MACD柱', np.nan), '{:.3f}')
+        main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
+        cost_gap_txt = fmt_num(current_stock.get('主力成本乖離(%)', np.nan), '{:+.2f}%')
+        radar_items = [x for x in str(current_stock.get('飆股雷達', '')).split('、') if x and x != '觀察'] or ['等待更強共振訊號']
+
+        st.markdown(f"""
+        <div class="quote-panel">
+          <div class="quote-head"><div class="quote-title">{current_stock['code']} {current_stock['name']}</div><div class="bias-chip">{report['盤面強弱']}</div></div>
+          <div class="quote-metrics">
+            <div><div class="metric-k">AI 綜合評分</div><div class="metric-v">{score_txt}</div></div>
+            <div><div class="metric-k">RSI14</div><div class="metric-v">{rsi_txt}</div></div>
+            <div><div class="metric-k">MACD 柱</div><div class="metric-v">{macd_txt}</div></div>
+          </div>
         </div>
         """, unsafe_allow_html=True)
+
+        ai_left, ai_right = st.columns([1.6, 1], gap="medium")
+        with ai_left:
+            st.markdown(f"""
+            <div class="side-card">
+              <div class="side-title">AI 綜合判讀</div>
+              <div class="report-row"><span>盤面強弱</span><span>{report['盤面強弱']}</span></div>
+              <div class="report-row"><span>主力成本</span><span>{main_cost_txt}</span></div>
+              <div class="report-row"><span>成本乖離</span><span>{cost_gap_txt}</span></div>
+              <div style="color:#c7d5e6;font-size:13px;line-height:1.9;margin-top:14px;"><b>趨勢結構</b><br>{report['趨勢結構']}<br><br><b>動能訊號</b><br>{report['動能訊號']}<br><br><b>財務訊號</b><br>{report['財務訊號']}</div>
+            </div>
+            <div class="side-card"><div class="side-title">高機率劇本</div><div style="color:#c7d5e6;font-size:14px;line-height:1.9;">{report['劇本']}</div></div>
+            """, unsafe_allow_html=True)
+        with ai_right:
+            st.markdown(f"""
+            <div class="side-card">
+              <div class="side-title"><span>飆股雷達</span><span class="bias-chip">HOT</span></div>
+              <div class="radar-check">{''.join([f'<div><b>✓</b>{item}</div>' for item in radar_items[:8]])}</div>
+            </div>
+            <div class="side-card"><div class="side-title">風險提醒</div><div style="color:#c7d5e6;font-size:13px;line-height:1.9;">{report['主力成本']}<br><br>AI 評分是條件整合結果，不代表保證獲利；仍需搭配停損、部位控管與市場環境判斷。</div></div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("尚無 AI 分析資料。請先執行選股掃描。")
+
+# ------------------------------------------------------------
+# TAB 5：個股新聞
+# ------------------------------------------------------------
+with tab_news:
+    if has_results:
+        selector_options_news = [f"{r['code']}｜{r['name']}" for _, r in df.iterrows()]
+        selected_news = st.selectbox("選擇股票", selector_options_news, index=st.session_state.current_idx, key="news_stock_selector")
+        news_idx = selector_options_news.index(selected_news)
+        if news_idx != st.session_state.current_idx:
+            st.session_state.current_idx = news_idx
+            current_stock = df.iloc[news_idx]
+
+        st.markdown(f'<div class="section-head"><div><div class="section-title">{current_stock["name"]} ({current_stock["code"]}) 最新新聞</div><div class="section-help">依標題關鍵字初步標記利多、利空或一般資訊。</div></div></div>', unsafe_allow_html=True)
+        news_list = get_tw_stock_news(current_stock['code'])
+        if news_list:
+            for n in news_list:
+                badge_bg = "rgba(34,171,148,0.14)" if "利多" in n["sentiment"] else "rgba(242,54,69,0.14)" if "利空" in n["sentiment"] else "rgba(41,98,255,0.12)"
+                st.markdown(f"""
+                <div class="news-card" style="border:1px solid rgba(40,80,100,0.2);border-left:2px solid {n['color']};padding:14px 16px;margin-bottom:10px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+                    <span style="background:{badge_bg};color:{n['color']};border:1px solid {n['color']}40;padding:2px 10px;border-radius:999px;font-size:11px;">{n['sentiment']}</span>
+                    <span style="color:#8b949e;font-size:11px;">{n['publisher']}</span>
+                  </div>
+                  <a class="news-title" href="{n['link']}" target="_blank" style="text-decoration:none;color:#e6edf3;font-size:14px;line-height:1.65;">{n['title']}</a>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
+    else:
+        st.info("尚無可查詢新聞的股票。請先執行選股掃描。")
+
