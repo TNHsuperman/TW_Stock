@@ -433,7 +433,9 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
             continue
         closes  = df["close"]
         volumes = df["volume"]
-        if volumes.tail(5).mean() < vol_limit:
+        # [修正] 零成交防呆：即使使用者把成交量門檻設為 0，
+        # 近 5 日均量不足 1 張的殭屍股也一律排除（無成交時收盤只是參考價，訊號無意義）。
+        if volumes.tail(5).mean() < max(vol_limit, 1):
             continue
         ma30 = closes.rolling(30).mean().iloc[-1]
         ma45 = closes.rolling(45).mean().iloc[-1]
@@ -441,6 +443,9 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
         curr_price   = float(closes.iloc[-1])
         vol_today    = int(volumes.iloc[-1])
         vol_yesterday = float(volumes.iloc[-2])
+        # [修正] 今日 0 成交（今日價格為參考價，非真實成交價）直接跳過
+        if vol_today <= 0:
+            continue
         bias_30   = ((curr_price - ma30) / ma30) * 100
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
@@ -1215,29 +1220,60 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
             except:
                 pass
     else:
+        # [修正] 上櫃 K 線資料來源升級：
+        # 1) 櫃買中心官網已改版，優先使用新版 API（/www/zh-tw/afterTrading/tradingStock）。
+        # 2) 舊版 st43_result.php 保留作備援（部分環境仍可用）。
+        # 3) 修正原有 bug：TPEx 成交欄位單位是「仟股」（1 仟股 = 1 張），
+        #    原程式又除以 1000，導致上櫃股 K 線成交量少了 1000 倍。
+        def parse_tpex_rows(data_rows):
+            parsed = 0
+            for row in data_rows or []:
+                try:
+                    yy, mm, dd = str(row[0]).strip().split("/")
+                    rows.append({
+                        "date":   f"{int(yy)+1911}-{mm}-{dd}",
+                        "open":   float(str(row[3]).replace(",", "")),
+                        "high":   float(str(row[4]).replace(",", "")),
+                        "low":    float(str(row[5]).replace(",", "")),
+                        "close":  float(str(row[6]).replace(",", "")),
+                        # 仟股 = 張，不需再除以 1000
+                        "volume": int(float(str(row[1]).replace(",", ""))),
+                    })
+                    parsed += 1
+                except Exception:
+                    pass
+            return parsed
+
         for delta in range(months):
             month_offset = now.month - delta
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
-            roc_ym = f"{year_offset - 1911}/{month_val:02d}"
-            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
-            try:
-                r = requests.get(url, headers=get_headers(), timeout=10)
-                for row in r.json().get("aaData", []):
-                    try:
-                        yy, mm, dd = str(row[0]).split("/")
-                        rows.append({
-                            "date":   f"{int(yy)+1911}-{mm}-{dd}",
-                            "open":   float(str(row[3]).replace(",", "")),
-                            "high":   float(str(row[4]).replace(",", "")),
-                            "low":    float(str(row[5]).replace(",", "")),
-                            "close":  float(str(row[6]).replace(",", "")),
-                            "volume": int(str(row[1]).replace(",", "")) // 1000,
-                        })
-                    except:
-                        pass
-            except:
-                pass
+            roc_ym  = f"{year_offset - 1911}/{month_val:02d}"
+            candidate_urls = [
+                # 新版官網 API（改版後的主要來源）
+                f"https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code={code}&date={year_offset}/{month_val:02d}/01&response=json",
+                # 舊版 API 備援
+                f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}",
+            ]
+            for url in candidate_urls:
+                try:
+                    r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
+                    if r.status_code != 200:
+                        continue
+                    payload = r.json()
+                    data_rows = []
+                    if isinstance(payload, dict):
+                        # 新版格式：{"tables": [{"data": [...]}]}
+                        tables = payload.get("tables")
+                        if isinstance(tables, list) and tables and isinstance(tables[0], dict):
+                            data_rows = tables[0].get("data") or []
+                        # 舊版格式：{"aaData": [...]}
+                        if not data_rows:
+                            data_rows = payload.get("aaData") or payload.get("data") or []
+                    if parse_tpex_rows(data_rows) > 0:
+                        break  # 這個月抓到了，換下一個月
+                except Exception:
+                    continue
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
@@ -2528,7 +2564,7 @@ if not st.session_state.scan_results.empty:
             except Exception:
                 pass
         else:
-            st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
+            st.warning("⚠️ 無法載入 K 線資料。可能原因：該股成交極為冷清（資料來源無足夠交易紀錄），或官方 API 暫時無回應，請稍後再試。")
 
     with right_area:
         st.markdown(f"""
