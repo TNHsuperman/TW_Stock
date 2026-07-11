@@ -1762,7 +1762,7 @@ with tab_list:
         if quick_filter == "AI 評分 80 分以上":
             view_df = view_df[view_df['AI評分'] >= 80]
         elif quick_filter == "營收年增為正":
-            view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0]
+            view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0] 
         elif quick_filter == "量比 1.5 倍以上":
             view_df = view_df[pd.to_numeric(view_df['量比20日'], errors='coerce') >= 1.5]
         elif quick_filter == "突破 20 日高":
