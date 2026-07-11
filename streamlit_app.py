@@ -58,6 +58,12 @@ for key, default in [
     ('user_vol',          500),
     ('chart_mode',       'K線圖'),
     ('chart_period',     '日'),
+    # [新功能] 大盤濾網 / 排除機制 / 回測
+    ('use_market_filter', True),   # 空頭環境自動調降評分
+    ('excl_disposal',     True),   # 排除處置股 / 全額交割股
+    ('excl_attention',    False),  # 排除注意股（預設僅標示不排除）
+    ('market_regime_info', None),  # 掃描當下的大盤環境快照
+    ('backtest_result',   None),   # 回測明細 DataFrame
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -342,10 +348,26 @@ def download_batch_history(tickers: tuple) -> dict:
                 pass
     return result
 
-def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
+# 非個股類型的產業別，掃描時一律排除（避免 ETF / 權證 / 存託憑證混入結果）。
+NON_STOCK_INDUSTRIES = {'ETF', '存託憑證', '受益證券', '認購售權證', '管理股票'}
+
+
+def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
+                    excluded_codes=None, attention_codes=None):
+    """[新功能4] excluded_codes: 處置/全額交割等應排除的代碼集合。
+    attention_codes: 注意股代碼集合，不排除但會標記警示。"""
+    excluded_codes  = excluded_codes or set()
+    attention_codes = attention_codes or set()
     hits = []
     for s in stock_map:
         tk = s["ticker"]
+        # [新功能4] 排除機制：非個股類型 / 處置股 / 全額交割股
+        if s.get('industry') in NON_STOCK_INDUSTRIES:
+            continue
+        if str(s.get('code', '')).startswith('00'):   # 00 開頭多為 ETF / ETN
+            continue
+        if s.get('code') in excluded_codes:
+            continue
         df = history_map.get(tk)
         if df is None or len(df) < 65:
             continue
@@ -382,6 +404,12 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
                 "MACD柱":     round(calc_macd_hist(closes), 3),
                 "突破20日高":  curr_price >= high20,
                 "接近60日高":  curr_price >= high60 * 0.97,
+                # [新功能3] 保留均線數值，供出場守則計算防守價
+                "MA30":       round(float(ma30), 2),
+                "MA45":       round(float(ma45), 2),
+                "MA60":       round(float(ma60), 2),
+                # [新功能4] 注意股僅標示，不直接排除（可由設定改為排除）
+                "注意股":     s.get('code') in attention_codes,
             })
     return hits
 
@@ -1510,6 +1538,276 @@ def get_tw_stock_news(code):
         return None
 
 # ============================================================
+# 2.5 [新功能] 大盤濾網 / 排除清單 / 出場守則 / 策略回測
+# ============================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_market_regime() -> dict:
+    """[新功能1] 大盤濾網：抓加權指數 (^TWII) 判斷多空環境。
+
+    判斷規則（簡單且穩健）：
+    - 多頭：收盤 > 60MA 且 20MA > 60MA
+    - 空頭：收盤 < 60MA 且 20MA < 60MA
+    - 其餘：震盪
+    均線多頭排列策略在空頭市場勝率會明顯下降，掃描時據此提示與調降評分。
+    """
+    info = {
+        'regime': '未知', 'close': np.nan, 'chg_pct': np.nan,
+        'ma20': np.nan, 'ma60': np.nan, 'position': 'N/A',
+        'suggestion': '大盤資料暫時無法取得；策略照常執行，但請自行留意大盤風險。',
+    }
+    try:
+        raw = yf.download("^TWII", period="9mo", interval="1d",
+                          auto_adjust=True, progress=False)
+        if raw is None or raw.empty:
+            return info
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        closes = raw['Close'].dropna()
+        if len(closes) < 60:
+            return info
+        close = float(closes.iloc[-1])
+        prev  = float(closes.iloc[-2])
+        ma20  = float(closes.rolling(20).mean().iloc[-1])
+        ma60  = float(closes.rolling(60).mean().iloc[-1])
+        chg   = (close / prev - 1) * 100 if prev > 0 else np.nan
+
+        if close > ma60 and ma20 > ma60:
+            regime, position = '多頭', '正常部位'
+            suggestion = '大盤趨勢偏多，均線多頭訊號可信度較高，可依計畫正常配置部位。'
+        elif close < ma60 and ma20 < ma60:
+            regime, position = '空頭', '低水位 / 觀望'
+            suggestion = '大盤處於空頭結構，多頭訊號勝率通常明顯下降；建議僅小量試單或觀望，嚴設停損。'
+        else:
+            regime, position = '震盪', '約五成部位'
+            suggestion = '大盤位於震盪區間，訊號雜訊較多；建議降低部位並提高停損紀律。'
+
+        info.update({'regime': regime, 'close': round(close, 2), 'chg_pct': round(chg, 2),
+                     'ma20': round(ma20, 2), 'ma60': round(ma60, 2),
+                     'position': position, 'suggestion': suggestion})
+    except Exception:
+        pass
+    return info
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def get_excluded_stock_sets() -> dict:
+    """[新功能4] 抓取官方警示名單：處置股、變更交易（全額交割）、注意股。
+
+    來源為 TWSE / TPEx OpenAPI；任何來源抓取失敗都回傳空集合，
+    不會影響掃描主流程（fail-open 設計）。
+    """
+    disposal, attention, altered = set(), set(), set()
+
+    def collect(url, target: set):
+        data = _fetch_json(url, timeout=6)
+        rows = []
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            for key in ['data', 'Data', 'aaData', 'tables']:
+                if isinstance(data.get(key), list):
+                    rows = data[key]
+                    break
+        for rec in rows:
+            if isinstance(rec, dict):
+                code = _find_record_code(rec)
+                if code:
+                    target.add(code)
+
+    # 處置有價證券（上市 / 上櫃）
+    collect("https://openapi.twse.com.tw/v1/announcement/punish", disposal)
+    collect("https://www.tpex.org.tw/openapi/v1/tpex_disposal_information", disposal)
+    # 注意有價證券（上市 / 上櫃）
+    collect("https://openapi.twse.com.tw/v1/announcement/notice", attention)
+    collect("https://www.tpex.org.tw/openapi/v1/tpex_attention_information", attention)
+    # 變更交易方法（全額交割）；API 名稱若調整，此處 fail-open 不影響掃描
+    collect("https://openapi.twse.com.tw/v1/opendata/t187ap04_L", altered)
+
+    return {'disposal': disposal, 'attention': attention, 'altered': altered}
+
+
+def build_exit_plan(stock: pd.Series) -> dict:
+    """[新功能3] 出場守則：回答「買了之後怎麼辦」。
+
+    - 趨勢防守價：MA30，收盤跌破視為趨勢轉弱出場訊號。
+    - 成本防守價：近 20 日量價加權主力成本。
+    - 建議停損價：兩者取較高（較靠近現價）者，控制單筆虧損。
+    - 另掃描 RSI 過熱 / MACD 柱轉負 / 跌破成本等即時警訊。
+    """
+    price     = stock.get('收盤', np.nan)
+    ma30      = stock.get('MA30', np.nan)
+    main_cost = stock.get('主力成本', np.nan)
+    rsi       = stock.get('RSI14', np.nan)
+    macd_hist = stock.get('MACD柱', np.nan)
+    cost_gap  = stock.get('主力成本乖離(%)', np.nan)
+
+    candidates = [v for v in [ma30, main_cost] if pd.notna(v) and v > 0]
+    stop_price = max(candidates) if candidates else np.nan
+    stop_gap   = ((stop_price / price) - 1) * 100 if pd.notna(stop_price) and pd.notna(price) and price > 0 else np.nan
+
+    alerts = []
+    if pd.notna(price) and pd.notna(ma30) and price < ma30:
+        alerts.append('收盤已跌破 MA30，趨勢防守失守')
+    if pd.notna(cost_gap) and cost_gap < 0:
+        alerts.append('現價低於主力成本，籌碼優勢轉弱')
+    if pd.notna(rsi) and rsi > 78:
+        alerts.append(f'RSI {rsi:.0f} 過熱，避免追高並留意回檔')
+    if pd.notna(macd_hist) and macd_hist < 0:
+        alerts.append('MACD 柱轉負，短線動能轉弱')
+
+    return {
+        'ma30': ma30,
+        'main_cost': main_cost,
+        'stop_price': stop_price,
+        'stop_gap': stop_gap,
+        'alerts': alerts,
+        'trail_rule': '移動停利：獲利超過 10% 後，改以 MA30 作為移動停損；收盤跌破即出場保住獲利。',
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_strategy_backtest(tickers: tuple, bias_limit: float, vol_limit: int) -> pd.DataFrame:
+    """[新功能2] 策略回測：用與掃描完全相同的條件，檢驗近一年歷史訊號表現。
+
+    條件：MA30 > MA45 > MA60、0 <= 30MA乖離 <= bias_limit、近5日均量 >= vol_limit。
+    同一檔股票 5 個交易日內只取一次訊號（cooldown），避免連續訊號灌水。
+    回傳每筆訊號的 5 / 10 / 20 日持有報酬明細。
+    """
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(" ".join(tickers), period="1y", interval="1d",
+                          group_by="ticker", auto_adjust=True,
+                          progress=False, threads=True)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    records = []
+    for tk in tickers:
+        try:
+            if len(tickers) == 1:
+                sub = raw[["Close", "Volume"]].dropna()
+            else:
+                sub = raw[tk][["Close", "Volume"]].dropna()
+        except Exception:
+            continue
+        if len(sub) < 70:
+            continue
+
+        closes  = sub["Close"].astype(float)
+        volumes = (sub["Volume"].astype(float) / 1000)  # 張
+        ma30 = closes.rolling(30).mean()
+        ma45 = closes.rolling(45).mean()
+        ma60 = closes.rolling(60).mean()
+        dates = sub.index
+
+        last_signal_i = -99
+        n = len(closes)
+        for i in range(64, n - 1):
+            if i - last_signal_i < 5:          # cooldown
+                continue
+            m30, m45, m60 = ma30.iloc[i], ma45.iloc[i], ma60.iloc[i]
+            if pd.isna(m30) or pd.isna(m45) or pd.isna(m60):
+                continue
+            if not (m30 > m45 > m60):
+                continue
+            bias = (closes.iloc[i] - m30) / m30 * 100
+            if not (0 <= bias <= bias_limit):
+                continue
+            if volumes.iloc[max(0, i - 4):i + 1].mean() < vol_limit:
+                continue
+
+            entry = float(closes.iloc[i])
+            rec = {
+                'ticker': tk,
+                '訊號日': pd.Timestamp(dates[i]).strftime('%Y-%m-%d'),
+                '進場價': round(entry, 2),
+                '乖離30MA(%)': round(float(bias), 2),
+            }
+            for horizon in (5, 10, 20):
+                if i + horizon < n:
+                    rec[f'{horizon}日報酬(%)'] = round((float(closes.iloc[i + horizon]) / entry - 1) * 100, 2)
+                else:
+                    rec[f'{horizon}日報酬(%)'] = np.nan
+            records.append(rec)
+            last_signal_i = i
+
+    return pd.DataFrame(records)
+
+
+def render_backtest_section(result_df: pd.DataFrame, bias_limit: float, vol_limit: int):
+    """[新功能2] 回測面板：顯示勝率 / 平均報酬 / 報酬分布。"""
+    st.markdown('<div class="tv-section">STRATEGY BACKTEST · 策略歷史回測</div>', unsafe_allow_html=True)
+    with st.expander("▸ 對目前掃描結果回測：近一年同條件訊號的 5 / 10 / 20 日表現", expanded=False):
+        st.caption(
+            "回測條件與掃描完全一致（MA30>MA45>MA60、乖離 0~上限、5日均量門檻），"
+            "同一檔 5 個交易日內僅取一次訊號。結果僅用於驗證策略邏輯，過去績效不代表未來表現，亦非投資建議。"
+        )
+        if st.button("▶ 執行回測", key="btn_backtest", use_container_width=True):
+            with st.spinner("回測中（下載一年歷史資料，約 10~60 秒）..."):
+                bt = run_strategy_backtest(
+                    tuple(result_df['ticker'].tolist()), float(bias_limit), int(vol_limit)
+                )
+            st.session_state.backtest_result = bt
+
+        bt = st.session_state.backtest_result
+        if bt is None:
+            return
+        if bt.empty:
+            st.info("回測期間內沒有產生符合條件的歷史訊號。")
+            return
+
+        # 各持有期間統計摘要
+        summary_rows = []
+        for h in (5, 10, 20):
+            col = f'{h}日報酬(%)'
+            s = bt[col].dropna() if col in bt.columns else pd.Series(dtype=float)
+            if s.empty:
+                continue
+            summary_rows.append({
+                '持有期間': f'{h} 日',
+                '訊號數': int(len(s)),
+                '勝率(%)': round(float((s > 0).mean() * 100), 1),
+                '平均報酬(%)': round(float(s.mean()), 2),
+                '中位數(%)': round(float(s.median()), 2),
+                '最差(%)': round(float(s.min()), 2),
+                '最佳(%)': round(float(s.max()), 2),
+            })
+        if summary_rows:
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+        # 20 日報酬分布直方圖（若樣本不足退回 10 日 / 5 日）
+        hist_col = next((f'{h}日報酬(%)' for h in (20, 10, 5)
+                         if f'{h}日報酬(%)' in bt.columns and bt[f'{h}日報酬(%)'].notna().sum() >= 5), None)
+        if hist_col:
+            s = bt[hist_col].dropna()
+            fig = go.Figure(go.Histogram(
+                x=s, nbinsx=30, marker_color='#3b82f6', opacity=0.85,
+                hovertemplate='報酬區間 %{x}<br>筆數 %{y}<extra></extra>',
+            ))
+            fig.add_vline(x=0, line_dash='dash', line_color='#f23645', line_width=1.2)
+            fig.update_layout(
+                title=dict(text=f'{hist_col} 分布（共 {len(s)} 筆訊號）', font=dict(size=13, color='#cbd5e1')),
+                height=300, template='plotly_dark',
+                paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                margin=dict(l=20, r=20, t=40, b=20), bargap=0.05,
+                xaxis=dict(title='報酬(%)', gridcolor='rgba(148,163,184,0.09)'),
+                yaxis=dict(title='筆數', gridcolor='rgba(148,163,184,0.09)'),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.download_button(
+            '⬇ 下載回測明細 CSV',
+            bt.to_csv(index=False).encode('utf-8-sig'),
+            file_name=f'backtest_detail_{get_tw_now().strftime("%Y%m%d")}.csv',
+            mime='text/csv', use_container_width=True,
+        )
+
+
+# ============================================================
 # 3. 全域 CSS（TradingView 機構終端機風格）
 # ============================================================
 
@@ -1727,9 +2025,30 @@ with st.expander("▸ 篩選參數", expanded=False):
         )
         st.session_state.user_vol = mb_vol
 
+    # [新功能1+4] 風控選項：大盤濾網 / 排除機制
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        st.session_state.use_market_filter = st.checkbox(
+            "啟用大盤濾網", value=st.session_state.use_market_filter, key="cb_market",
+            help="空頭環境自動調降個股評分（-12分）、震盪環境小幅調降（-5分），並提示建議部位水位。"
+        )
+    with fc2:
+        st.session_state.excl_disposal = st.checkbox(
+            "排除處置 / 全額交割股", value=st.session_state.excl_disposal, key="cb_disposal",
+            help="依 TWSE / TPEx 官方公告名單，直接自掃描結果排除。"
+        )
+    with fc3:
+        st.session_state.excl_attention = st.checkbox(
+            "排除注意股", value=st.session_state.excl_attention, key="cb_attention",
+            help="勾選則直接排除；未勾選時注意股仍會出現，但會加上 ⚠ 警示標記。"
+        )
+
 # 統一讀取最終值
 user_bias = st.session_state.user_bias
 user_vol  = st.session_state.user_vol
+use_market_filter = st.session_state.use_market_filter
+excl_disposal     = st.session_state.excl_disposal
+excl_attention    = st.session_state.excl_attention
 
 # ── 掃描按鈕 ──
 if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
@@ -1747,7 +2066,22 @@ if st.session_state.is_scanning:
     bar    = st.progress(0)
     BATCH  = 200
 
-    status.text("📋 Step 1/3：載入股票清單...")
+    # [新功能1] 大盤濾網：先判斷市場環境，作為後續評分調整與提示依據
+    status.text("🌐 Step 1/4：判斷大盤環境（加權指數）...")
+    bar.progress(0.01)
+    regime_info = get_market_regime()
+    st.session_state.market_regime_info = regime_info
+
+    # [新功能4] 抓官方警示名單（處置 / 全額交割 / 注意股）
+    excl_sets = get_excluded_stock_sets()
+    excluded_codes = set()
+    if excl_disposal:
+        excluded_codes |= excl_sets['disposal'] | excl_sets['altered']
+    if excl_attention:
+        excluded_codes |= excl_sets['attention']
+    attention_codes = excl_sets['attention']
+
+    status.text("📋 Step 2/4：載入股票清單...")
     bar.progress(0.03)
     stock_map    = get_stock_market_list()
     all_tickers  = [s["ticker"] for s in stock_map]
@@ -1756,13 +2090,16 @@ if st.session_state.is_scanning:
     history_map = {}
     batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
     for bi, batch in enumerate(batches):
-        status.text(f"📥 Step 2/3：批次下載 {bi+1}/{len(batches)}...")
+        status.text(f"📥 Step 3/4：批次下載 {bi+1}/{len(batches)}...")
         bar.progress(0.03 + 0.72 * (bi / len(batches)))
         history_map.update(download_batch_history(tuple(batch)))
 
     bar.progress(0.75)
-    status.text("✅ 計算均線中...")
-    initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
+    status.text("✅ Step 4/4：計算均線與排除警示股中...")
+    initial_hits = calc_ma_signals(
+        history_map, stock_map, user_bias, user_vol,
+        excluded_codes=excluded_codes, attention_codes=attention_codes,
+    )
     bar.progress(0.80)
 
     if initial_hits:
@@ -1796,8 +2133,22 @@ if st.session_state.is_scanning:
                     "本益比":      deep_res["pe"],
                     "營收月增":    deep_res["mom"],
                     "營收年增":    deep_res["yoy"],
+                    # [新功能3] 出場守則使用的均線數值
+                    "MA30":       base.get("MA30", np.nan),
+                    "MA45":       base.get("MA45", np.nan),
+                    "MA60":       base.get("MA60", np.nan),
+                    # [新功能4] 注意股警示標記
+                    "警示":       "⚠ 注意股" if base.get("注意股", False) else "",
                 }
                 score, radar = calc_stock_score(row_data)
+                # [新功能1] 大盤濾網：空頭 / 震盪環境調降評分，反映系統性風險
+                if use_market_filter:
+                    regime = (regime_info or {}).get('regime', '未知')
+                    if regime == '空頭':
+                        score = max(0, score - 12)
+                        radar.append('大盤空頭壓抑')
+                    elif regime == '震盪':
+                        score = max(0, score - 5)
                 row_data["AI評分"] = score
                 row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
                 final_list.append(row_data)
@@ -1820,13 +2171,31 @@ if not st.session_state.scan_results.empty:
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
 
-    # ── 精簡統計列：移除 Avg AI Score / Rocket Radar 與熱門族群區塊 ──
+    # ── [新功能1] 大盤環境卡片與空頭警示 ──
+    regime_info = st.session_state.market_regime_info or {}
+    regime = regime_info.get('regime', '未知')
+    regime_color = {'多頭': 'var(--tv-green)', '空頭': 'var(--tv-red)',
+                    '震盪': 'var(--tv-yellow)'}.get(regime, '#8f9bad')
+    twii_txt = fmt_num(regime_info.get('close', np.nan), '{:,.0f}')
+    twii_chg = regime_info.get('chg_pct', np.nan)
+    twii_chg_txt = 'N/A' if pd.isna(twii_chg) else f"{twii_chg:+.2f}%"
+
+    if regime == '空頭' and use_market_filter:
+        st.warning(f"⚠️ 大盤濾網警示：加權指數目前為空頭結構（收盤 {twii_txt}，20MA 低於 60MA）。"
+                   f"多頭訊號勝率通常明顯下降，所有評分已自動調降 12 分。{regime_info.get('suggestion','')}")
+
+    # ── 精簡統計列（加入大盤環境）──
     st.markdown(f"""
-    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px;">
+    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px;">
       <div class="tv-card">
         <div class="tv-label">Total Signals</div>
         <div class="tv-value" style="color:#8fb2ff;">{total_found}</div>
         <div class="tv-caption">符合條件標的</div>
+      </div>
+      <div class="tv-card">
+        <div class="tv-label">Market Regime · 大盤環境</div>
+        <div class="tv-value" style="font-size:20px;color:{regime_color};">{regime} <span style="font-size:13px;color:#8f9bad;">TAIEX {twii_txt} ({twii_chg_txt})</span></div>
+        <div class="tv-caption">建議部位：{regime_info.get('position', 'N/A')}</div>
       </div>
       <div class="tv-card">
         <div class="tv-label">Bias / Volume</div>
@@ -1847,7 +2216,7 @@ if not st.session_state.scan_results.empty:
         )
 
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "市場別", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "市場別", "警示", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股", "市場別": "市場"})
 
@@ -1870,6 +2239,7 @@ if not st.session_state.scan_results.empty:
             "代碼":        st.column_config.TextColumn("代碼",    width=70),
             "名稱":        st.column_config.TextColumn("名稱",    width=100),
             "市場":        st.column_config.TextColumn("市場",    width=70),
+            "警示":        st.column_config.TextColumn("警示",    width=85, help="官方注意股名單標記"),
             "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
@@ -1897,6 +2267,9 @@ if not st.session_state.scan_results.empty:
         進度條滿格代表 30MA 乖離接近上限 {user_bias}%；綠字為正增長，紅字為負增長；點擊任一列可切換 K 線。
     </div>
     """, unsafe_allow_html=True)
+
+    # ── [新功能2] 策略回測面板 ──
+    render_backtest_section(df, user_bias, user_vol)
 
     # ============================================================
     # 8. 個股總覽 / K 線 + 成交量整合圖 / 右側 AI 面板
@@ -1996,6 +2369,29 @@ if not st.session_state.scan_results.empty:
             <span class="tv-caption">綜合評分</span>
             <span style="font-family:Roboto Mono,monospace;font-size:26px;font-weight:800;color:var(--tv-green);">{score_txt}</span>
           </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── [新功能3] 出場守則卡片 ──
+        exit_plan = build_exit_plan(current_stock)
+        stop_txt = fmt_num(exit_plan['stop_price'], '{:.2f}')
+        stop_gap_txt = '' if pd.isna(exit_plan['stop_gap']) else f"（距現價 {exit_plan['stop_gap']:+.1f}%）"
+        if exit_plan['alerts']:
+            alert_html = ''.join([
+                f'<div style="color:#f8a5a5;font-size:13px;line-height:1.8;"><b style="color:var(--tv-red);margin-right:8px;">✕</b>{a}</div>'
+                for a in exit_plan['alerts']
+            ])
+        else:
+            alert_html = '<div style="color:#8ef0aa;font-size:13px;line-height:1.8;"><b style="color:var(--tv-green);margin-right:8px;">✓</b>目前未觸發任何出場警訊</div>'
+        st.markdown(f"""
+        <div class="side-card">
+          <div class="side-title"><span>出場守則</span><span class="bias-chip" style="background:rgba(239,68,68,.14);color:#f8a5a5;border-color:rgba(239,68,68,.3);">RISK</span></div>
+          <div class="report-row"><span>趨勢防守價 (MA30)</span><span>{fmt_num(exit_plan['ma30'], '{:.2f}')}</span></div>
+          <div class="report-row"><span>成本防守價</span><span>{fmt_num(exit_plan['main_cost'], '{:.2f}')}</span></div>
+          <div class="report-row"><span>建議停損價</span><span style="color:var(--tv-red);">{stop_txt}</span></div>
+          <div class="tv-caption" style="margin-top:4px;">取 MA30 與主力成本較高者 {stop_gap_txt}，收盤跌破建議出場。</div>
+          <div style="margin-top:10px;">{alert_html}</div>
+          <div class="tv-caption" style="margin-top:10px;border-top:1px solid rgba(45,62,82,.45);padding-top:8px;">{exit_plan['trail_rule']}</div>
         </div>
         """, unsafe_allow_html=True)
 
