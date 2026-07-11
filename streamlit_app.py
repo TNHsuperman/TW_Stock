@@ -1581,15 +1581,14 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. 五頁簽工作台
+# 5. 四頁簽工作台
 # ============================================================
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
-tab_scan, tab_list, tab_chart, tab_ai, tab_news = st.tabs([
+tab_scan, tab_list_chart, tab_ai, tab_news = st.tabs([
     "🔍 選股掃描",
-    "📋 候選清單",
-    "📈 個股圖表",
+    "📋 候選清單與個股圖表",
     "🤖 AI 分析",
     "📰 個股新聞",
 ])
@@ -1711,7 +1710,7 @@ with tab_scan:
           <div class="tv-card"><div class="tv-label">最近掃描結果</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">符合條件股票</div></div>
           <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
           <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
-          <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">候選清單</div><div class="tv-caption">切換第二個頁簽選股</div></div>
+          <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">清單與圖表</div><div class="tv-caption">切換第二個頁簽選股並看圖</div></div>
         </div>
         """, unsafe_allow_html=True)
     elif not st.session_state.is_scanning:
@@ -1719,7 +1718,7 @@ with tab_scan:
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:18px;">
           <div style="font-size:40px;margin-bottom:12px;">🔎</div>
           <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「候選清單」頁簽。</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「候選清單與個股圖表」頁簽。</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1737,9 +1736,9 @@ else:
     current_stock = None
 
 # ------------------------------------------------------------
-# TAB 2：候選清單
+# TAB 2：候選清單與個股圖表
 # ------------------------------------------------------------
-with tab_list:
+with tab_list_chart:
     if has_results:
         avg_score = df['AI評分'].mean() if 'AI評分' in df.columns else np.nan
         strong_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
@@ -1748,7 +1747,7 @@ with tab_list:
           <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{total_found}</div><div class="tv-caption">本次候選股票</div></div>
           <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
           <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
-          <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">其他頁簽同步顯示</div></div>
+          <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">圖表與分析同步顯示</div></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1762,7 +1761,7 @@ with tab_list:
         if quick_filter == "AI 評分 80 分以上":
             view_df = view_df[view_df['AI評分'] >= 80]
         elif quick_filter == "營收年增為正":
-            view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0] 
+            view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0]
         elif quick_filter == "量比 1.5 倍以上":
             view_df = view_df[pd.to_numeric(view_df['量比20日'], errors='coerce') >= 1.5]
         elif quick_filter == "突破 20 日高":
@@ -1781,7 +1780,7 @@ with tab_list:
             color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
             return f'color: {color}; font-weight: bold'
 
-        st.markdown('<div class="section-head"><div><div class="section-title">候選股票清單</div><div class="section-help">點擊任一列，圖表、AI 分析與新聞頁簽會同步切換。</div></div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head"><div><div class="section-title">候選股票清單</div><div class="section-help">點擊任一列，下方個股圖表、AI 分析與新聞頁簽會同步切換。</div></div></div>', unsafe_allow_html=True)
         event = st.dataframe(
             df_display.style.map(color_tw_style, subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]),
             use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
@@ -1811,15 +1810,10 @@ with tab_list:
                 st.session_state.last_selected_row = clicked_view_row
                 current_stock = df.iloc[st.session_state.current_idx]
 
-        st.caption(f"目前選擇：{current_stock['code']} {current_stock['name']}。切換到個股圖表、AI 分析或個股新聞即可查看。")
-    else:
-        st.info("目前沒有候選股票。請先到「選股掃描」頁簽執行掃描。")
+        st.caption(f"目前選擇：{current_stock['code']} {current_stock['name']}。下方會直接顯示個股圖表。")
 
-# ------------------------------------------------------------
-# TAB 3：個股圖表
-# ------------------------------------------------------------
-with tab_chart:
-    if has_results:
+
+        st.markdown('<div class="section-head" style="margin-top:26px;"><div><div class="section-title">個股圖表</div><div class="section-help">在上方清單點選股票，或使用下拉選單、上一檔與下一檔切換。</div></div></div>', unsafe_allow_html=True)
         selector_options = [f"{r['code']}｜{r['name']}" for _, r in df.iterrows()]
         selected_label = st.selectbox("選擇股票", selector_options, index=st.session_state.current_idx, key="chart_stock_selector")
         selected_idx = selector_options.index(selected_label)
@@ -1870,11 +1864,12 @@ with tab_chart:
                 pass
         else:
             st.warning("無法載入 K 線資料，請稍後再試。")
+
     else:
-        st.info("尚無可顯示的股票。請先執行選股掃描。")
+        st.info("目前沒有候選股票。請先到「選股掃描」頁簽執行掃描。")
 
 # ------------------------------------------------------------
-# TAB 4：AI 分析
+# TAB 3：AI 分析
 # ------------------------------------------------------------
 with tab_ai:
     if has_results:
@@ -1929,7 +1924,7 @@ with tab_ai:
         st.info("尚無 AI 分析資料。請先執行選股掃描。")
 
 # ------------------------------------------------------------
-# TAB 5：個股新聞
+# TAB 4：個股新聞
 # ------------------------------------------------------------
 with tab_news:
     if has_results:
