@@ -591,7 +591,10 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 # ── 官方 API 本益比高速擷取 ───────────────────────────────
 # 改用 TWSE / TPEx 官方一次性批次資料，不再逐檔爬 Goodinfo。
 # 優點：速度快、穩定、不容易被擋；掃描時只要抓上市 + 上櫃兩包資料。
-PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "official_pe_cache.json")
+PE_CACHE_FILE = os.path.join(
+    os.path.dirname(__file__) if '__file__' in globals() else '.',
+    "official_pe_cache.json"
+)
 PE_CACHE_LOCK = threading.Lock()
 PE_CACHE_VERSION = "20260609_official_tpex_oldapi_yahoo_fallback_v2"
 
