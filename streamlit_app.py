@@ -18,6 +18,7 @@ import uuid
 import os
 import json
 import threading
+import multiprocessing as mp
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -70,6 +71,55 @@ for key, default in [
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
+
+# ============================================================
+# 1.5 [修正] 子行程隔離：避免 yfinance/curl_cffi 的 segmentation fault
+#     直接把整個 Streamlit 主行程一起打死
+# ============================================================
+# 背景：curl_cffi（yfinance 底層 HTTP 函式庫）在高併發 / 連續請求時，
+# 偶爾會觸發作業系統層級的 segmentation fault。這種錯誤是 C 底層崩潰，
+# Python 的 try/except 完全攔截不到，會直接終止整個行程（也就是整個
+# Streamlit App 一起爆掉，出現「Oh no」畫面）。
+# 解法：把所有會呼叫 yfinance 的動作丟到獨立子行程執行；子行程就算崩潰，
+# 也只會讓那一次資料抓取失敗（回傳 None），完全不影響主行程存活。
+
+def _isolated_call(target, args=(), timeout=60):
+    """在獨立子行程執行 target(*args)，回傳 (result, crashed)。
+    - result 為 None 代表逾時 / 例外 / 無資料。
+    - crashed=True 代表子行程是被系統訊號（例如 SIGSEGV）強制終止，
+      而不是正常執行完畢，呼叫端可依此決定要不要降級重試。
+    """
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+
+    def _runner(_q):
+        try:
+            _q.put(target(*args))
+        except Exception:
+            try:
+                _q.put(None)
+            except Exception:
+                pass
+
+    p = ctx.Process(target=_runner, args=(q,), daemon=True)
+    try:
+        p.start()
+    except Exception:
+        return None, True
+
+    result = None
+    try:
+        result = q.get(timeout=timeout)
+    except Exception:
+        result = None
+
+    p.join(3)
+    if p.is_alive():
+        p.terminate()
+        p.join(3)
+
+    crashed = (p.exitcode is not None and p.exitcode != 0)
+    return result, crashed
 
 # ============================================================
 # 2. 數據抓取
@@ -312,16 +362,26 @@ def get_stock_market_list():
     # 最後保底：回傳舊快取，即使不是今天，也比直接卡住或空白好。
     return load_local_cache(allow_stale=True)
 
+def _yf_download_worker(ticker_str: str, threads: bool):
+    """實際執行 yf.download 的子行程工作函式，必須是模組層級函式才能被 fork 正確使用。"""
+    try:
+        return yf.download(ticker_str, period="4mo", interval="1d",
+                           group_by="ticker", auto_adjust=True, progress=False, threads=threads)
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
         return {}
     ticker_str = " ".join(tickers)
-    try:
-        raw = yf.download(ticker_str, period="4mo", interval="1d",
-                          group_by="ticker", auto_adjust=True, progress=False, threads=True)
-    except Exception:
-        return {}
+
+    # [修正] 先以多執行緒（快）在子行程嘗試；若子行程崩潰或無資料，
+    # 改用單執行緒（穩，但較慢）重試一次，犧牲一點速度換穩定性。
+    raw, crashed = _isolated_call(_yf_download_worker, (ticker_str, True), timeout=60)
+    if crashed or raw is None or (hasattr(raw, "empty") and raw.empty):
+        raw, _ = _isolated_call(_yf_download_worker, (ticker_str, False), timeout=90)
 
     # [修正3] 下載失敗時提前返回，避免後續 KeyError
     if raw is None or raw.empty:
@@ -1204,6 +1264,13 @@ def warm_kline_data_async(stocks):
     except Exception:
         pass
 
+def _yf_ticker_history_worker(ticker: str):
+    try:
+        return yf.Ticker(ticker).history(period="1y")
+    except Exception:
+        return None
+
+
 def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     """畫出有實際切換功能的金融圖表。
     chart_mode: K線圖 / 走勢圖 / 技術指標
@@ -1213,9 +1280,9 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     market = "TW" if ticker.endswith(".TW") else "TWO"
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
-        yt  = yf.Ticker(ticker)
-        raw = yt.history(period="1y")
-        if raw.empty:
+        # [修正] yf.Ticker(...).history() 一樣走子行程隔離，避免 curl_cffi 崩潰拖垮主行程
+        raw, _crashed = _isolated_call(_yf_ticker_history_worker, (ticker,), timeout=25)
+        if raw is None or raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
                                   "Close": "close", "Volume": "volume"}).reset_index()
@@ -1544,6 +1611,28 @@ def get_tw_stock_news(code):
 # 2.5 [新功能] 大盤濾網 / 排除清單 / 出場守則 / 策略回測
 # ============================================================
 
+def _yf_twii_worker():
+    """子行程工作函式：抓取加權指數並直接算好摘要數值再回傳（回傳值需可被 pickle，
+    plain dict 比整包 DataFrame 更輕量、更安全）。"""
+    try:
+        raw = yf.download("^TWII", period="9mo", interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+        if raw is None or raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        closes = raw['Close'].dropna()
+        if len(closes) < 60:
+            return None
+        close = float(closes.iloc[-1])
+        prev  = float(closes.iloc[-2])
+        ma20  = float(closes.rolling(20).mean().iloc[-1])
+        ma60  = float(closes.rolling(60).mean().iloc[-1])
+        return {'close': close, 'prev': prev, 'ma20': ma20, 'ma60': ma60}
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_market_regime() -> dict:
     """[新功能1] 大盤濾網：抓加權指數 (^TWII) 判斷多空環境。
@@ -1553,43 +1642,36 @@ def get_market_regime() -> dict:
     - 空頭：收盤 < 60MA 且 20MA < 60MA
     - 其餘：震盪
     均線多頭排列策略在空頭市場勝率會明顯下降，掃描時據此提示與調降評分。
+
+    [修正] 實際下載動作丟到獨立子行程執行，避免 yfinance/curl_cffi 偶發的
+    segmentation fault 拖垮整個 Streamlit 主行程；子行程崩潰時直接視為
+    「大盤資料暫時無法取得」，不影響掃描主流程。
     """
     info = {
         'regime': '未知', 'close': np.nan, 'chg_pct': np.nan,
         'ma20': np.nan, 'ma60': np.nan, 'position': 'N/A',
         'suggestion': '大盤資料暫時無法取得；策略照常執行，但請自行留意大盤風險。',
     }
-    try:
-        raw = yf.download("^TWII", period="9mo", interval="1d",
-                          auto_adjust=True, progress=False)
-        if raw is None or raw.empty:
-            return info
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        closes = raw['Close'].dropna()
-        if len(closes) < 60:
-            return info
-        close = float(closes.iloc[-1])
-        prev  = float(closes.iloc[-2])
-        ma20  = float(closes.rolling(20).mean().iloc[-1])
-        ma60  = float(closes.rolling(60).mean().iloc[-1])
-        chg   = (close / prev - 1) * 100 if prev > 0 else np.nan
+    data, _crashed = _isolated_call(_yf_twii_worker, (), timeout=30)
+    if not data:
+        return info
 
-        if close > ma60 and ma20 > ma60:
-            regime, position = '多頭', '正常部位'
-            suggestion = '大盤趨勢偏多，均線多頭訊號可信度較高，可依計畫正常配置部位。'
-        elif close < ma60 and ma20 < ma60:
-            regime, position = '空頭', '低水位 / 觀望'
-            suggestion = '大盤處於空頭結構，多頭訊號勝率通常明顯下降；建議僅小量試單或觀望，嚴設停損。'
-        else:
-            regime, position = '震盪', '約五成部位'
-            suggestion = '大盤位於震盪區間，訊號雜訊較多；建議降低部位並提高停損紀律。'
+    close, prev, ma20, ma60 = data['close'], data['prev'], data['ma20'], data['ma60']
+    chg = (close / prev - 1) * 100 if prev > 0 else np.nan
 
-        info.update({'regime': regime, 'close': round(close, 2), 'chg_pct': round(chg, 2),
-                     'ma20': round(ma20, 2), 'ma60': round(ma60, 2),
-                     'position': position, 'suggestion': suggestion})
-    except Exception:
-        pass
+    if close > ma60 and ma20 > ma60:
+        regime, position = '多頭', '正常部位'
+        suggestion = '大盤趨勢偏多，均線多頭訊號可信度較高，可依計畫正常配置部位。'
+    elif close < ma60 and ma20 < ma60:
+        regime, position = '空頭', '低水位 / 觀望'
+        suggestion = '大盤處於空頭結構，多頭訊號勝率通常明顯下降；建議僅小量試單或觀望，嚴設停損。'
+    else:
+        regime, position = '震盪', '約五成部位'
+        suggestion = '大盤位於震盪區間，訊號雜訊較多；建議降低部位並提高停損紀律。'
+
+    info.update({'regime': regime, 'close': round(close, 2), 'chg_pct': round(chg, 2),
+                 'ma20': round(ma20, 2), 'ma60': round(ma60, 2),
+                 'position': position, 'suggestion': suggestion})
     return info
 
 
@@ -1669,6 +1751,15 @@ def build_exit_plan(stock: pd.Series) -> dict:
     }
 
 
+def _yf_backtest_download_worker(ticker_str: str, threads: bool):
+    try:
+        return yf.download(ticker_str, period="1y", interval="1d",
+                           group_by="ticker", auto_adjust=True,
+                           progress=False, threads=threads)
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_strategy_backtest(tickers: tuple, bias_limit: float, vol_limit: int) -> pd.DataFrame:
     """[新功能2] 策略回測：用與掃描完全相同的條件，檢驗近一年歷史訊號表現。
@@ -1676,15 +1767,16 @@ def run_strategy_backtest(tickers: tuple, bias_limit: float, vol_limit: int) -> 
     條件：MA30 > MA45 > MA60、0 <= 30MA乖離 <= bias_limit、近5日均量 >= vol_limit。
     同一檔股票 5 個交易日內只取一次訊號（cooldown），避免連續訊號灌水。
     回傳每筆訊號的 5 / 10 / 20 日持有報酬明細。
+
+    [修正] 下載動作在獨立子行程執行，避免 yfinance/curl_cffi 偶發崩潰拖垮主行程。
     """
     if not tickers:
         return pd.DataFrame()
-    try:
-        raw = yf.download(" ".join(tickers), period="1y", interval="1d",
-                          group_by="ticker", auto_adjust=True,
-                          progress=False, threads=True)
-    except Exception:
-        return pd.DataFrame()
+
+    ticker_str = " ".join(tickers)
+    raw, crashed = _isolated_call(_yf_backtest_download_worker, (ticker_str, True), timeout=90)
+    if crashed or raw is None or (hasattr(raw, "empty") and raw.empty):
+        raw, _ = _isolated_call(_yf_backtest_download_worker, (ticker_str, False), timeout=120)
     if raw is None or raw.empty:
         return pd.DataFrame()
 
