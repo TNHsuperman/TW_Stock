@@ -18,7 +18,6 @@ import uuid
 import os
 import json
 import threading
-import multiprocessing as mp
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -26,7 +25,7 @@ import multiprocessing as mp
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(
-    page_title="台股智慧選股",
+    page_title="台股智慧選股｜操作中心",
     layout="wide",
     page_icon="https://cdn-icons-png.flaticon.com/512/2953/2953423.png",
     initial_sidebar_state="collapsed",
@@ -59,67 +58,13 @@ for key, default in [
     ('user_vol',          500),
     ('chart_mode',       'K線圖'),
     ('chart_period',     '日'),
-    # [新功能] 大盤濾網 / 排除機制 / 回測
-    ('use_market_filter', True),   # 空頭環境自動調降評分
-    ('excl_disposal',     True),   # 排除處置股 / 全額交割股
-    ('excl_attention',    False),  # 排除注意股（預設僅標示不排除）
-    ('market_regime_info', None),  # 掃描當下的大盤環境快照
-    ('backtest_result',   None),   # 回測明細 DataFrame
+    ('show_guide',       True),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
-
-# ============================================================
-# 1.5 [修正] 子行程隔離：避免 yfinance/curl_cffi 的 segmentation fault
-#     直接把整個 Streamlit 主行程一起打死
-# ============================================================
-# 背景：curl_cffi（yfinance 底層 HTTP 函式庫）在高併發 / 連續請求時，
-# 偶爾會觸發作業系統層級的 segmentation fault。這種錯誤是 C 底層崩潰，
-# Python 的 try/except 完全攔截不到，會直接終止整個行程（也就是整個
-# Streamlit App 一起爆掉，出現「Oh no」畫面）。
-# 解法：把所有會呼叫 yfinance 的動作丟到獨立子行程執行；子行程就算崩潰，
-# 也只會讓那一次資料抓取失敗（回傳 None），完全不影響主行程存活。
-
-def _isolated_call(target, args=(), timeout=60):
-    """在獨立子行程執行 target(*args)，回傳 (result, crashed)。
-    - result 為 None 代表逾時 / 例外 / 無資料。
-    - crashed=True 代表子行程是被系統訊號（例如 SIGSEGV）強制終止，
-      而不是正常執行完畢，呼叫端可依此決定要不要降級重試。
-    """
-    ctx = mp.get_context("fork")
-    q = ctx.Queue()
-
-    def _runner(_q):
-        try:
-            _q.put(target(*args))
-        except Exception:
-            try:
-                _q.put(None)
-            except Exception:
-                pass
-
-    p = ctx.Process(target=_runner, args=(q,), daemon=True)
-    try:
-        p.start()
-    except Exception:
-        return None, True
-
-    result = None
-    try:
-        result = q.get(timeout=timeout)
-    except Exception:
-        result = None
-
-    p.join(3)
-    if p.is_alive():
-        p.terminate()
-        p.join(3)
-
-    crashed = (p.exitcode is not None and p.exitcode != 0)
-    return result, crashed
 
 # ============================================================
 # 2. 數據抓取
@@ -135,7 +80,7 @@ def get_stock_market_list():
     2) 再抓 TWSE / TPEx OpenAPI JSON，避免 read_html 大表格解析。
     3) OpenAPI 失敗時才用舊 ISIN HTML 備援，且 timeout 較短。
     """
-    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v3_no_etn.json')
+    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v2_industry_fixed.json')
     today = get_tw_now().strftime('%Y-%m-%d')
 
 
@@ -274,9 +219,7 @@ def get_stock_market_list():
             code = clean_code(pick(row, ['Code', '證券代號', '公司代號', '有價證券代號', 'SecuritiesCompanyCode', '股票代號']))
             name = pick(row, ['Name', '證券名稱', '公司簡稱', '有價證券名稱', '股票名稱', '公司名稱', 'CompanyName'])
             industry = normalize_industry(pick(row, ['產業別', '產業類別', 'Industry', 'industry'], '未分類'))
-            # [修正] 個股代碼不會以 0 開頭；0 開頭多為 ETF/ETN/受益證券，
-            # 且 6 碼 ETN 會被 clean_code 截成 4 碼混入清單（如 020018 → 0200）。
-            if len(code) == 4 and code.isdigit() and not code.startswith('0') and name:
+            if len(code) == 4 and code.isdigit() and name:
                 out.append({
                     'ticker': f'{code}.{market_suffix}',
                     'name': normalize_stock_name(name),
@@ -341,7 +284,7 @@ def get_stock_market_list():
                 val = str(row.get('有價證券代號及名稱', ''))
                 if '　' in val:
                     code, name = val.split('　', 1)
-                    if len(code) == 4 and code.isdigit() and not code.startswith('0'):
+                    if len(code) == 4 and code.isdigit():
                         key = f'{code}.{mkt}'
                         if key in seen:
                             continue
@@ -364,28 +307,16 @@ def get_stock_market_list():
     # 最後保底：回傳舊快取，即使不是今天，也比直接卡住或空白好。
     return load_local_cache(allow_stale=True)
 
-def _yf_download_worker(ticker_str: str, threads: bool):
-    """實際執行 yf.download 的子行程工作函式，必須是模組層級函式才能被 fork 正確使用。"""
-    try:
-        # [修正] threads 上限 4：避免 yfinance 內部全速多執行緒轟炸 Yahoo 觸發限流
-        return yf.download(ticker_str, period="4mo", interval="1d",
-                           group_by="ticker", auto_adjust=True, progress=False,
-                           threads=(4 if threads is True else threads))
-    except Exception:
-        return None
-
-
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
         return {}
     ticker_str = " ".join(tickers)
-
-    # [修正] 先以多執行緒（快）在子行程嘗試；只有在子行程「真的崩潰」時
-    # 才改用單執行緒重試（穩，但較慢）。查無資料不重試，避免白等。
-    raw, crashed = _isolated_call(_yf_download_worker, (ticker_str, True), timeout=45)
-    if crashed:
-        raw, _ = _isolated_call(_yf_download_worker, (ticker_str, False), timeout=60)
+    try:
+        raw = yf.download(ticker_str, period="4mo", interval="1d",
+                          group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    except Exception:
+        return {}
 
     # [修正3] 下載失敗時提前返回，避免後續 KeyError
     if raw is None or raw.empty:
@@ -412,34 +343,16 @@ def download_batch_history(tickers: tuple) -> dict:
                 pass
     return result
 
-# 非個股類型的產業別，掃描時一律排除（避免 ETF / 權證 / 存託憑證混入結果）。
-NON_STOCK_INDUSTRIES = {'ETF', '存託憑證', '受益證券', '認購售權證', '管理股票'}
-
-
-def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
-                    excluded_codes=None, attention_codes=None):
-    """[新功能4] excluded_codes: 處置/全額交割等應排除的代碼集合。
-    attention_codes: 注意股代碼集合，不排除但會標記警示。"""
-    excluded_codes  = excluded_codes or set()
-    attention_codes = attention_codes or set()
+def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
     hits = []
     for s in stock_map:
         tk = s["ticker"]
-        # [新功能4] 排除機制：非個股類型 / 處置股 / 全額交割股
-        if s.get('industry') in NON_STOCK_INDUSTRIES:
-            continue
-        if str(s.get('code', '')).startswith('0'):    # 0 開頭皆非個股（ETF/ETN/受益證券）
-            continue
-        if s.get('code') in excluded_codes:
-            continue
         df = history_map.get(tk)
         if df is None or len(df) < 65:
             continue
         closes  = df["close"]
         volumes = df["volume"]
-        # [修正] 零成交防呆：即使使用者把成交量門檻設為 0，
-        # 近 5 日均量不足 1 張的殭屍股也一律排除（無成交時收盤只是參考價，訊號無意義）。
-        if volumes.tail(5).mean() < max(vol_limit, 1):
+        if volumes.tail(5).mean() < vol_limit:
             continue
         ma30 = closes.rolling(30).mean().iloc[-1]
         ma45 = closes.rolling(45).mean().iloc[-1]
@@ -447,9 +360,6 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
         curr_price   = float(closes.iloc[-1])
         vol_today    = int(volumes.iloc[-1])
         vol_yesterday = float(volumes.iloc[-2])
-        # [修正] 今日 0 成交（今日價格為參考價，非真實成交價）直接跳過
-        if vol_today <= 0:
-            continue
         bias_30   = ((curr_price - ma30) / ma30) * 100
         vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
         if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
@@ -473,12 +383,6 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
                 "MACD柱":     round(calc_macd_hist(closes), 3),
                 "突破20日高":  curr_price >= high20,
                 "接近60日高":  curr_price >= high60 * 0.97,
-                # [新功能3] 保留均線數值，供出場守則計算防守價
-                "MA30":       round(float(ma30), 2),
-                "MA45":       round(float(ma45), 2),
-                "MA60":       round(float(ma60), 2),
-                # [新功能4] 注意股僅標示，不直接排除（可由設定改為排除）
-                "注意股":     s.get('code') in attention_codes,
             })
     return hits
 
@@ -660,10 +564,7 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 # ── 官方 API 本益比高速擷取 ───────────────────────────────
 # 改用 TWSE / TPEx 官方一次性批次資料，不再逐檔爬 Goodinfo。
 # 優點：速度快、穩定、不容易被擋；掃描時只要抓上市 + 上櫃兩包資料。
-PE_CACHE_FILE = os.path.join(
-    os.path.dirname(__file__) if '__file__' in globals() else '.',
-    "official_pe_cache.json"
-)
+PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "official_pe_cache.json")
 PE_CACHE_LOCK = threading.Lock()
 PE_CACHE_VERSION = "20260609_official_tpex_oldapi_yahoo_fallback_v2"
 
@@ -1224,60 +1125,29 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
             except:
                 pass
     else:
-        # [修正] 上櫃 K 線資料來源升級：
-        # 1) 櫃買中心官網已改版，優先使用新版 API（/www/zh-tw/afterTrading/tradingStock）。
-        # 2) 舊版 st43_result.php 保留作備援（部分環境仍可用）。
-        # 3) 修正原有 bug：TPEx 成交欄位單位是「仟股」（1 仟股 = 1 張），
-        #    原程式又除以 1000，導致上櫃股 K 線成交量少了 1000 倍。
-        def parse_tpex_rows(data_rows):
-            parsed = 0
-            for row in data_rows or []:
-                try:
-                    yy, mm, dd = str(row[0]).strip().split("/")
-                    rows.append({
-                        "date":   f"{int(yy)+1911}-{mm}-{dd}",
-                        "open":   float(str(row[3]).replace(",", "")),
-                        "high":   float(str(row[4]).replace(",", "")),
-                        "low":    float(str(row[5]).replace(",", "")),
-                        "close":  float(str(row[6]).replace(",", "")),
-                        # 仟股 = 張，不需再除以 1000
-                        "volume": int(float(str(row[1]).replace(",", ""))),
-                    })
-                    parsed += 1
-                except Exception:
-                    pass
-            return parsed
-
         for delta in range(months):
             month_offset = now.month - delta
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
-            roc_ym  = f"{year_offset - 1911}/{month_val:02d}"
-            candidate_urls = [
-                # 新版官網 API（改版後的主要來源）
-                f"https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code={code}&date={year_offset}/{month_val:02d}/01&response=json",
-                # 舊版 API 備援
-                f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}",
-            ]
-            for url in candidate_urls:
-                try:
-                    r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
-                    if r.status_code != 200:
-                        continue
-                    payload = r.json()
-                    data_rows = []
-                    if isinstance(payload, dict):
-                        # 新版格式：{"tables": [{"data": [...]}]}
-                        tables = payload.get("tables")
-                        if isinstance(tables, list) and tables and isinstance(tables[0], dict):
-                            data_rows = tables[0].get("data") or []
-                        # 舊版格式：{"aaData": [...]}
-                        if not data_rows:
-                            data_rows = payload.get("aaData") or payload.get("data") or []
-                    if parse_tpex_rows(data_rows) > 0:
-                        break  # 這個月抓到了，換下一個月
-                except Exception:
-                    continue
+            roc_ym = f"{year_offset - 1911}/{month_val:02d}"
+            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
+            try:
+                r = requests.get(url, headers=get_headers(), timeout=10)
+                for row in r.json().get("aaData", []):
+                    try:
+                        yy, mm, dd = str(row[0]).split("/")
+                        rows.append({
+                            "date":   f"{int(yy)+1911}-{mm}-{dd}",
+                            "open":   float(str(row[3]).replace(",", "")),
+                            "high":   float(str(row[4]).replace(",", "")),
+                            "low":    float(str(row[5]).replace(",", "")),
+                            "close":  float(str(row[6]).replace(",", "")),
+                            "volume": int(str(row[1]).replace(",", "")) // 1000,
+                        })
+                    except:
+                        pass
+            except:
+                pass
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
@@ -1304,13 +1174,6 @@ def warm_kline_data_async(stocks):
     except Exception:
         pass
 
-def _yf_ticker_history_worker(ticker: str):
-    try:
-        return yf.Ticker(ticker).history(period="1y")
-    except Exception:
-        return None
-
-
 def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     """畫出有實際切換功能的金融圖表。
     chart_mode: K線圖 / 走勢圖 / 技術指標
@@ -1320,9 +1183,9 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
     market = "TW" if ticker.endswith(".TW") else "TWO"
     df     = get_kline_data(code, market)
     if df.empty or len(df) < 30:
-        # [修正] yf.Ticker(...).history() 一樣走子行程隔離，避免 curl_cffi 崩潰拖垮主行程
-        raw, _crashed = _isolated_call(_yf_ticker_history_worker, (ticker,), timeout=25)
-        if raw is None or raw.empty:
+        yt  = yf.Ticker(ticker)
+        raw = yt.history(period="1y")
+        if raw.empty:
             return None
         df = raw.rename(columns={"Open": "open", "High": "high", "Low": "low",
                                   "Close": "close", "Volume": "volume"}).reset_index()
@@ -1608,12 +1471,7 @@ def render_kline_chart_with_axis_price(fig, height=640):
     }})();
     </script>
     """
-    # [修正] st.components.v1.html 已標記棄用（2026-06-01 後移除），改用 st.iframe；
-    # 舊版 Streamlit 沒有 st.iframe 時自動退回 components.html。
-    try:
-        st.iframe(html, height=height + 8)
-    except Exception:
-        components.html(html, height=height + 8, scrolling=False)
+    components.html(html, height=height + 8, scrolling=False)
 
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
@@ -1653,596 +1511,114 @@ def get_tw_stock_news(code):
         return None
 
 # ============================================================
-# 2.5 [新功能] 大盤濾網 / 排除清單 / 出場守則 / 策略回測
-# ============================================================
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_todays_volume_map() -> dict:
-    """[加速] 用官方 API 一次抓上市+上櫃全部個股「今日成交量(張)」。
-
-    用途：掃描前預過濾。若一檔股票今日成交量連門檻的 20% 都不到，
-    5 日均量幾乎不可能達標，直接跳過不下載歷史資料，
-    可大幅減少 yfinance 批次下載量（通常能砍掉一半以上的股票）。
-    任一來源失敗回傳部分或空 dict，掃描流程自動退回全量下載（fail-open）。
-    """
-    vol_map = {}
-
-    def to_lots(value):
-        """成交股數 → 張；容錯各種字串格式。"""
-        try:
-            txt = str(value).replace(',', '').strip()
-            if txt in ['', '-', '--', 'N/A', 'None']:
-                return None
-            return float(txt) / 1000.0
-        except Exception:
-            return None
-
-    VOLUME_KEYS = ['TradeVolume', 'TradingShares', '成交股數', '成交量', 'TradingVolume']
-
-    def collect(url):
-        data = _fetch_json(url, timeout=8)
-        rows = data if isinstance(data, list) else []
-        if isinstance(data, dict):
-            for key in ['data', 'Data', 'aaData', 'tables']:
-                if isinstance(data.get(key), list):
-                    rows = data[key]
-                    break
-        for rec in rows:
-            if not isinstance(rec, dict):
-                continue
-            code = _find_record_code(rec)
-            if not code:
-                continue
-            for vk in VOLUME_KEYS:
-                if vk in rec:
-                    lots = to_lots(rec[vk])
-                    if lots is not None:
-                        vol_map[code] = lots
-                        break
-
-    collect("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
-    collect("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes")
-    return vol_map
-
-
-def _yf_twii_worker():
-    """子行程工作函式：抓取加權指數並直接算好摘要數值再回傳（回傳值需可被 pickle，
-    plain dict 比整包 DataFrame 更輕量、更安全）。"""
-    try:
-        raw = yf.download("^TWII", period="9mo", interval="1d",
-                          auto_adjust=True, progress=False, threads=False)
-        if raw is None or raw.empty:
-            return None
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        closes = raw['Close'].dropna()
-        if len(closes) < 60:
-            return None
-        close = float(closes.iloc[-1])
-        prev  = float(closes.iloc[-2])
-        ma20  = float(closes.rolling(20).mean().iloc[-1])
-        ma60  = float(closes.rolling(60).mean().iloc[-1])
-        return {'close': close, 'prev': prev, 'ma20': ma20, 'ma60': ma60}
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_market_regime() -> dict:
-    """[新功能1] 大盤濾網：抓加權指數 (^TWII) 判斷多空環境。
-
-    判斷規則（簡單且穩健）：
-    - 多頭：收盤 > 60MA 且 20MA > 60MA
-    - 空頭：收盤 < 60MA 且 20MA < 60MA
-    - 其餘：震盪
-    均線多頭排列策略在空頭市場勝率會明顯下降，掃描時據此提示與調降評分。
-
-    [修正] 實際下載動作丟到獨立子行程執行，避免 yfinance/curl_cffi 偶發的
-    segmentation fault 拖垮整個 Streamlit 主行程；子行程崩潰時直接視為
-    「大盤資料暫時無法取得」，不影響掃描主流程。
-    """
-    info = {
-        'regime': '未知', 'close': np.nan, 'chg_pct': np.nan,
-        'ma20': np.nan, 'ma60': np.nan, 'position': 'N/A',
-        'suggestion': '大盤資料暫時無法取得；策略照常執行，但請自行留意大盤風險。',
-    }
-    data, _crashed = _isolated_call(_yf_twii_worker, (), timeout=30)
-    if not data:
-        return info
-
-    close, prev, ma20, ma60 = data['close'], data['prev'], data['ma20'], data['ma60']
-    chg = (close / prev - 1) * 100 if prev > 0 else np.nan
-
-    if close > ma60 and ma20 > ma60:
-        regime, position = '多頭', '正常部位'
-        suggestion = '大盤趨勢偏多，均線多頭訊號可信度較高，可依計畫正常配置部位。'
-    elif close < ma60 and ma20 < ma60:
-        regime, position = '空頭', '低水位 / 觀望'
-        suggestion = '大盤處於空頭結構，多頭訊號勝率通常明顯下降；建議僅小量試單或觀望，嚴設停損。'
-    else:
-        regime, position = '震盪', '約五成部位'
-        suggestion = '大盤位於震盪區間，訊號雜訊較多；建議降低部位並提高停損紀律。'
-
-    info.update({'regime': regime, 'close': round(close, 2), 'chg_pct': round(chg, 2),
-                 'ma20': round(ma20, 2), 'ma60': round(ma60, 2),
-                 'position': position, 'suggestion': suggestion})
-    return info
-
-
-@st.cache_data(ttl=43200, show_spinner=False)
-def get_excluded_stock_sets() -> dict:
-    """[新功能4] 抓取官方警示名單：處置股、變更交易（全額交割）、注意股。
-
-    來源為 TWSE / TPEx OpenAPI；任何來源抓取失敗都回傳空集合，
-    不會影響掃描主流程（fail-open 設計）。
-    """
-    disposal, attention, altered = set(), set(), set()
-
-    def collect(url, target: set):
-        data = _fetch_json(url, timeout=6)
-        rows = []
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict):
-            for key in ['data', 'Data', 'aaData', 'tables']:
-                if isinstance(data.get(key), list):
-                    rows = data[key]
-                    break
-        for rec in rows:
-            if isinstance(rec, dict):
-                code = _find_record_code(rec)
-                if code:
-                    target.add(code)
-
-    # 處置有價證券（上市 / 上櫃）
-    collect("https://openapi.twse.com.tw/v1/announcement/punish", disposal)
-    collect("https://www.tpex.org.tw/openapi/v1/tpex_disposal_information", disposal)
-    # 注意有價證券（上市 / 上櫃）
-    collect("https://openapi.twse.com.tw/v1/announcement/notice", attention)
-    collect("https://www.tpex.org.tw/openapi/v1/tpex_attention_information", attention)
-    # 變更交易方法（全額交割）；API 名稱若調整，此處 fail-open 不影響掃描
-    collect("https://openapi.twse.com.tw/v1/opendata/t187ap04_L", altered)
-
-    return {'disposal': disposal, 'attention': attention, 'altered': altered}
-
-
-def build_exit_plan(stock: pd.Series) -> dict:
-    """[新功能3] 出場守則：回答「買了之後怎麼辦」。
-
-    - 趨勢防守價：MA30，收盤跌破視為趨勢轉弱出場訊號。
-    - 成本防守價：近 20 日量價加權主力成本。
-    - 建議停損價：兩者取較高（較靠近現價）者，控制單筆虧損。
-    - 另掃描 RSI 過熱 / MACD 柱轉負 / 跌破成本等即時警訊。
-    """
-    price     = stock.get('收盤', np.nan)
-    ma30      = stock.get('MA30', np.nan)
-    main_cost = stock.get('主力成本', np.nan)
-    rsi       = stock.get('RSI14', np.nan)
-    macd_hist = stock.get('MACD柱', np.nan)
-    cost_gap  = stock.get('主力成本乖離(%)', np.nan)
-
-    candidates = [v for v in [ma30, main_cost] if pd.notna(v) and v > 0]
-    stop_price = max(candidates) if candidates else np.nan
-    stop_gap   = ((stop_price / price) - 1) * 100 if pd.notna(stop_price) and pd.notna(price) and price > 0 else np.nan
-
-    alerts = []
-    if pd.notna(price) and pd.notna(ma30) and price < ma30:
-        alerts.append('收盤已跌破 MA30，趨勢防守失守')
-    if pd.notna(cost_gap) and cost_gap < 0:
-        alerts.append('現價低於主力成本，籌碼優勢轉弱')
-    if pd.notna(rsi) and rsi > 78:
-        alerts.append(f'RSI {rsi:.0f} 過熱，避免追高並留意回檔')
-    if pd.notna(macd_hist) and macd_hist < 0:
-        alerts.append('MACD 柱轉負，短線動能轉弱')
-
-    return {
-        'ma30': ma30,
-        'main_cost': main_cost,
-        'stop_price': stop_price,
-        'stop_gap': stop_gap,
-        'alerts': alerts,
-        'trail_rule': '移動停利：獲利超過 10% 後，改以 MA30 作為移動停損；收盤跌破即出場保住獲利。',
-    }
-
-
-def _yf_backtest_download_worker(ticker_str: str, threads: bool):
-    try:
-        return yf.download(ticker_str, period="1y", interval="1d",
-                           group_by="ticker", auto_adjust=True,
-                           progress=False, threads=(4 if threads is True else threads))
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def run_strategy_backtest(tickers: tuple, bias_limit: float, vol_limit: int) -> pd.DataFrame:
-    """[新功能2] 策略回測：用與掃描完全相同的條件，檢驗近一年歷史訊號表現。
-
-    條件：MA30 > MA45 > MA60、0 <= 30MA乖離 <= bias_limit、近5日均量 >= vol_limit。
-    同一檔股票 5 個交易日內只取一次訊號（cooldown），避免連續訊號灌水。
-    回傳每筆訊號的 5 / 10 / 20 日持有報酬明細。
-
-    [修正] 下載動作在獨立子行程執行，避免 yfinance/curl_cffi 偶發崩潰拖垮主行程。
-    """
-    if not tickers:
-        return pd.DataFrame()
-
-    ticker_str = " ".join(tickers)
-    raw, crashed = _isolated_call(_yf_backtest_download_worker, (ticker_str, True), timeout=90)
-    if crashed or raw is None or (hasattr(raw, "empty") and raw.empty):
-        raw, _ = _isolated_call(_yf_backtest_download_worker, (ticker_str, False), timeout=120)
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-
-    records = []
-    for tk in tickers:
-        try:
-            if len(tickers) == 1:
-                sub = raw[["Close", "Volume"]].dropna()
-            else:
-                sub = raw[tk][["Close", "Volume"]].dropna()
-        except Exception:
-            continue
-        if len(sub) < 70:
-            continue
-
-        closes  = sub["Close"].astype(float)
-        volumes = (sub["Volume"].astype(float) / 1000)  # 張
-        ma30 = closes.rolling(30).mean()
-        ma45 = closes.rolling(45).mean()
-        ma60 = closes.rolling(60).mean()
-        dates = sub.index
-
-        last_signal_i = -99
-        n = len(closes)
-        for i in range(64, n - 1):
-            if i - last_signal_i < 5:          # cooldown
-                continue
-            m30, m45, m60 = ma30.iloc[i], ma45.iloc[i], ma60.iloc[i]
-            if pd.isna(m30) or pd.isna(m45) or pd.isna(m60):
-                continue
-            if not (m30 > m45 > m60):
-                continue
-            bias = (closes.iloc[i] - m30) / m30 * 100
-            if not (0 <= bias <= bias_limit):
-                continue
-            if volumes.iloc[max(0, i - 4):i + 1].mean() < vol_limit:
-                continue
-
-            entry = float(closes.iloc[i])
-            rec = {
-                'ticker': tk,
-                '訊號日': pd.Timestamp(dates[i]).strftime('%Y-%m-%d'),
-                '進場價': round(entry, 2),
-                '乖離30MA(%)': round(float(bias), 2),
-            }
-            for horizon in (5, 10, 20):
-                if i + horizon < n:
-                    rec[f'{horizon}日報酬(%)'] = round((float(closes.iloc[i + horizon]) / entry - 1) * 100, 2)
-                else:
-                    rec[f'{horizon}日報酬(%)'] = np.nan
-            records.append(rec)
-            last_signal_i = i
-
-    return pd.DataFrame(records)
-
-
-def render_backtest_section(result_df: pd.DataFrame, bias_limit: float, vol_limit: int):
-    """[新功能2] 回測面板：顯示勝率 / 平均報酬 / 報酬分布。"""
-    st.markdown('<div class="tv-section">STRATEGY BACKTEST · 策略歷史回測</div>', unsafe_allow_html=True)
-    with st.expander("▸ 對目前掃描結果回測：近一年同條件訊號的 5 / 10 / 20 日表現", expanded=False):
-        st.caption(
-            "回測條件與掃描完全一致（MA30>MA45>MA60、乖離 0~上限、5日均量門檻），"
-            "同一檔 5 個交易日內僅取一次訊號。結果僅用於驗證策略邏輯，過去績效不代表未來表現，亦非投資建議。"
-        )
-        if st.button("▶ 執行回測", key="btn_backtest", width='stretch'):
-            with st.spinner("回測中（下載一年歷史資料，約 10~60 秒）..."):
-                bt = run_strategy_backtest(
-                    tuple(result_df['ticker'].tolist()), float(bias_limit), int(vol_limit)
-                )
-            st.session_state.backtest_result = bt
-
-        bt = st.session_state.backtest_result
-        if bt is None:
-            return
-        if bt.empty:
-            st.info("回測期間內沒有產生符合條件的歷史訊號。")
-            return
-
-        # 各持有期間統計摘要
-        summary_rows = []
-        for h in (5, 10, 20):
-            col = f'{h}日報酬(%)'
-            s = bt[col].dropna() if col in bt.columns else pd.Series(dtype=float)
-            if s.empty:
-                continue
-            summary_rows.append({
-                '持有期間': f'{h} 日',
-                '訊號數': int(len(s)),
-                '勝率(%)': round(float((s > 0).mean() * 100), 1),
-                '平均報酬(%)': round(float(s.mean()), 2),
-                '中位數(%)': round(float(s.median()), 2),
-                '最差(%)': round(float(s.min()), 2),
-                '最佳(%)': round(float(s.max()), 2),
-            })
-        if summary_rows:
-            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width='stretch')
-
-        # 20 日報酬分布直方圖（若樣本不足退回 10 日 / 5 日）
-        hist_col = next((f'{h}日報酬(%)' for h in (20, 10, 5)
-                         if f'{h}日報酬(%)' in bt.columns and bt[f'{h}日報酬(%)'].notna().sum() >= 5), None)
-        if hist_col:
-            s = bt[hist_col].dropna()
-            fig = go.Figure(go.Histogram(
-                x=s, nbinsx=30, marker_color='#3b82f6', opacity=0.85,
-                hovertemplate='報酬區間 %{x}<br>筆數 %{y}<extra></extra>',
-            ))
-            fig.add_vline(x=0, line_dash='dash', line_color='#f23645', line_width=1.2)
-            fig.update_layout(
-                title=dict(text=f'{hist_col} 分布（共 {len(s)} 筆訊號）', font=dict(size=13, color='#cbd5e1')),
-                height=300, template='plotly_dark',
-                paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
-                margin=dict(l=20, r=20, t=40, b=20), bargap=0.05,
-                xaxis=dict(title='報酬(%)', gridcolor='rgba(148,163,184,0.09)'),
-                yaxis=dict(title='筆數', gridcolor='rgba(148,163,184,0.09)'),
-            )
-            st.plotly_chart(fig, width='stretch')
-
-        st.download_button(
-            '⬇ 下載回測明細 CSV',
-            bt.to_csv(index=False).encode('utf-8-sig'),
-            file_name=f'backtest_detail_{get_tw_now().strftime("%Y%m%d")}.csv',
-            mime='text/csv', width='stretch',
-        )
-
-
-# ============================================================
 # 3. 全域 CSS（TradingView 機構終端機風格）
 # ============================================================
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Roboto+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@300;400;500;700;900&display=swap');
-
-:root {
-    --tv-bg: #070d14;
-    --tv-bg-2: #0b121b;
-    --tv-panel: #0f1722;
-    --tv-panel-2: #111c29;
-    --tv-card: #0c1520;
-    --tv-border: #213040;
-    --tv-border-2: #2d3e52;
-    --tv-text: #d8dee9;
-    --tv-muted: #8f9bad;
-    --tv-faint: #5d6b7d;
-    --tv-blue: #3b82f6;
-    --tv-blue-soft: rgba(59,130,246,.16);
-    --tv-green: #22c55e;
-    --tv-green-2: #26a69a;
-    --tv-red: #ef4444;
-    --tv-red-2: #f23645;
-    --tv-yellow: #facc15;
-    --tv-orange: #f59e0b;
-    --tv-purple: #a855f7;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600;700;800&display=swap');
+:root{
+ --bg:#07111f;--panel:#0d1a2b;--panel2:#102138;--border:#233a55;
+ --text:#edf4ff;--muted:#9db0c6;--blue:#4c8dff;--green:#35c48d;
+ --red:#ff6474;--yellow:#ffc857;--shadow:0 14px 36px rgba(0,0,0,.22);
 }
-
-[data-testid='stSidebarCollapseButton'],
-[data-testid='collapsedControl'],
-[data-testid='stHeader'],
-header[data-testid='stHeader'],
-[data-testid='stToolbar'] { display: none !important; }
-
-html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'] {
-    background:
-        radial-gradient(circle at 15% 0%, rgba(59,130,246,.10), transparent 30%),
-        linear-gradient(180deg, #080e16 0%, #060b11 100%) !important;
-    color: var(--tv-text) !important;
-    font-family: 'Inter','Noto Sans TC',sans-serif !important;
+[data-testid='stHeader'],[data-testid='stToolbar'],[data-testid='stSidebar'],
+[data-testid='collapsedControl'],[data-testid='stSidebarCollapseButton']{display:none!important;}
+html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
+ background:radial-gradient(circle at 10% 0%,rgba(76,141,255,.13),transparent 30%),linear-gradient(180deg,#081321,#050c16)!important;
+ color:var(--text)!important;font-family:'Inter','Noto Sans TC',sans-serif!important;
 }
-.block-container {
-    max-width: none !important;
-    padding: 78px 24px 2.2rem 24px !important;
-}
-
-[data-testid='stSidebar'] { display:none !important; }
-
-/* top bar / left rail */
-.tv-topbar {
-    position: fixed; top: 0; left: 0; right: 0; height: 58px; z-index: 9999;
-    display: flex; align-items: center; justify-content: space-between; gap: 18px;
-    padding: 0 18px 0 20px;
-    background: rgba(7,13,20,.92);
-    border-bottom: 1px solid var(--tv-border);
-    backdrop-filter: blur(14px);
-}
-.tv-brand { display:flex;align-items:center;gap:10px;font-size:20px;font-weight:900;color:#f3f6fb;letter-spacing:.8px;white-space:nowrap; }
-.tv-brand-icon { color: var(--tv-blue); font-size: 21px; }
-.tv-tabs { display:flex;align-items:center;gap:30px;height:100%; }
-.tv-tab { color:#b8c0cc;font-size:14px;font-weight:700;padding:19px 2px 16px;border-bottom:2px solid transparent; }
-.tv-tab.active { color:#e8eef7;border-color:var(--tv-blue);box-shadow:0 8px 20px rgba(59,130,246,.16); }
-.tv-top-meta { display:flex;align-items:center;gap:14px;color:#9aa7b8;font-family:'Roboto Mono',monospace;font-size:12px;white-space:nowrap; }
-.tv-leftnav {
-    position: fixed; left:0; top:58px; bottom:0; width:184px; z-index: 9998;
-    background: rgba(8,14,22,.95); border-right:1px solid var(--tv-border);
-    padding: 18px 14px; backdrop-filter: blur(14px);
-}
-.tv-navitem { display:flex;align-items:center;gap:12px;color:#9aa7b8;padding:13px 14px;border-radius:7px;margin-bottom:9px;font-weight:700;font-size:14px; }
-.tv-navitem.active { color:#e8eef7;background:rgba(59,130,246,.08);border:1px solid var(--tv-border-2); }
-.tv-navitem .ico { width:22px;text-align:center;font-size:19px;color:#9fb2c8; }
-.tv-market-mini { position:absolute;left:14px;right:14px;bottom:30px;background:#0b131d;border:1px solid var(--tv-border);border-radius:8px;padding:14px 15px; }
-
-[data-testid='stButton'] > button,
-[data-testid='stDownloadButton'] > button {
-    background: #111a26 !important;
-    color: var(--tv-text) !important;
-    border: 1px solid var(--tv-border) !important;
-    border-radius: 6px !important;
-    font-family: 'Inter','Noto Sans TC',sans-serif !important;
-    font-size: 13px !important;
-    font-weight: 700 !important;
-    padding: 10px 0 !important;
-    transition: all .16s ease !important;
-}
-[data-testid='stButton'] > button:hover,
-[data-testid='stDownloadButton'] > button:hover {
-    border-color: var(--tv-blue) !important;
-    background: #172336 !important;
-    box-shadow: 0 0 0 3px rgba(59,130,246,.15) !important;
-}
-[data-testid='stButton'] > button:disabled { opacity: .35 !important; }
-
-[data-testid='stDataFrame'] {
-    background: var(--tv-panel) !important;
-    border: 1px solid var(--tv-border) !important;
-    border-radius: 9px !important;
-    overflow: hidden !important;
-}
-[data-testid='stDataFrame'] * { font-family: 'Roboto Mono','Noto Sans TC',monospace !important; }
-
-[data-testid='stPlotlyChart'] {
-    background: var(--tv-panel) !important;
-    border: 1px solid var(--tv-border) !important;
-    border-radius: 9px !important;
-    padding: 8px !important;
-}
-
-[data-testid='stProgress'] > div { background:#111a26 !important;border-radius:999px !important;height:7px !important; }
-[data-testid='stProgress'] > div > div { background:linear-gradient(90deg,var(--tv-blue),#66a3ff) !important;border-radius:999px !important; }
-[data-testid='stAlert'] { background:rgba(59,130,246,.08) !important;border:1px solid rgba(59,130,246,.25) !important;border-radius:8px !important; }
-[data-testid='stSlider'] div[role='slider'] { background:var(--tv-blue) !important; }
-[data-testid='stNumberInput'] input { background:#0b121b !important;border:1px solid var(--tv-border) !important;color:var(--tv-text) !important;border-radius:7px !important;font-family:'Roboto Mono',monospace !important; }
-
-.tv-panel, .tv-card, .quote-panel, .side-card {
-    background: linear-gradient(180deg, rgba(16,26,38,.98) 0%, rgba(10,18,28,.98) 100%);
-    border: 1px solid var(--tv-border);
-    border-radius: 9px;
-    box-shadow: 0 18px 40px rgba(0,0,0,.20);
-}
-.tv-panel { padding: 14px 16px; }
-.tv-card { padding: 13px 15px; }
-.tv-label { color: var(--tv-muted); font-size: 11px; font-weight: 700; letter-spacing: .45px; text-transform: uppercase; }
-.tv-value { color: var(--tv-text); font-family:'Roboto Mono',monospace; font-size:25px; font-weight:800; margin-top:5px; }
-.tv-caption { color: var(--tv-muted); font-size: 12px; margin-top:4px; }
-.tv-section { color:#dce6f2;font-size:13px;font-weight:900;letter-spacing:.4px;margin:15px 0 9px;padding-left:10px;border-left:3px solid var(--tv-blue); }
-.tv-pill { border:1px solid var(--tv-border);background:#101a28;color:#bdc7d5;border-radius:5px;padding:6px 12px;font-size:13px;font-weight:700; }
-.tv-pill.active { background:rgba(59,130,246,.18);border-color:#315b9b;color:#e9f1ff; }
-.chart-control-label {font-size:11px;font-weight:800;color:var(--tv-muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;}
-.chart-control-box {border:1px solid var(--tv-border);background:#0d1622;border-radius:8px;padding:8px 10px;}
-.chart-control-box [data-testid='stRadio'] label {font-size:12px;color:#cbd5e1;font-weight:700;}
-.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] {gap:6px;}
-.chart-control-box [data-testid='stRadio'] div[role='radiogroup'] label {border:1px solid var(--tv-border);background:#101a28;border-radius:5px;padding:4px 9px;margin-right:4px;}
-
-.quote-panel { padding: 6px 0 12px; margin-bottom: 10px; border: 0; box-shadow:none; background:transparent; }
-.quote-head { display:flex;align-items:center;gap:15px;flex-wrap:wrap; }
-.quote-title { font-size:25px;font-weight:900;color:#e6edf6;letter-spacing:.5px; }
-.quote-tag { background:#111a26;border:1px solid var(--tv-border);border-radius:6px;padding:8px 12px;color:#aeb9c7;font-weight:700;font-size:13px; }
-.quote-price { font-family:'Roboto Mono',monospace;font-size:40px;font-weight:800;color:var(--tv-green);line-height:1.1;margin-top:14px; }
-.quote-change { font-family:'Roboto Mono',monospace;font-size:18px;font-weight:700;margin-left:10px; }
-.quote-metrics { display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:18px;margin-top:13px;max-width:780px; }
-.metric-k { color:#8996a8;font-size:12px;font-weight:700; }
-.metric-v { color:#e5edf7;font-family:'Roboto Mono',monospace;font-size:16px;font-weight:700;margin-top:4px; }
-.chart-toolbar { display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 8px; }
-.chart-tabs { display:flex;gap:8px;align-items:center;flex-wrap:wrap; }
-.side-card { padding:15px 16px;margin-bottom:14px; }
-.side-title { display:flex;justify-content:space-between;align-items:center;color:#eef3fb;font-size:17px;font-weight:900;margin-bottom:12px; }
-.bias-chip { background:rgba(34,197,94,.16);color:#8ef0aa;border:1px solid rgba(34,197,94,.25);border-radius:5px;padding:4px 10px;font-size:12px;font-weight:800; }
-.report-row { display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid rgba(45,62,82,.45);padding:7px 0;color:#c8d1dd;font-size:13px; }
-.report-row span:last-child { font-family:'Roboto Mono',monospace;font-weight:700;color:#e8edf5;text-align:right; }
-.radar-check { color:#b9c4d2;font-size:13px;line-height:1.9; }
-.radar-check b { color:var(--tv-green);margin-right:8px; }
-.news-card { background:#0f1722 !important;border:1px solid var(--tv-border) !important;border-radius:9px !important; }
-.news-title:hover { color:#8fb7ff !important; }
-
-/* Streamlit spacing cleanup */
-div[data-testid='stVerticalBlock'] { gap: .55rem !important; }
-hr { border-color: var(--tv-border) !important; }
-::-webkit-scrollbar { width:8px;height:8px; }
-::-webkit-scrollbar-track { background:#070d14; }
-::-webkit-scrollbar-thumb { background:#2d3e52;border-radius:999px; }
-
-@media (max-width: 1100px) {
-    .block-container { padding-left: 18px !important; padding-top: 72px !important; }
-    .tv-leftnav { display:none; }
-    .tv-tabs { display:none; }
-    .quote-metrics { grid-template-columns:repeat(2,1fr); }
-}
-@media (max-width: 768px) {
-    .block-container { padding:68px 10px 2rem !important; }
-    .tv-top-meta { display:none; }
-    .tv-brand { font-size:16px; }
-    .quote-price { font-size:32px; }
-    [data-testid='stPlotlyChart'] { min-height:420px !important; }
-    [data-testid='stDataFrame'] * { font-size:12px !important; }
-}
+.block-container{max-width:1500px!important;padding:24px 28px 56px!important;}
+.app-hero{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:22px 24px;margin-bottom:16px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(9,20,35,.98));border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);}
+.app-title{font-size:28px;font-weight:800;letter-spacing:.2px;color:#fff}.app-sub{font-size:13px;color:var(--muted);margin-top:7px;line-height:1.7}.app-meta{text-align:right;color:var(--muted);font-family:'Roboto Mono',monospace;font-size:12px;line-height:1.8;white-space:nowrap}
+.workflow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:0 0 16px}.workflow-step{padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:rgba(13,26,43,.85);color:var(--muted);font-size:12px;font-weight:700}.workflow-step b{display:inline-flex;width:23px;height:23px;border-radius:50%;align-items:center;justify-content:center;background:rgba(76,141,255,.18);color:#9fc0ff;margin-right:7px}.workflow-step.active{border-color:#4777b8;background:rgba(76,141,255,.10);color:#eaf2ff}
+.section-head{display:flex;justify-content:space-between;align-items:end;margin:22px 0 10px}.section-title{font-size:18px;font-weight:800;color:#f4f8ff}.section-help{font-size:12px;color:var(--muted)}
+.control-shell,.tv-panel,.tv-card,.side-card,[data-testid='stDataFrame']{background:linear-gradient(180deg,rgba(16,33,56,.96),rgba(9,20,35,.98))!important;border:1px solid var(--border)!important;border-radius:14px!important;box-shadow:var(--shadow)}
+.control-shell{padding:8px 16px 14px;margin-bottom:12px}.control-note{padding:13px 15px;border-radius:11px;background:rgba(76,141,255,.08);border:1px solid rgba(76,141,255,.22);color:#bcd0e8;font-size:13px;line-height:1.75}
+[data-testid='stExpander']{background:transparent!important;border:0!important}[data-testid='stExpander'] details{border:0!important}[data-testid='stExpander'] summary{font-weight:800!important;color:#f1f6ff!important;font-size:15px!important}
+[data-testid='stButton']>button,[data-testid='stDownloadButton']>button{border-radius:10px!important;border:1px solid #34547b!important;background:#142944!important;color:#eff5ff!important;font-weight:800!important;min-height:44px!important;transition:.16s ease!important}
+[data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{border-color:var(--blue)!important;background:#19365b!important;box-shadow:0 0 0 3px rgba(76,141,255,.13)!important}
+[data-testid='stButton']>button[kind='primary']{background:linear-gradient(135deg,#3978e8,#4c8dff)!important;border-color:#679fff!important;color:#fff!important}
+[data-testid='stNumberInput'] input{background:#091625!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:9px!important}.stSlider{padding-top:2px}
+[data-testid='stProgress']>div{background:#13243a!important;border-radius:999px!important;height:9px!important}[data-testid='stProgress']>div>div{background:linear-gradient(90deg,#3978e8,#35c48d)!important;border-radius:999px!important}
+[data-testid='stAlert']{border-radius:12px!important;background:rgba(76,141,255,.09)!important;border:1px solid rgba(76,141,255,.24)!important}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.tv-card{padding:16px}.tv-label{color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.06em}.tv-value{font-family:'Roboto Mono',monospace;font-size:25px;font-weight:800;margin-top:6px;color:var(--text)}.tv-caption{color:var(--muted);font-size:12px;margin-top:5px}
+.tv-section{font-size:17px;font-weight:800;color:#f4f8ff;margin:22px 0 10px}.quote-panel{padding:18px 20px;margin:18px 0 12px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(8,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}.quote-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.quote-title{font-size:24px;font-weight:800}.quote-tag,.bias-chip{border:1px solid var(--border);background:#13243a;border-radius:999px;padding:5px 10px;color:#b9c9dc;font-size:12px;font-weight:700}.quote-price{font-family:'Roboto Mono',monospace;font-size:38px;font-weight:800;color:var(--green);line-height:1.25}.quote-change{font-family:'Roboto Mono',monospace;font-size:17px;font-weight:700;margin-left:8px}.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(110px,1fr));gap:12px;margin-top:12px;max-width:700px}.metric-k{color:var(--muted);font-size:11px;font-weight:700}.metric-v{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-top:3px}
+.side-card{padding:16px;margin-bottom:12px}.side-title{display:flex;justify-content:space-between;gap:8px;font-size:16px;font-weight:800;margin-bottom:10px}.report-row{display:flex;justify-content:space-between;border-bottom:1px solid rgba(35,58,85,.65);padding:8px 0;color:#c7d5e6;font-size:13px}.radar-check{font-size:13px;line-height:1.9;color:#c6d4e5}.radar-check b{color:var(--green);margin-right:7px}
+[data-testid='stDataFrame']{overflow:hidden!important}[data-testid='stDataFrame'] *{font-family:'Roboto Mono','Noto Sans TC',monospace!important}.news-card{background:linear-gradient(180deg,rgba(16,33,56,.9),rgba(9,20,35,.96))!important;border-radius:12px!important}.news-title:hover{color:#8eb6ff!important}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#07111f}::-webkit-scrollbar-thumb{background:#29425f;border-radius:999px}
+@media(max-width:1000px){.block-container{padding:16px 14px 40px!important}.workflow,.stat-grid{grid-template-columns:repeat(2,1fr)}.app-hero{align-items:flex-start}.app-meta{display:none}}
+@media(max-width:700px){.workflow,.stat-grid,.quote-metrics{grid-template-columns:1fr}.app-title{font-size:22px}.quote-price{font-size:31px}.section-help{display:none}}
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 4. 交易終端機 Top Bar（保留實際資訊，移除無作用導航）
+# 4. 頁首與操作流程
 # ============================================================
-
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
 _signal_count = len(st.session_state.scan_results) if isinstance(st.session_state.scan_results, pd.DataFrame) else 0
+_current_step = 3 if _signal_count else (2 if st.session_state.is_scanning else 1)
 st.markdown(f"""
-<div class="tv-topbar">
-  <div class="tv-brand"><span class="tv-brand-icon">◆</span> 台股智慧選股系統</div>
-  <div class="tv-top-meta">
-    <span>策略：MA30 &gt; MA45 &gt; MA60</span>
-    <span>目前訊號：{_signal_count}</span>
-    <span>更新時間：{_now_str}</span>
+<div class="app-hero">
+  <div>
+    <div class="app-title">台股智慧選股</div>
+    <div class="app-sub">依均線多頭排列、乖離率與成交量快速篩選，再整合 AI 評分、K 線、營收、本益比與個股新聞。</div>
   </div>
+  <div class="app-meta">目前訊號 {_signal_count} 檔<br>資料時間 {_now_str}</div>
+</div>
+<div class="workflow">
+  <div class="workflow-step {'active' if _current_step >= 1 else ''}"><b>1</b>設定篩選條件</div>
+  <div class="workflow-step {'active' if _current_step >= 2 else ''}"><b>2</b>執行全市場掃描</div>
+  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>3</b>從清單選擇股票</div>
+  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>4</b>查看圖表與分析</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 5. 篩選參數設定（實際可操作）
+# 5. 篩選條件與掃描操作
 # ============================================================
+st.markdown('<div class="section-head"><div><div class="section-title">1. 設定掃描條件</div><div class="section-help">條件越嚴格，結果通常越少；初次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
+with st.container():
+    st.markdown('<div class="control-shell">', unsafe_allow_html=True)
+    with st.expander("掃描條件與說明", expanded=True):
+        note_col, bias_col, vol_col = st.columns([1.6, 1, 1], gap="large")
+        with note_col:
+            st.markdown("""
+            <div class="control-note">
+              <b>策略條件</b><br>
+              先找出 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，再限制股價不可離 30 日均線太遠，並排除成交量不足的標的。
+            </div>
+            """, unsafe_allow_html=True)
+        with bias_col:
+            mb_bias = st.number_input(
+                "30MA 乖離上限 (%)", 0.1, 15.0,
+                value=float(st.session_state.user_bias), step=0.1, key="mb_bias",
+                help="數值越小，越偏向尋找貼近 30 日均線的股票。"
+            )
+            st.session_state.user_bias = mb_bias
+        with vol_col:
+            mb_vol = st.slider(
+                "最小成交量 (張)", 0, 3000,
+                value=int(st.session_state.user_vol), key="mb_vol",
+                help="排除流動性較低的股票。"
+            )
+            st.session_state.user_vol = mb_vol
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ── 主畫面篩選參數：這裡是實際會影響掃描結果的控制項 ──
-with st.expander("▸ 篩選參數", expanded=False):
-    mc1, mc2 = st.columns(2)
-    with mc1:
-        mb_bias = st.number_input(
-            "30MA 乖離上限 (%)", 0.1, 15.0,
-            value=st.session_state.user_bias, step=0.1, key="mb_bias"
-        )
-        st.session_state.user_bias = mb_bias
-    with mc2:
-        mb_vol = st.slider(
-            "最小成交量 (張)", 0, 3000,
-            value=st.session_state.user_vol, key="mb_vol"
-        )
-        st.session_state.user_vol = mb_vol
-
-    # [新功能1+4] 風控選項：大盤濾網 / 排除機制
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        st.session_state.use_market_filter = st.checkbox(
-            "啟用大盤濾網", value=st.session_state.use_market_filter, key="cb_market",
-            help="空頭環境自動調降個股評分（-12分）、震盪環境小幅調降（-5分），並提示建議部位水位。"
-        )
-    with fc2:
-        st.session_state.excl_disposal = st.checkbox(
-            "排除處置 / 全額交割股", value=st.session_state.excl_disposal, key="cb_disposal",
-            help="依 TWSE / TPEx 官方公告名單，直接自掃描結果排除。"
-        )
-    with fc3:
-        st.session_state.excl_attention = st.checkbox(
-            "排除注意股", value=st.session_state.excl_attention, key="cb_attention",
-            help="勾選則直接排除；未勾選時注意股仍會出現，但會加上 ⚠ 警示標記。"
-        )
-
-# 統一讀取最終值
 user_bias = st.session_state.user_bias
-user_vol  = st.session_state.user_vol
-use_market_filter = st.session_state.use_market_filter
-excl_disposal     = st.session_state.excl_disposal
-excl_attention    = st.session_state.excl_attention
+user_vol = st.session_state.user_vol
 
-# ── 掃描按鈕 ──
-if st.button("🚀 開始全市場智慧掃描", width='stretch', disabled=st.session_state.is_scanning):
-    st.session_state.is_scanning      = True
-    st.session_state.current_idx      = 0
+scan_left, scan_right = st.columns([3, 1])
+with scan_left:
+    st.caption(f"目前條件：30MA 乖離 ≤ {user_bias:.1f}%｜成交量 ≥ {user_vol:,} 張｜均線 MA30 > MA45 > MA60")
+with scan_right:
+    scan_clicked = st.button(
+        "開始全市場掃描", use_container_width=True,
+        disabled=st.session_state.is_scanning, type="primary"
+    )
+if scan_clicked:
+    st.session_state.is_scanning = True
+    st.session_state.current_idx = 0
     st.session_state.last_selected_row = None
     st.rerun()
 
@@ -2255,78 +1631,26 @@ if st.session_state.is_scanning:
     bar    = st.progress(0)
     BATCH  = 200
 
-    # [新功能1] 大盤濾網：先判斷市場環境，作為後續評分調整與提示依據
-    status.text("🌐 Step 1/4：判斷大盤環境（加權指數）...")
-    bar.progress(0.01)
-    regime_info = get_market_regime()
-    st.session_state.market_regime_info = regime_info
-
-    # [新功能4] 抓官方警示名單（處置 / 全額交割 / 注意股）
-    excl_sets = get_excluded_stock_sets()
-    excluded_codes = set()
-    if excl_disposal:
-        excluded_codes |= excl_sets['disposal'] | excl_sets['altered']
-    if excl_attention:
-        excluded_codes |= excl_sets['attention']
-    attention_codes = excl_sets['attention']
-
-    status.text("📋 Step 2/4：載入股票清單與預過濾...")
+    status.info("步驟 1/3：正在載入上市櫃股票清單…")
     bar.progress(0.03)
-    stock_map = get_stock_market_list()
-    total_universe = len(stock_map)
-
-    # [加速1] 下載前先過濾：非個股類型 / 00 開頭 / 處置全額交割股，
-    # 這些原本要等下載完才在 calc_ma_signals 剔除，白白浪費下載時間。
-    stock_map = [
-        s for s in stock_map
-        if s.get('industry') not in NON_STOCK_INDUSTRIES
-        and not str(s.get('code', '')).startswith('0')
-        and s.get('code') not in excluded_codes
-    ]
-
-    # [加速2] 成交量預過濾：今日成交量連門檻 20% 都不到的股票，
-    # 5 日均量幾乎不可能達標，直接跳過不下載。官方 API 抓不到時自動退回全量。
-    if user_vol > 0:
-        vol_map = get_todays_volume_map()
-        if vol_map:
-            threshold = max(1.0, user_vol * 0.2)
-            stock_map = [
-                s for s in stock_map
-                if vol_map.get(s['code']) is None or vol_map[s['code']] >= threshold
-            ]
-
-    all_tickers   = [s["ticker"] for s in stock_map]
+    stock_map    = get_stock_market_list()
+    all_tickers  = [s["ticker"] for s in stock_map]
     total_tickers = len(all_tickers)
-    status.text(f"📋 Step 2/4：預過濾完成，{total_universe} → {total_tickers} 檔需下載歷史資料")
 
-    # [加速3] 批次並行下載：2 個批次同時進行（每批仍在獨立子行程中隔離）。
-    # 註：原為 3 批並行，實測會觸發 Yahoo 限流（YFRateLimitError），降為 2 批
-    # 並將 yfinance 內部執行緒限制為 4，在速度與限流風險間取得平衡。
     history_map = {}
     batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
-    if batches:
-        done = 0
-        with ThreadPoolExecutor(max_workers=2) as dl_ex:
-            futures = {dl_ex.submit(download_batch_history, tuple(b)): bi for bi, b in enumerate(batches)}
-            for f in as_completed(futures):
-                done += 1
-                status.text(f"📥 Step 3/4：批次下載 {done}/{len(batches)}（2 批並行）...")
-                bar.progress(0.05 + 0.70 * (done / len(batches)))
-                try:
-                    history_map.update(f.result() or {})
-                except Exception:
-                    pass
+    for bi, batch in enumerate(batches):
+        status.info(f"步驟 2/3：下載歷史行情批次 {bi+1}/{len(batches)}…")
+        bar.progress(0.03 + 0.72 * (bi / len(batches)))
+        history_map.update(download_batch_history(tuple(batch)))
 
     bar.progress(0.75)
-    status.text("✅ Step 4/4：計算均線與排除警示股中...")
-    initial_hits = calc_ma_signals(
-        history_map, stock_map, user_bias, user_vol,
-        excluded_codes=excluded_codes, attention_codes=attention_codes,
-    )
+    status.info("步驟 3/3：正在計算均線、量能與候選股票…")
+    initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
     bar.progress(0.80)
 
     if initial_hits:
-        status.text(f"📈 找到 {len(initial_hits)} 支！載入官方本益比快取與營收資料中...")
+        status.info(f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
         load_official_pe_map(False)
         final_list = []
         with ThreadPoolExecutor(max_workers=6) as ex:
@@ -2356,22 +1680,8 @@ if st.session_state.is_scanning:
                     "本益比":      deep_res["pe"],
                     "營收月增":    deep_res["mom"],
                     "營收年增":    deep_res["yoy"],
-                    # [新功能3] 出場守則使用的均線數值
-                    "MA30":       base.get("MA30", np.nan),
-                    "MA45":       base.get("MA45", np.nan),
-                    "MA60":       base.get("MA60", np.nan),
-                    # [新功能4] 注意股警示標記
-                    "警示":       "⚠ 注意股" if base.get("注意股", False) else "",
                 }
                 score, radar = calc_stock_score(row_data)
-                # [新功能1] 大盤濾網：空頭 / 震盪環境調降評分，反映系統性風險
-                if use_market_filter:
-                    regime = (regime_info or {}).get('regime', '未知')
-                    if regime == '空頭':
-                        score = max(0, score - 12)
-                        radar.append('大盤空頭壓抑')
-                    elif regime == '震盪':
-                        score = max(0, score - 5)
                 row_data["AI評分"] = score
                 row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
                 final_list.append(row_data)
@@ -2394,37 +1704,15 @@ if not st.session_state.scan_results.empty:
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
 
-    # ── [新功能1] 大盤環境卡片與空頭警示 ──
-    regime_info = st.session_state.market_regime_info or {}
-    regime = regime_info.get('regime', '未知')
-    regime_color = {'多頭': 'var(--tv-green)', '空頭': 'var(--tv-red)',
-                    '震盪': 'var(--tv-yellow)'}.get(regime, '#8f9bad')
-    twii_txt = fmt_num(regime_info.get('close', np.nan), '{:,.0f}')
-    twii_chg = regime_info.get('chg_pct', np.nan)
-    twii_chg_txt = 'N/A' if pd.isna(twii_chg) else f"{twii_chg:+.2f}%"
-
-    if regime == '空頭' and use_market_filter:
-        st.warning(f"⚠️ 大盤濾網警示：加權指數目前為空頭結構（收盤 {twii_txt}，20MA 低於 60MA）。"
-                   f"多頭訊號勝率通常明顯下降，所有評分已自動調降 12 分。{regime_info.get('suggestion','')}")
-
-    # ── 精簡統計列（加入大盤環境）──
+    avg_score = df['AI評分'].mean() if 'AI評分' in df.columns else np.nan
+    strong_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
+    st.markdown('<div class="section-head"><div><div class="section-title">2. 掃描結果</div><div class="section-help">點擊表格任一列，即可在下方查看該股票的完整分析。</div></div></div>', unsafe_allow_html=True)
     st.markdown(f"""
-    <div class="stat-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px;">
-      <div class="tv-card">
-        <div class="tv-label">Total Signals</div>
-        <div class="tv-value" style="color:#8fb2ff;">{total_found}</div>
-        <div class="tv-caption">符合條件標的</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Market Regime · 大盤環境</div>
-        <div class="tv-value" style="font-size:20px;color:{regime_color};">{regime} <span style="font-size:13px;color:#8f9bad;">TAIEX {twii_txt} ({twii_chg_txt})</span></div>
-        <div class="tv-caption">建議部位：{regime_info.get('position', 'N/A')}</div>
-      </div>
-      <div class="tv-card">
-        <div class="tv-label">Bias / Volume</div>
-        <div class="tv-value" style="font-size:20px;color:#f9a825;">{user_bias}% / {user_vol}</div>
-        <div class="tv-caption">30MA 乖離上限 / 最小成交量</div>
-      </div>
+    <div class="stat-grid">
+      <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{total_found}</div><div class="tv-caption">本次候選股票</div></div>
+      <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+      <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
+      <div class="tv-card"><div class="tv-label">本次條件</div><div class="tv-value" style="font-size:18px">{user_bias:.1f}% / {user_vol:,}</div><div class="tv-caption">乖離上限 / 最小成交量</div></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2433,13 +1721,13 @@ if not st.session_state.scan_results.empty:
     with col_dl:
         csv = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="⬇ EXPORT CSV", data=csv,
+            label="下載掃描結果 CSV", data=csv,
             file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
-            mime='text/csv', width='stretch'
+            mime='text/csv', use_container_width=True
         )
 
     # ── 結果表格 ──
-    show_cols      = ["code", "name", "市場別", "警示", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
+    show_cols      = ["code", "name", "市場別", "AI評分", "收盤", "漲跌幅(%)", "乖離30MA(%)", "量比20日", "成交量(張)", "量變動(%)", "本益比", "營收月增", "營收年增", "industry"]
     available_cols = [c for c in show_cols if c in df.columns]
     df_display     = df[available_cols].rename(columns={"code": "代碼", "name": "名稱", "industry": "類股", "市場別": "市場"})
 
@@ -2448,12 +1736,14 @@ if not st.session_state.scan_results.empty:
         color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
         return f'color: {color}; font-weight: bold'
 
+    st.markdown('<div class="section-head"><div><div class="section-title">候選股票清單</div><div class="section-help">可左右捲動查看更多欄位，點擊列可切換個股。</div></div></div>', unsafe_allow_html=True)
+
     event = st.dataframe(
         df_display.style.map(
             color_tw_style,
             subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
         ),
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -2462,7 +1752,6 @@ if not st.session_state.scan_results.empty:
             "代碼":        st.column_config.TextColumn("代碼",    width=70),
             "名稱":        st.column_config.TextColumn("名稱",    width=100),
             "市場":        st.column_config.TextColumn("市場",    width=70),
-            "警示":        st.column_config.TextColumn("警示",    width=85, help="官方注意股名單標記"),
             "AI評分":      st.column_config.ProgressColumn("AI評分", width=105, format="%d", min_value=0, max_value=100),
             "收盤":        st.column_config.NumberColumn("價格",  width=75,  format="%.2f"),
             "漲跌幅(%)":   st.column_config.NumberColumn("漲跌", width=75, format="%.1f%%"),
@@ -2487,12 +1776,9 @@ if not st.session_state.scan_results.empty:
 
     st.markdown(f"""
     <div class="tv-caption" style="padding:6px 2px 2px;">
-        進度條滿格代表 30MA 乖離接近上限 {user_bias}%；綠字為正增長，紅字為負增長；點擊任一列可切換 K 線。
+        30MA 乖離進度條越滿，代表越接近設定上限 {user_bias}%；正數以綠色表示、負數以紅色表示。
     </div>
     """, unsafe_allow_html=True)
-
-    # ── [新功能2] 策略回測面板 ──
-    render_backtest_section(df, user_bias, user_vol)
 
     # ============================================================
     # 8. 個股總覽 / K 線 + 成交量整合圖 / 右側 AI 面板
@@ -2520,7 +1806,7 @@ if not st.session_state.scan_results.empty:
         radar_items = ['等待更強共振訊號']
 
     st.markdown(f"""
-    <div class="quote-panel">
+    <div class="section-head"><div><div class="section-title">3. 個股分析</div><div class="section-help">可用上一檔／下一檔快速瀏覽候選股票。</div></div></div><div class="quote-panel">
       <div class="quote-head">
         <div style="font-size:24px;color:var(--tv-yellow);">☆</div>
         <div class="quote-title">{current_stock['name']} · {current_stock['code']}.{ 'TW' if current_stock['ticker'].endswith('.TW') else 'TWO' }</div>
@@ -2543,13 +1829,13 @@ if not st.session_state.scan_results.empty:
     with left_area:
         nav_spacer, nav1, nav2 = st.columns([3.2, 0.9, 0.9])
         with nav1:
-            if st.button("⬅ PREV", width='stretch', key="btn_prev"):
+            if st.button("← 上一檔", use_container_width=True, key="btn_prev"):
                 st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
                 st.session_state.last_selected_row = None
                 st.session_state.table_key += 1
                 st.rerun()
         with nav2:
-            if st.button("NEXT ➡", width='stretch', key="btn_next"):
+            if st.button("下一檔 →", use_container_width=True, key="btn_next"):
                 st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                 st.session_state.last_selected_row = None
                 st.session_state.table_key += 1
@@ -2574,12 +1860,12 @@ if not st.session_state.scan_results.empty:
             except Exception:
                 pass
         else:
-            st.warning("⚠️ 無法載入 K 線資料。可能原因：該股成交極為冷清（資料來源無足夠交易紀錄），或官方 API 暫時無回應，請稍後再試。")
+            st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
     with right_area:
         st.markdown(f"""
         <div class="side-card">
-          <div class="side-title"><span>AI 分析報告</span><span class="bias-chip">{report['盤面強弱']}</span></div>
+          <div class="side-title"><span>AI 綜合分析</span><span class="bias-chip">{report['盤面強弱']}</span></div>
           <div class="report-row"><span>強度評分</span><span style="color:var(--tv-green);">{score_txt}</span></div>
           <div class="report-row"><span>RSI</span><span>{rsi_txt}</span></div>
           <div class="report-row"><span>MACD柱</span><span>{macd_txt}</span></div>
@@ -2595,34 +1881,11 @@ if not st.session_state.scan_results.empty:
         </div>
         """, unsafe_allow_html=True)
 
-        # ── [新功能3] 出場守則卡片 ──
-        exit_plan = build_exit_plan(current_stock)
-        stop_txt = fmt_num(exit_plan['stop_price'], '{:.2f}')
-        stop_gap_txt = '' if pd.isna(exit_plan['stop_gap']) else f"（距現價 {exit_plan['stop_gap']:+.1f}%）"
-        if exit_plan['alerts']:
-            alert_html = ''.join([
-                f'<div style="color:#f8a5a5;font-size:13px;line-height:1.8;"><b style="color:var(--tv-red);margin-right:8px;">✕</b>{a}</div>'
-                for a in exit_plan['alerts']
-            ])
-        else:
-            alert_html = '<div style="color:#8ef0aa;font-size:13px;line-height:1.8;"><b style="color:var(--tv-green);margin-right:8px;">✓</b>目前未觸發任何出場警訊</div>'
-        st.markdown(f"""
-        <div class="side-card">
-          <div class="side-title"><span>出場守則</span><span class="bias-chip" style="background:rgba(239,68,68,.14);color:#f8a5a5;border-color:rgba(239,68,68,.3);">RISK</span></div>
-          <div class="report-row"><span>趨勢防守價 (MA30)</span><span>{fmt_num(exit_plan['ma30'], '{:.2f}')}</span></div>
-          <div class="report-row"><span>成本防守價</span><span>{fmt_num(exit_plan['main_cost'], '{:.2f}')}</span></div>
-          <div class="report-row"><span>建議停損價</span><span style="color:var(--tv-red);">{stop_txt}</span></div>
-          <div class="tv-caption" style="margin-top:4px;">取 MA30 與主力成本較高者 {stop_gap_txt}，收盤跌破建議出場。</div>
-          <div style="margin-top:10px;">{alert_html}</div>
-          <div class="tv-caption" style="margin-top:10px;border-top:1px solid rgba(45,62,82,.45);padding-top:8px;">{exit_plan['trail_rule']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
     # ============================================================
     # 9. 新聞
     # ============================================================
     st.markdown(f"""
-    <div class="tv-section">LIVE NEWS · {current_stock['name']} ({current_stock['code']})</div>
+    <div class="tv-section">個股即時新聞 · {current_stock['name']} ({current_stock['code']})</div>
     """, unsafe_allow_html=True)
 
     news_list = get_tw_stock_news(current_stock['code'])
@@ -2653,15 +1916,14 @@ if not st.session_state.scan_results.empty:
             </div>
             """, unsafe_allow_html=True)
     else:
-        st.warning("⚠️ 無法獲取即時新聞。")
+        st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
 
 else:
     if not st.session_state.is_scanning:
         st.markdown("""
-        <div class="tv-panel" style="text-align:center;padding:56px 22px;margin-top:16px;">
-          <div style="font-size:42px;margin-bottom:16px;">📈</div>
-          <div class="tv-title">Ready to Scan</div>
-          <div class="tv-sub" style="margin-top:8px;">MA30 &gt; MA45 &gt; MA60 · Bias Filter · Volume Gate</div>
-          <div style="margin-top:18px;display:inline-block;" class="tv-pill">展開上方篩選參數後點擊掃描按鈕</div>
+        <div class="tv-panel" style="text-align:center;padding:46px 22px;margin-top:18px;">
+          <div style="font-size:40px;margin-bottom:12px;">🔎</div>
+          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">確認上方條件後，按下「開始全市場掃描」。<br>完成後會顯示候選清單、K 線、AI 分析與個股新聞。</div>
         </div>
         """, unsafe_allow_html=True)
