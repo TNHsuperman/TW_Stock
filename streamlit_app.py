@@ -135,7 +135,7 @@ def get_stock_market_list():
     2) 再抓 TWSE / TPEx OpenAPI JSON，避免 read_html 大表格解析。
     3) OpenAPI 失敗時才用舊 ISIN HTML 備援，且 timeout 較短。
     """
-    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v2_industry_fixed.json')
+    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v3_no_etn.json')
     today = get_tw_now().strftime('%Y-%m-%d')
 
 
@@ -274,7 +274,9 @@ def get_stock_market_list():
             code = clean_code(pick(row, ['Code', '證券代號', '公司代號', '有價證券代號', 'SecuritiesCompanyCode', '股票代號']))
             name = pick(row, ['Name', '證券名稱', '公司簡稱', '有價證券名稱', '股票名稱', '公司名稱', 'CompanyName'])
             industry = normalize_industry(pick(row, ['產業別', '產業類別', 'Industry', 'industry'], '未分類'))
-            if len(code) == 4 and code.isdigit() and name:
+            # [修正] 個股代碼不會以 0 開頭；0 開頭多為 ETF/ETN/受益證券，
+            # 且 6 碼 ETN 會被 clean_code 截成 4 碼混入清單（如 020018 → 0200）。
+            if len(code) == 4 and code.isdigit() and not code.startswith('0') and name:
                 out.append({
                     'ticker': f'{code}.{market_suffix}',
                     'name': normalize_stock_name(name),
@@ -339,7 +341,7 @@ def get_stock_market_list():
                 val = str(row.get('有價證券代號及名稱', ''))
                 if '　' in val:
                     code, name = val.split('　', 1)
-                    if len(code) == 4 and code.isdigit():
+                    if len(code) == 4 and code.isdigit() and not code.startswith('0'):
                         key = f'{code}.{mkt}'
                         if key in seen:
                             continue
@@ -365,8 +367,10 @@ def get_stock_market_list():
 def _yf_download_worker(ticker_str: str, threads: bool):
     """實際執行 yf.download 的子行程工作函式，必須是模組層級函式才能被 fork 正確使用。"""
     try:
+        # [修正] threads 上限 4：避免 yfinance 內部全速多執行緒轟炸 Yahoo 觸發限流
         return yf.download(ticker_str, period="4mo", interval="1d",
-                           group_by="ticker", auto_adjust=True, progress=False, threads=threads)
+                           group_by="ticker", auto_adjust=True, progress=False,
+                           threads=(4 if threads is True else threads))
     except Exception:
         return None
 
@@ -424,7 +428,7 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit,
         # [新功能4] 排除機制：非個股類型 / 處置股 / 全額交割股
         if s.get('industry') in NON_STOCK_INDUSTRIES:
             continue
-        if str(s.get('code', '')).startswith('00'):   # 00 開頭多為 ETF / ETN
+        if str(s.get('code', '')).startswith('0'):    # 0 開頭皆非個股（ETF/ETN/受益證券）
             continue
         if s.get('code') in excluded_codes:
             continue
@@ -1604,7 +1608,12 @@ def render_kline_chart_with_axis_price(fig, height=640):
     }})();
     </script>
     """
-    components.html(html, height=height + 8, scrolling=False)
+    # [修正] st.components.v1.html 已標記棄用（2026-06-01 後移除），改用 st.iframe；
+    # 舊版 Streamlit 沒有 st.iframe 時自動退回 components.html。
+    try:
+        st.iframe(html, height=height + 8)
+    except Exception:
+        components.html(html, height=height + 8, scrolling=False)
 
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
@@ -1840,7 +1849,7 @@ def _yf_backtest_download_worker(ticker_str: str, threads: bool):
     try:
         return yf.download(ticker_str, period="1y", interval="1d",
                            group_by="ticker", auto_adjust=True,
-                           progress=False, threads=threads)
+                           progress=False, threads=(4 if threads is True else threads))
     except Exception:
         return None
 
@@ -1926,7 +1935,7 @@ def render_backtest_section(result_df: pd.DataFrame, bias_limit: float, vol_limi
             "回測條件與掃描完全一致（MA30>MA45>MA60、乖離 0~上限、5日均量門檻），"
             "同一檔 5 個交易日內僅取一次訊號。結果僅用於驗證策略邏輯，過去績效不代表未來表現，亦非投資建議。"
         )
-        if st.button("▶ 執行回測", key="btn_backtest", use_container_width=True):
+        if st.button("▶ 執行回測", key="btn_backtest", width='stretch'):
             with st.spinner("回測中（下載一年歷史資料，約 10~60 秒）..."):
                 bt = run_strategy_backtest(
                     tuple(result_df['ticker'].tolist()), float(bias_limit), int(vol_limit)
@@ -1957,7 +1966,7 @@ def render_backtest_section(result_df: pd.DataFrame, bias_limit: float, vol_limi
                 '最佳(%)': round(float(s.max()), 2),
             })
         if summary_rows:
-            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width='stretch')
 
         # 20 日報酬分布直方圖（若樣本不足退回 10 日 / 5 日）
         hist_col = next((f'{h}日報酬(%)' for h in (20, 10, 5)
@@ -1977,13 +1986,13 @@ def render_backtest_section(result_df: pd.DataFrame, bias_limit: float, vol_limi
                 xaxis=dict(title='報酬(%)', gridcolor='rgba(148,163,184,0.09)'),
                 yaxis=dict(title='筆數', gridcolor='rgba(148,163,184,0.09)'),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         st.download_button(
             '⬇ 下載回測明細 CSV',
             bt.to_csv(index=False).encode('utf-8-sig'),
             file_name=f'backtest_detail_{get_tw_now().strftime("%Y%m%d")}.csv',
-            mime='text/csv', use_container_width=True,
+            mime='text/csv', width='stretch',
         )
 
 
@@ -2231,7 +2240,7 @@ excl_disposal     = st.session_state.excl_disposal
 excl_attention    = st.session_state.excl_attention
 
 # ── 掃描按鈕 ──
-if st.button("🚀 開始全市場智慧掃描", use_container_width=True, disabled=st.session_state.is_scanning):
+if st.button("🚀 開始全市場智慧掃描", width='stretch', disabled=st.session_state.is_scanning):
     st.session_state.is_scanning      = True
     st.session_state.current_idx      = 0
     st.session_state.last_selected_row = None
@@ -2271,7 +2280,7 @@ if st.session_state.is_scanning:
     stock_map = [
         s for s in stock_map
         if s.get('industry') not in NON_STOCK_INDUSTRIES
-        and not str(s.get('code', '')).startswith('00')
+        and not str(s.get('code', '')).startswith('0')
         and s.get('code') not in excluded_codes
     ]
 
@@ -2290,17 +2299,18 @@ if st.session_state.is_scanning:
     total_tickers = len(all_tickers)
     status.text(f"📋 Step 2/4：預過濾完成，{total_universe} → {total_tickers} 檔需下載歷史資料")
 
-    # [加速3] 批次並行下載：3 個批次同時進行（每批仍在獨立子行程中隔離），
-    # 相較逐批序列下載約可縮短至 1/2 ~ 1/3 時間。
+    # [加速3] 批次並行下載：2 個批次同時進行（每批仍在獨立子行程中隔離）。
+    # 註：原為 3 批並行，實測會觸發 Yahoo 限流（YFRateLimitError），降為 2 批
+    # 並將 yfinance 內部執行緒限制為 4，在速度與限流風險間取得平衡。
     history_map = {}
     batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
     if batches:
         done = 0
-        with ThreadPoolExecutor(max_workers=3) as dl_ex:
+        with ThreadPoolExecutor(max_workers=2) as dl_ex:
             futures = {dl_ex.submit(download_batch_history, tuple(b)): bi for bi, b in enumerate(batches)}
             for f in as_completed(futures):
                 done += 1
-                status.text(f"📥 Step 3/4：批次下載 {done}/{len(batches)}（3 批並行）...")
+                status.text(f"📥 Step 3/4：批次下載 {done}/{len(batches)}（2 批並行）...")
                 bar.progress(0.05 + 0.70 * (done / len(batches)))
                 try:
                     history_map.update(f.result() or {})
@@ -2425,7 +2435,7 @@ if not st.session_state.scan_results.empty:
         st.download_button(
             label="⬇ EXPORT CSV", data=csv,
             file_name=f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv',
-            mime='text/csv', use_container_width=True
+            mime='text/csv', width='stretch'
         )
 
     # ── 結果表格 ──
@@ -2443,7 +2453,7 @@ if not st.session_state.scan_results.empty:
             color_tw_style,
             subset=[c for c in ['漲跌幅(%)', '量變動(%)', '營收月增', '營收年增'] if c in df_display.columns]
         ),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -2533,13 +2543,13 @@ if not st.session_state.scan_results.empty:
     with left_area:
         nav_spacer, nav1, nav2 = st.columns([3.2, 0.9, 0.9])
         with nav1:
-            if st.button("⬅ PREV", use_container_width=True, key="btn_prev"):
+            if st.button("⬅ PREV", width='stretch', key="btn_prev"):
                 st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
                 st.session_state.last_selected_row = None
                 st.session_state.table_key += 1
                 st.rerun()
         with nav2:
-            if st.button("NEXT ➡", use_container_width=True, key="btn_next"):
+            if st.button("NEXT ➡", width='stretch', key="btn_next"):
                 st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                 st.session_state.last_selected_row = None
                 st.session_state.table_key += 1
