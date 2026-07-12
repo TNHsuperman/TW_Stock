@@ -153,6 +153,7 @@ def refresh_watchlist_quotes(watchlist: list) -> pd.DataFrame:
 
     tickers = tuple(item['ticker'] for item in watchlist if item.get('ticker'))
     history_map = download_batch_history(tickers) if tickers else {}
+    hot_codes = get_hot_stock_tickers()  # [新功能] 熱門股判定，跟掃描流程共用同一份排行
 
     rows = []
     for item in watchlist:
@@ -179,6 +180,7 @@ def refresh_watchlist_quotes(watchlist: list) -> pd.DataFrame:
             '累計報酬(%)': round(chg_since_added, 2) if pd.notna(chg_since_added) else np.nan,
             'RSI14': round(rsi_now, 1) if pd.notna(rsi_now) else np.nan,
             '跌破MA30': below_ma30,
+            '熱門股': item['code'] in hot_codes,
             '資料狀態': '正常' if data_ok else '暫無資料',
         })
     return pd.DataFrame(rows)
@@ -1991,6 +1993,48 @@ def render_kline_chart_with_axis_price(fig, height=640):
     """
     components.html(html, height=height + 8, scrolling=False)
 
+# ============================================================
+# [新功能] 熱門股判定：根據 Yahoo股市「社群爆紅榜．熱門搜尋」排行
+# ============================================================
+# 這個榜單是近7日「使用者實際搜尋量佔比」排序，反映的是當下市場話題／
+# 時事熱度（例如法說會、財報、產業消息帶動的關注度），比單純用成交量
+# 或漲跌幅判斷「熱門」更貼近「根據時事」的直覺意義。
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_hot_stock_tickers() -> set:
+    """抓取 Yahoo股市熱門搜尋排行，回傳目前『熱門股』的股票代碼集合（前30名）。
+    抓不到資料時安全回傳空集合（fail-open），熱門股Tag單純不顯示，不影響其他功能。
+    """
+    try:
+        r = requests.get("https://tw.stock.yahoo.com/community/rank/search",
+                         headers=get_headers(), timeout=10, verify=False)
+        if r.status_code != 200:
+            return set()
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        # 頁面除了榜單本身，導覽列也會帶幾個範例代碼（如「個股比較」連結裡的
+        # 2330.TW,2454.TW），為避免誤判，只擷取「資料時間：」到「我的自選股」
+        # 之間、真正屬於榜單的區塊再解析，抓不到這兩個標記就直接放棄（寧可沒有
+        # 標籤，也不要標錯）。
+        start_idx = text.find("資料時間：")
+        end_idx = text.find("我的自選股")
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            return set()
+        table_text = text[start_idx:end_idx]
+
+        codes = []
+        for m in re.finditer(r'(\d{4,6})\.(TW|TWO)\b', table_text):
+            code = m.group(1)
+            if code not in codes:
+                codes.append(code)
+            if len(codes) >= 30:
+                break
+        return set(codes)
+    except Exception:
+        return set()
+
+
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
 def get_tw_stock_news(code):
@@ -2094,6 +2138,9 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .mobile-stock-card .msc-metrics{display:flex;gap:14px;font-family:'Roboto Mono',monospace;font-size:12.5px;color:#c7d5e6;}
 .mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
 .strategy-badge{display:inline-block;background:rgba(76,141,255,.14);color:#9fc0ff;border:1px solid rgba(76,141,255,.3);border-radius:999px;padding:3px 11px;font-size:11px;font-weight:800;margin-left:8px;}
+/* [新功能] 熱門股 Tag：橘紅色系，跟其他中性 quote-tag 拉開視覺區別，一眼看出是熱門股 */
+.hot-tag{background:rgba(255,138,61,.16)!important;border-color:rgba(255,138,61,.45)!important;color:#ffb37a!important;font-weight:800!important;}
+.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#07111f}::-webkit-scrollbar-thumb{background:#29425f;border-radius:999px}
 @media(max-width:1000px){.block-container{padding:16px 14px 40px!important}.workflow,.stat-grid{grid-template-columns:repeat(2,1fr)}.app-hero{align-items:flex-start}.app-meta{display:none}.workspace-left{max-height:420px;}}
 @media(max-width:760px){
@@ -2241,6 +2288,7 @@ with tab_scan:
         if initial_hits:
             _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
             load_official_pe_map(False)
+            hot_codes = get_hot_stock_tickers()  # [新功能] 熱門股判定：整批只抓一次排行榜，逐檔比對代碼
             final_list = []
             with ThreadPoolExecutor(max_workers=6) as ex:
                 f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
@@ -2263,6 +2311,7 @@ with tab_scan:
                         "RSI14": base.get("RSI14", np.nan), "MACD柱": base.get("MACD柱", np.nan),
                         "突破20日高": base.get("突破20日高", False), "接近60日高": base.get("接近60日高", False),
                         "策略": base.get("策略", active_strategy), "訊號說明": base.get("訊號說明", ""),
+                        "熱門股": base["code"] in hot_codes,
                         "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"],
                     }
                     score, radar = calc_stock_score(row_data)
@@ -2399,6 +2448,12 @@ with tab_workspace:
                     show_cols = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "量比20日"]
                     available_cols = [c for c in show_cols if c in view_df.columns]
                     df_display = view_df[available_cols].rename(columns={"code": "代碼", "name": "名稱"})
+                    if "熱門股" in view_df.columns:
+                        # [新功能] 名稱後面加 🔥 標示熱門股，不額外佔一欄，維持窄欄表格的空間
+                        df_display["名稱"] = [
+                            f"🔥 {n}" if hot else n
+                            for n, hot in zip(df_display["名稱"], view_df["熱門股"])
+                        ]
 
                     def color_tw_style(val):
                         if pd.isna(val): return ''
@@ -2437,10 +2492,11 @@ with tab_workspace:
                         chg_color = '#22ab94' if pd.notna(chg) and chg > 0 else '#f23645' if pd.notna(chg) and chg < 0 else '#c7d5e6'
                         chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.1f}%"
                         score_val = row.get('AI評分', np.nan)
+                        hot_badge = '<span class="hot-badge-inline">🔥</span>' if bool(row.get('熱門股', False)) else ''
                         st.markdown(f"""
                         <div class="mobile-stock-card">
                           <div class="msc-head">
-                            <div><span class="msc-name">{row['name']}</span><span class="msc-code">{row['code']}</span></div>
+                            <div><span class="msc-name">{row['name']}</span>{hot_badge}<span class="msc-code">{row['code']}</span></div>
                             <div class="msc-score">{'N/A' if pd.isna(score_val) else int(score_val)}</div>
                           </div>
                           <div class="msc-metrics">
@@ -2490,10 +2546,12 @@ with tab_workspace:
             score_val = current_stock.get('AI評分', np.nan)
             score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
             vol_ratio_txt = fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')
+            is_hot = bool(current_stock.get('熱門股', False))
+            hot_tag_html = '<div class="quote-tag hot-tag">🔥 熱門股</div>' if is_hot else ''
 
             st.markdown(f"""
             <div class="quote-panel" style="margin-top:8px;">
-              <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div></div>
+              <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{hot_tag_html}</div>
               <div><span class="quote-price">{fmt_num(price, '{:.2f}')}</span><span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span></div>
               <div class="quote-metrics">
                 <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
@@ -2700,7 +2758,8 @@ with tab_watchlist:
                 with st.container(border=True):
                     head_col, price_col, ret_col, btn_col1, btn_col2 = st.columns([2, 1.2, 1.2, 1, 1])
                     with head_col:
-                        st.markdown(f"**{row['name']}** ({row['code']})　<span style='color:var(--muted);font-size:12px;'>{row['industry']}｜加入於 {row['added_date']}</span>", unsafe_allow_html=True)
+                        hot_prefix = "🔥 " if bool(row.get('熱門股', False)) else ""
+                        st.markdown(f"**{hot_prefix}{row['name']}** ({row['code']})　<span style='color:var(--muted);font-size:12px;'>{row['industry']}｜加入於 {row['added_date']}</span>", unsafe_allow_html=True)
                     with price_col:
                         added_p = row.get('added_price')
                         st.markdown(f"加入價 {fmt_num(added_p, '{:.2f}') if added_p else 'N/A'} → 現價 **{fmt_num(row.get('現價', np.nan), '{:.2f}')}**")
