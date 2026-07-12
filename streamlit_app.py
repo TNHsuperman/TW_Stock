@@ -1381,6 +1381,144 @@ def calc_main_cost(df: pd.DataFrame, window: int = 20) -> float:
         return np.nan
 
 
+# ============================================================
+# [新功能] 多空綜合判讀：市場常用技術指標的多／空判定
+# ============================================================
+# 這裡不是 AI 給的主觀敘述，是把市場上最常見的幾種技術指標各自獨立
+# 算出「這個指標本身」目前偏多還是偏空，透明列出，讓使用者自己看得懂
+# 每個判斷是怎麼來的，最後再統計「幾個指標偏多、幾個偏空」做綜合結論。
+# 需要完整 OHLC K 線資料（不是只有收盤價），沿用 get_kline_data() 的資料格式。
+
+def calc_bull_bear_indicators(df: pd.DataFrame) -> list:
+    """計算 6 種常見技術指標的多空訊號：均線排列、KD、RSI、MACD、布林通道、乖離率。
+    df 需含 open/high/low/close/volume 欄位且已依日期由舊到新排序（get_kline_data 格式）。
+    回傳每個指標一筆 dict：{'指標', '數值', '訊號'(多/空/中性), '說明'}，資料不足時回傳空list。
+    """
+    if df is None or df.empty or len(df) < 60:
+        return []
+    close, high, low = df['close'], df['high'], df['low']
+    price = float(close.iloc[-1])
+    results = []
+
+    # 1. 均線排列 (MA5 / MA20 / MA60)：短中長期均線的相對位置，判斷趨勢方向
+    ma5 = close.rolling(5).mean().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma60 = close.rolling(60).mean().iloc[-1]
+    if pd.notna(ma5) and pd.notna(ma20) and pd.notna(ma60):
+        if ma5 > ma20 > ma60:
+            verdict, note = '多', 'MA5 > MA20 > MA60，短中長期均線多頭排列'
+        elif ma5 < ma20 < ma60:
+            verdict, note = '空', 'MA5 < MA20 < MA60，短中長期均線空頭排列'
+        else:
+            verdict, note = '中性', '均線糾結交錯，尚未形成明確排列'
+        results.append({'指標': '均線排列', '數值': f'{ma5:.2f} / {ma20:.2f} / {ma60:.2f}', '訊號': verdict, '說明': note})
+
+    # 2. KD 隨機指標：常見的短線超買超賣與交叉訊號指標
+    low9 = low.rolling(9).min()
+    high9 = high.rolling(9).max()
+    denom = (high9 - low9).replace(0, np.nan)
+    rsv = ((close - low9) / denom * 100).fillna(50)
+    k_line = rsv.ewm(alpha=1/3, adjust=False).mean()
+    d_line = k_line.ewm(alpha=1/3, adjust=False).mean()
+    if len(k_line) >= 2:
+        k_now, d_now = float(k_line.iloc[-1]), float(d_line.iloc[-1])
+        k_prev, d_prev = float(k_line.iloc[-2]), float(d_line.iloc[-2])
+        cross_up = k_now > d_now and k_prev <= d_prev
+        cross_down = k_now < d_now and k_prev >= d_prev
+        if cross_up:
+            verdict, note = '多', f'K({k_now:.0f}) 向上黃金交叉 D({d_now:.0f})'
+        elif cross_down:
+            verdict, note = '空', f'K({k_now:.0f}) 向下死亡交叉 D({d_now:.0f})'
+        elif k_now > d_now:
+            verdict, note = '多', f'K({k_now:.0f}) 位於 D({d_now:.0f}) 之上'
+        else:
+            verdict, note = '空', f'K({k_now:.0f}) 位於 D({d_now:.0f}) 之下'
+        if k_now > 80:
+            note += '，高檔區須留意過熱回檔'
+        elif k_now < 20:
+            note += '，低檔區留意反彈契機'
+        results.append({'指標': 'KD隨機指標', '數值': f'K={k_now:.0f} D={d_now:.0f}', '訊號': verdict, '說明': note})
+
+    # 3. RSI14：沿用既有 calc_rsi，補上多空判定門檻
+    rsi = calc_rsi(close)
+    if pd.notna(rsi):
+        if rsi >= 55:
+            verdict = '多'
+        elif rsi <= 45:
+            verdict = '空'
+        else:
+            verdict = '中性'
+        extra = '，已達超買區間' if rsi > 70 else '，已達超賣區間' if rsi < 30 else ''
+        results.append({'指標': 'RSI14', '數值': f'{rsi:.0f}', '訊號': verdict, '說明': f'RSI = {rsi:.0f}{extra}'})
+
+    # 4. MACD：柱狀圖正負與翻轉，判斷動能方向
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    hist = macd_line - signal_line
+    if len(hist) >= 2 and pd.notna(hist.iloc[-1]) and pd.notna(hist.iloc[-2]):
+        hist_now, hist_prev = float(hist.iloc[-1]), float(hist.iloc[-2])
+        if hist_now > 0 and hist_prev <= 0:
+            verdict, note = '多', 'MACD 柱狀圖翻紅（黃金交叉）'
+        elif hist_now < 0 and hist_prev >= 0:
+            verdict, note = '空', 'MACD 柱狀圖翻黑（死亡交叉）'
+        elif hist_now > 0:
+            verdict, note = '多', 'MACD 柱狀圖為正，動能偏多'
+        else:
+            verdict, note = '空', 'MACD 柱狀圖為負，動能偏空'
+        results.append({'指標': 'MACD', '數值': f'{hist_now:+.3f}', '訊號': verdict, '說明': note})
+
+    # 5. 布林通道：股價相對通道位置，判斷強弱與是否過熱／過冷
+    ma20_boll = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    upper = (ma20_boll + 2 * std20).iloc[-1]
+    lower = (ma20_boll - 2 * std20).iloc[-1]
+    mid = ma20_boll.iloc[-1]
+    if pd.notna(upper) and pd.notna(lower) and pd.notna(mid):
+        if price >= upper:
+            verdict, note = '多', '股價觸及或突破布林上軌，短線強勢'
+        elif price <= lower:
+            verdict, note = '空', '股價跌破布林下軌，短線弱勢'
+        elif price > mid:
+            verdict, note = '多', '股價位於布林中軌之上'
+        else:
+            verdict, note = '空', '股價位於布林中軌之下'
+        results.append({'指標': '布林通道', '數值': f'上{upper:.1f} 中{mid:.1f} 下{lower:.1f}', '訊號': verdict, '說明': note})
+
+    # 6. 20日乖離率：股價偏離均線的幅度，判斷過熱／過冷程度
+    if pd.notna(mid) and mid > 0:
+        bias20 = (price - mid) / mid * 100
+        if bias20 > 3:
+            verdict = '多'
+        elif bias20 < -3:
+            verdict = '空'
+        else:
+            verdict = '中性'
+        results.append({'指標': '20日乖離率', '數值': f'{bias20:+.1f}%', '訊號': verdict, '說明': f'股價與20日均線相差 {bias20:+.1f}%'})
+
+    return results
+
+
+def summarize_bull_bear(indicators: list) -> dict:
+    """統計多空指標清單，給出綜合結論。多空各過半數以上（差距>=2個指標）才判定
+    明確偏多／偏空，差距不大則視為多空拉鋸，避免用小樣本硬湊出過度自信的結論。
+    """
+    if not indicators:
+        return {'verdict': '資料不足', 'bull': 0, 'bear': 0, 'neutral': 0, 'total': 0}
+    bull = sum(1 for i in indicators if i['訊號'] == '多')
+    bear = sum(1 for i in indicators if i['訊號'] == '空')
+    neutral = sum(1 for i in indicators if i['訊號'] == '中性')
+    total = len(indicators)
+    if bull - bear >= 2:
+        verdict = '偏多'
+    elif bear - bull >= 2:
+        verdict = '偏空'
+    else:
+        verdict = '多空拉鋸'
+    return {'verdict': verdict, 'bull': bull, 'bear': bear, 'neutral': neutral, 'total': total}
+
+
 def calc_stock_score(row: dict) -> tuple[int, list[str]]:
     """0-100 分股票評分與飆股雷達條件。"""
     score = 0
@@ -2657,7 +2795,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "🏢 公司資訊", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -2713,6 +2851,45 @@ with tab_workspace:
                     </div>
                     <div class="side-card"><div class="side-title">風險提醒</div><div style="color:#c7d5e6;font-size:13px;line-height:1.9;">{report['主力成本']}<br><br>AI 評分是條件整合結果，不代表保證獲利；仍需搭配停損、部位控管與市場環境判斷。</div></div>
                     """, unsafe_allow_html=True)
+
+            # ---------- 多空指標：市場常用技術指標的多空綜合判讀 ----------
+            elif view_mode == "📐 多空指標":
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} 多空綜合判讀</div><div class="section-help">彙整市場上常用的技術指標各自獨立判斷，非 AI 主觀敘述，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+
+                k_source_df = get_kline_data(current_stock['code'], "TW" if current_stock['ticker'].endswith(".TW") else "TWO")
+                indicators = calc_bull_bear_indicators(k_source_df)
+
+                if indicators:
+                    summary = summarize_bull_bear(indicators)
+                    verdict_color = {'偏多': 'var(--green)', '偏空': 'var(--red)', '多空拉鋸': 'var(--yellow)'}.get(summary['verdict'], '#8f9bad')
+                    st.markdown(f"""
+                    <div class="quote-panel" style="margin:4px 0 16px;">
+                      <div class="quote-head"><div class="quote-title" style="color:{verdict_color};">綜合判讀：{summary['verdict']}</div></div>
+                      <div class="quote-metrics" style="grid-template-columns:repeat(3,minmax(90px,1fr));">
+                        <div><div class="metric-k">看多指標</div><div class="metric-v" style="color:var(--green);">{summary['bull']} / {summary['total']}</div></div>
+                        <div><div class="metric-k">看空指標</div><div class="metric-v" style="color:var(--red);">{summary['bear']} / {summary['total']}</div></div>
+                        <div><div class="metric-k">中性指標</div><div class="metric-v">{summary['neutral']} / {summary['total']}</div></div>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    for ind in indicators:
+                        badge_color = {'多': 'var(--green)', '空': 'var(--red)', '中性': '#8f9bad'}.get(ind['訊號'], '#8f9bad')
+                        badge_bg = {'多': 'rgba(34,171,148,0.14)', '空': 'rgba(242,54,69,0.14)', '中性': 'rgba(139,148,158,0.14)'}.get(ind['訊號'], 'rgba(139,148,158,0.14)')
+                        st.markdown(f"""
+                        <div class="side-card" style="margin-bottom:10px;">
+                          <div class="side-title" style="margin-bottom:4px;">
+                            <span>{ind['指標']}</span>
+                            <span style="background:{badge_bg};color:{badge_color};border:1px solid {badge_color}40;border-radius:999px;padding:3px 12px;font-size:12px;font-weight:800;">{ind['訊號']}</span>
+                          </div>
+                          <div class="tv-caption" style="font-family:'Roboto Mono',monospace;margin-bottom:4px;">{ind['數值']}</div>
+                          <div style="color:#c7d5e6;font-size:13px;">{ind['說明']}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.caption("多空各項指標為市場常見的獨立技術分析工具，彼此可能出現不一致的訊號（例如趨勢指標偏多、短線震盪指標偏空），這是正常現象；綜合判讀僅是「多空指標數量對比」，不代表保證漲跌，仍請自行評估風險。")
+                else:
+                    st.info("目前無法取得足夠的歷史 K 線資料計算多空指標（需至少 60 個交易日），可能是新股或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 公司資訊：公司簡介 + 季度 EPS 列表（ETF 改顯示成分股占比）----------
             elif view_mode == "🏢 公司資訊":
