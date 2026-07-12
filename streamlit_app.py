@@ -2035,6 +2035,50 @@ def get_hot_stock_tickers() -> set:
         return set()
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_etf_holdings(code: str, market_suffix: str) -> dict:
+    """抓取 ETF 前十大持股與資產分佈。來源：Yahoo股市 ETF 持股分析頁面。
+    Yahoo 只公開揭露『前十大持股』，不是完整成分股清單（完整清單通常要跟
+    發行商或跟公開說明書才能拿到），資料通常每月更新一次，抓不到時回傳空 dict。
+    """
+    ticker = f"{code}.{market_suffix}"
+    result = {'holdings': [], 'as_of': None, 'asset_alloc': []}
+    try:
+        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/holding",
+                         headers=get_headers(), timeout=10, verify=False)
+        if r.status_code != 200:
+            return result
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        # 前十大持股：從「前十大持股」標記之後才開始解析，避免跟前面的
+        # 「資產分佈」區塊（同樣是「數字. 名稱 百分比%」格式）混在一起。
+        start = text.find("前十大持股")
+        if start != -1:
+            end = text.find("我的自選股", start)
+            segment = text[start:end] if end != -1 else text[start:start + 1500]
+            date_m = re.search(r'資料時間：(\d{4}/\d{2}/\d{2})', segment)
+            if date_m:
+                result['as_of'] = date_m.group(1)
+            for m in re.finditer(r'(\d{1,2})\s*\.\s*([\u4e00-\u9fffA-Za-z0-9\*]{1,16}?)\s+(\d{1,3}\.\d{1,2})%', segment):
+                rank, name, pct = m.groups()
+                result['holdings'].append({'排名': int(rank), '名稱': name, '占比(%)': float(pct)})
+                if len(result['holdings']) >= 10:
+                    break
+
+        # 資產分佈（股票／債券／現金／其他），出現在「前十大持股」之前
+        alloc_start = text.find("資產分佈")
+        if alloc_start != -1:
+            alloc_end = start if start != -1 else alloc_start + 400
+            alloc_segment = text[alloc_start:alloc_end]
+            for m in re.finditer(r'(股票|債券|現金|其他)\s+(\d{1,3}\.\d{1,2})%', alloc_segment):
+                name, pct = m.groups()
+                result['asset_alloc'].append({'類別': name, '占比(%)': float(pct)})
+    except Exception:
+        pass
+    return result
+
+
 # [修正 新增] 新聞加上快取，避免每次切換股票都重新爬取
 @st.cache_data(ttl=300)
 def get_tw_stock_news(code):
@@ -2622,9 +2666,11 @@ with tab_workspace:
                     <div class="side-card"><div class="side-title">風險提醒</div><div style="color:#c7d5e6;font-size:13px;line-height:1.9;">{report['主力成本']}<br><br>AI 評分是條件整合結果，不代表保證獲利；仍需搭配停損、部位控管與市場環境判斷。</div></div>
                     """, unsafe_allow_html=True)
 
-            # ---------- 公司資訊：公司簡介 + 季度 EPS 列表 ----------
+            # ---------- 公司資訊：公司簡介 + 季度 EPS 列表（ETF 改顯示成分股占比）----------
             elif view_mode == "🏢 公司資訊":
                 market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+                # [新功能] ETF 判定：產業別為「ETF」或代碼為 00 開頭（台股 ETF 代碼慣例）
+                is_etf = (str(current_stock.get('industry', '')) == 'ETF') or bool(re.match(r'^00\d', str(current_stock['code'])))
                 profile = get_company_profile(current_stock['code'], market_suffix)
 
                 st.markdown('<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">公司簡介</div><div class="section-help">資料來源：公開資訊觀測站（TWSE OpenAPI）。</div></div></div>', unsafe_allow_html=True)
@@ -2644,49 +2690,90 @@ with tab_workspace:
                       <div class="tv-caption" style="margin-top:10px;">{profile['住址']}</div>
                     </div>
                     """, unsafe_allow_html=True)
+                elif is_etf:
+                    st.info(f"「{current_stock['name']}」是 ETF（基金），不是一般公司，沒有董事長／總經理等公司登記資料，屬正常情況。")
                 else:
                     st.info("目前無法取得公司基本資料，可能是新股或官方資料尚未更新，請稍後再試。")
 
-                st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></div></div>', unsafe_allow_html=True)
-                eps_rows = fetch_quarterly_eps(current_stock['code'], market_suffix)
-                if eps_rows:
-                    eps_df = pd.DataFrame(eps_rows)
-                    ttm_eps = eps_df['EPS'].head(4).sum()
-                    st.markdown(f"""
-                    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:10px;">
-                      <div class="tv-card"><div class="tv-label">最新單季 EPS</div><div class="tv-value">{eps_df.iloc[0]['EPS']:.2f}</div><div class="tv-caption">{eps_df.iloc[0]['年季']}</div></div>
-                      <div class="tv-card"><div class="tv-label">近四季 EPS 合計</div><div class="tv-value">{ttm_eps:.2f}</div><div class="tv-caption">近四季加總（TTM）</div></div>
-                      <div class="tv-card"><div class="tv-label">季度年增率</div><div class="tv-value" style="font-size:20px;color:{'var(--green)' if pd.notna(eps_df.iloc[0]['年增率(%)']) and eps_df.iloc[0]['年增率(%)']>=0 else 'var(--red)'};">{fmt_num(eps_df.iloc[0]['年增率(%)'], '{:+.1f}%')}</div><div class="tv-caption">最新一季 YoY</div></div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                if is_etf:
+                    # [新功能] ETF 成分股與占比：取代一般個股才適用的 EPS 區塊
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">ETF 成分股與占比</div><div class="section-help">資料來源：Yahoo 股市 ETF 持股分析頁面，僅公開揭露前十大持股，非完整成分股清單。</div></div></div>', unsafe_allow_html=True)
+                    etf_data = get_etf_holdings(current_stock['code'], market_suffix)
+                    holdings = etf_data.get('holdings', [])
+                    if holdings:
+                        as_of_txt = f"（資料時間：{etf_data['as_of']}）" if etf_data.get('as_of') else ""
+                        st.caption(f"前十大持股占比{as_of_txt}，加總約為基金淨值的 {sum(h['占比(%)'] for h in holdings):.1f}%，其餘由更多分散持股組成。")
 
-                    chart_df = eps_df.iloc[::-1]
-                    fig = go.Figure(go.Bar(
-                        x=chart_df['年季'], y=chart_df['EPS'],
-                        marker_color=['#f23645' if v < 0 else '#35c48d' for v in chart_df['EPS']],
-                        hovertemplate='%{x}<br>EPS %{y:.2f}<extra></extra>',
-                    ))
-                    fig.update_layout(
-                        height=280, template='plotly_dark',
-                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
-                        margin=dict(l=20, r=20, t=10, b=20),
-                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                        yaxis=dict(title='EPS (元)', gridcolor='rgba(148,163,184,0.09)'),
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                        holdings_df = pd.DataFrame(holdings)
+                        fig = go.Figure(go.Bar(
+                            x=holdings_df['占比(%)'][::-1], y=holdings_df['名稱'][::-1], orientation='h',
+                            marker_color='#4c8dff',
+                            hovertemplate='%{y}<br>占比 %{x:.2f}%<extra></extra>',
+                        ))
+                        fig.update_layout(
+                            height=320, template='plotly_dark',
+                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            margin=dict(l=10, r=20, t=10, b=20),
+                            xaxis=dict(title='占比 (%)', gridcolor='rgba(148,163,184,0.09)'),
+                            yaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
-                    st.dataframe(
-                        eps_df, hide_index=True, use_container_width=True,
-                        column_config={
-                            "年季": st.column_config.TextColumn("年季", width=80),
-                            "EPS": st.column_config.NumberColumn("EPS(元)", width=80, format="%.2f"),
-                            "季增率(%)": st.column_config.NumberColumn("季增率", width=80, format="%.1f%%"),
-                            "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%.1f%%"),
-                            "季均價": st.column_config.NumberColumn("季均價", width=80, format="%.2f"),
-                        }
-                    )
+                        st.dataframe(
+                            holdings_df, hide_index=True, use_container_width=True,
+                            column_config={
+                                "排名": st.column_config.NumberColumn("排名", width=55),
+                                "名稱": st.column_config.TextColumn("成分股名稱", width=140),
+                                "占比(%)": st.column_config.ProgressColumn("占比", width=140, format="%.2f%%", min_value=0, max_value=max(h['占比(%)'] for h in holdings)),
+                            }
+                        )
+
+                        if etf_data.get('asset_alloc'):
+                            alloc_txt = "、".join(f"{a['類別']} {a['占比(%)']:.1f}%" for a in etf_data['asset_alloc'])
+                            st.caption(f"資產配置：{alloc_txt}")
+                    else:
+                        st.info("目前無法取得這檔 ETF 的成分股資料，可能是新掛牌 ETF 或資料來源暫時無回應，請稍後再試。")
                 else:
-                    st.info("目前無法取得單季 EPS 資料，可能是新股、金融股（財報格式不同）或資料來源暫時無回應。")
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></div></div>', unsafe_allow_html=True)
+                    eps_rows = fetch_quarterly_eps(current_stock['code'], market_suffix)
+                    if eps_rows:
+                        eps_df = pd.DataFrame(eps_rows)
+                        ttm_eps = eps_df['EPS'].head(4).sum()
+                        st.markdown(f"""
+                        <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:10px;">
+                          <div class="tv-card"><div class="tv-label">最新單季 EPS</div><div class="tv-value">{eps_df.iloc[0]['EPS']:.2f}</div><div class="tv-caption">{eps_df.iloc[0]['年季']}</div></div>
+                          <div class="tv-card"><div class="tv-label">近四季 EPS 合計</div><div class="tv-value">{ttm_eps:.2f}</div><div class="tv-caption">近四季加總（TTM）</div></div>
+                          <div class="tv-card"><div class="tv-label">季度年增率</div><div class="tv-value" style="font-size:20px;color:{'var(--green)' if pd.notna(eps_df.iloc[0]['年增率(%)']) and eps_df.iloc[0]['年增率(%)']>=0 else 'var(--red)'};">{fmt_num(eps_df.iloc[0]['年增率(%)'], '{:+.1f}%')}</div><div class="tv-caption">最新一季 YoY</div></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        chart_df = eps_df.iloc[::-1]
+                        fig = go.Figure(go.Bar(
+                            x=chart_df['年季'], y=chart_df['EPS'],
+                            marker_color=['#f23645' if v < 0 else '#35c48d' for v in chart_df['EPS']],
+                            hovertemplate='%{x}<br>EPS %{y:.2f}<extra></extra>',
+                        ))
+                        fig.update_layout(
+                            height=280, template='plotly_dark',
+                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            margin=dict(l=20, r=20, t=10, b=20),
+                            xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                            yaxis=dict(title='EPS (元)', gridcolor='rgba(148,163,184,0.09)'),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.dataframe(
+                            eps_df, hide_index=True, use_container_width=True,
+                            column_config={
+                                "年季": st.column_config.TextColumn("年季", width=80),
+                                "EPS": st.column_config.NumberColumn("EPS(元)", width=80, format="%.2f"),
+                                "季增率(%)": st.column_config.NumberColumn("季增率", width=80, format="%.1f%%"),
+                                "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%.1f%%"),
+                                "季均價": st.column_config.NumberColumn("季均價", width=80, format="%.2f"),
+                            }
+                        )
+                    else:
+                        st.info("目前無法取得單季 EPS 資料，可能是新股、金融股（財報格式不同）或資料來源暫時無回應。")
 
             # ---------- 個股新聞 ----------
             else:
