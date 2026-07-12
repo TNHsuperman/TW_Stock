@@ -62,12 +62,127 @@ for key, default in [
     # [新功能] 多策略切換 / 策略回測比較
     ('scan_strategy_used', '均線多頭排列'),
     ('backtest_results',   {}),   # {策略名稱: DataFrame} 讓不同策略的回測結果可以並排比較
+    # [新功能] 自選股／追蹤清單
+    ('watchlist_quotes',       pd.DataFrame()),
+    ('watchlist_chart_target', None),  # (ticker, name)，選了哪一檔要在下方顯示 K 線
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
+
+# ============================================================
+# [新功能] 自選股／追蹤清單：JSON 檔案持久化
+# ============================================================
+# 沿用跟 get_stock_market_list() 相同的檔案路徑寫法（同一個部署環境下
+# 存取邏輯保持一致）。存的是「輕量資訊」（代碼/名稱/加入時的價格與日期），
+# 不存整包歷史資料，清單本身開啟速度才會快。
+#
+# 限制說明：這是「檔案系統持久化」，同一次部署運行期間會一直保留；
+# 但 Streamlit Cloud 重新部署（例如推新 commit）時容器會重建，檔案不保證留著。
+# 對單人使用的個人選股工具來說，這已經是不需要額外資料庫、最簡單可行的做法。
+
+WATCHLIST_FILE = os.path.join(
+    os.path.dirname(__file__) if '__file__' in globals() else '.',
+    'watchlist_v1.json'
+)
+
+
+def load_watchlist() -> list:
+    """讀取追蹤清單，檔案不存在或損毀時安全回傳空清單。"""
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def save_watchlist(watchlist: list) -> bool:
+    """寫回追蹤清單，失敗（例如唯讀檔案系統）時安靜略過，不影響其他功能。"""
+    try:
+        with open(WATCHLIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(watchlist, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def is_in_watchlist(code: str, watchlist: list) -> bool:
+    return any(str(item.get('code')) == str(code) for item in watchlist)
+
+
+def add_to_watchlist(stock: dict) -> list:
+    """加入追蹤：記錄加入當下的日期／價格／AI評分，供之後計算累計報酬。"""
+    watchlist = load_watchlist()
+    code = str(stock.get('code'))
+    if is_in_watchlist(code, watchlist):
+        return watchlist
+    watchlist.append({
+        'code': code,
+        'name': stock.get('name', ''),
+        'ticker': stock.get('ticker', ''),
+        'industry': stock.get('industry', '未分類'),
+        '市場別': stock.get('市場別', ''),
+        'added_date': get_tw_now().strftime('%Y-%m-%d'),
+        'added_price': stock.get('收盤', None),
+        'added_score': stock.get('AI評分', None),
+        'note': '',
+    })
+    save_watchlist(watchlist)
+    return watchlist
+
+
+def remove_from_watchlist(code: str) -> list:
+    watchlist = load_watchlist()
+    watchlist = [item for item in watchlist if str(item.get('code')) != str(code)]
+    save_watchlist(watchlist)
+    return watchlist
+
+
+def refresh_watchlist_quotes(watchlist: list) -> pd.DataFrame:
+    """批次抓取追蹤清單目前報價，計算「加入以來累計報酬」與簡易健康度標示
+    （跌破 MA30 / RSI 過熱），抓不到資料的股票仍會列出、只是報價欄顯示 N/A。
+    """
+    if not watchlist:
+        return pd.DataFrame()
+
+    tickers = tuple(item['ticker'] for item in watchlist if item.get('ticker'))
+    history_map = download_batch_history(tickers) if tickers else {}
+
+    rows = []
+    for item in watchlist:
+        tk = item.get('ticker', '')
+        df = history_map.get(tk)
+        curr_price, chg_since_added, rsi_now, below_ma30, data_ok = np.nan, np.nan, np.nan, False, False
+        if df is not None and not df.empty:
+            closes = df['close']
+            curr_price = float(closes.iloc[-1])
+            data_ok = True
+            added_price = item.get('added_price')
+            if added_price and added_price > 0:
+                chg_since_added = (curr_price / added_price - 1) * 100
+            if len(closes) >= 30:
+                ma30 = closes.rolling(30).mean().iloc[-1]
+                below_ma30 = pd.notna(ma30) and curr_price < ma30
+            rsi_now = calc_rsi(closes)
+        rows.append({
+            'code': item['code'], 'name': item['name'], 'ticker': tk,
+            'industry': item.get('industry', '未分類'),
+            'added_date': item.get('added_date', 'N/A'),
+            'added_price': item.get('added_price'),
+            '現價': round(curr_price, 2) if pd.notna(curr_price) else np.nan,
+            '累計報酬(%)': round(chg_since_added, 2) if pd.notna(chg_since_added) else np.nan,
+            'RSI14': round(rsi_now, 1) if pd.notna(rsi_now) else np.nan,
+            '跌破MA30': below_ma30,
+            '資料狀態': '正常' if data_ok else '暫無資料',
+        })
+    return pd.DataFrame(rows)
+
 
 # ============================================================
 # 2. 數據抓取
@@ -2022,9 +2137,10 @@ st.markdown(f"""
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
-tab_scan, tab_workspace = st.tabs([
+tab_scan, tab_workspace, tab_watchlist = st.tabs([
     "🔍 選股掃描",
     "📊 候選與分析工作台",
+    "⭐ 自選股追蹤",
 ])
 
 # ------------------------------------------------------------
@@ -2342,7 +2458,19 @@ with tab_workspace:
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
         with right_col:
-            nav_space, nav1, nav2 = st.columns([3.4, 0.8, 0.8])
+            nav_star, nav_space, nav1, nav2 = st.columns([0.9, 2.5, 0.8, 0.8])
+            with nav_star:
+                # [新功能] 自選股／追蹤清單：星號切換加入/移除，重新讀檔即時反映目前狀態
+                _wl_now = load_watchlist()
+                _in_wl = is_in_watchlist(current_stock['code'], _wl_now)
+                star_label = "★ 追蹤中" if _in_wl else "☆ 加入追蹤"
+                if st.button(star_label, use_container_width=True, key="toggle_watchlist"):
+                    if _in_wl:
+                        remove_from_watchlist(current_stock['code'])
+                    else:
+                        add_to_watchlist(current_stock.to_dict())
+                    st.session_state.watchlist_quotes = pd.DataFrame()  # 清空快取，下次進追蹤頁會提示重新整理
+                    st.rerun()
             with nav1:
                 if st.button("← 上一檔", use_container_width=True, key="chart_prev"):
                     st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
@@ -2522,3 +2650,78 @@ with tab_workspace:
                     st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
     else:
         st.info("目前沒有候選股票。請先到「選股掃描」頁籤執行掃描。")
+
+# ------------------------------------------------------------
+# TAB 3：自選股／追蹤清單
+# ------------------------------------------------------------
+# [新功能] 讓還沒符合策略條件、但你想持續觀察的股票也能被記錄下來，
+# 不用每次都全市場重新掃描才看得到它們。清單存在本機 JSON 檔案
+# （watchlist_v1.json），跟 get_stock_market_list() 用同一套持久化寫法。
+with tab_watchlist:
+    st.markdown('<div class="section-head"><div><div class="section-title">自選股／追蹤清單</div><div class="section-help">在「候選與分析工作台」右上角點 ☆ 加入追蹤，這裡會持續記錄，不受重新掃描影響。</div></div></div>', unsafe_allow_html=True)
+
+    watchlist = load_watchlist()
+    if not watchlist:
+        st.markdown("""
+        <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:8px;">
+          <div style="font-size:40px;margin-bottom:12px;">⭐</div>
+          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">追蹤清單目前是空的</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">掃描完成後，在「候選與分析工作台」右上角點「☆ 加入追蹤」，<br>就能把還沒達標、但值得持續觀察的股票留在這裡。</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        rc1, rc2 = st.columns([1, 3])
+        with rc1:
+            if st.button("🔄 更新報價", use_container_width=True, key="btn_refresh_watchlist", type="primary"):
+                with st.spinner(f"正在更新 {len(watchlist)} 檔追蹤股票的報價..."):
+                    st.session_state.watchlist_quotes = refresh_watchlist_quotes(watchlist)
+        with rc2:
+            st.caption(f"共追蹤 {len(watchlist)} 檔股票。首次查看或剛新增／移除後，請按「更新報價」重新整理數字。")
+
+        quotes_df = st.session_state.watchlist_quotes
+        # 追蹤清單本身有異動（新增/移除）時，快取的報價欄位數會對不上，提示需要重新整理
+        stale = quotes_df is None or quotes_df.empty or len(quotes_df) != len(watchlist)
+
+        if stale:
+            st.info("報價尚未載入或追蹤清單剛更新過，請按上方「🔄 更新報價」。")
+        else:
+            for _, row in quotes_df.iterrows():
+                ret = row.get('累計報酬(%)', np.nan)
+                ret_color = 'var(--green)' if pd.notna(ret) and ret >= 0 else 'var(--red)' if pd.notna(ret) else '#8f9bad'
+                ret_txt = 'N/A' if pd.isna(ret) else f"{ret:+.2f}%"
+                warn_bits = []
+                if row.get('跌破MA30'):
+                    warn_bits.append('跌破MA30')
+                rsi_v = row.get('RSI14', np.nan)
+                if pd.notna(rsi_v) and rsi_v > 78:
+                    warn_bits.append(f'RSI過熱{rsi_v:.0f}')
+                warn_txt = f" · ⚠ {' / '.join(warn_bits)}" if warn_bits else ""
+
+                with st.container(border=True):
+                    head_col, price_col, ret_col, btn_col1, btn_col2 = st.columns([2, 1.2, 1.2, 1, 1])
+                    with head_col:
+                        st.markdown(f"**{row['name']}** ({row['code']})　<span style='color:var(--muted);font-size:12px;'>{row['industry']}｜加入於 {row['added_date']}</span>", unsafe_allow_html=True)
+                    with price_col:
+                        added_p = row.get('added_price')
+                        st.markdown(f"加入價 {fmt_num(added_p, '{:.2f}') if added_p else 'N/A'} → 現價 **{fmt_num(row.get('現價', np.nan), '{:.2f}')}**")
+                    with ret_col:
+                        st.markdown(f"<span style='color:{ret_color};font-weight:800;font-family:Roboto Mono,monospace;'>{ret_txt}</span>{warn_txt}", unsafe_allow_html=True)
+                    with btn_col1:
+                        if st.button("📈 K線", key=f"wl_chart_{row['code']}", use_container_width=True):
+                            st.session_state.watchlist_chart_target = (row['ticker'], row['name'])
+                    with btn_col2:
+                        if st.button("🗑 移除", key=f"wl_remove_{row['code']}", use_container_width=True):
+                            remove_from_watchlist(row['code'])
+                            st.session_state.watchlist_quotes = pd.DataFrame()
+                            if st.session_state.watchlist_chart_target and st.session_state.watchlist_chart_target[0] == row['ticker']:
+                                st.session_state.watchlist_chart_target = None
+                            st.rerun()
+
+            if st.session_state.watchlist_chart_target:
+                wl_tk, wl_name = st.session_state.watchlist_chart_target
+                st.markdown(f'<div class="section-head" style="margin-top:20px;"><div><div class="section-title" style="font-size:16px;">{wl_name} K線圖</div></div></div>', unsafe_allow_html=True)
+                wl_fig = draw_k_line(wl_tk, wl_name, chart_mode='K線圖', chart_period='日')
+                if wl_fig:
+                    render_kline_chart_with_axis_price(wl_fig, height=440)
+                else:
+                    st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
