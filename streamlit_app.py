@@ -2462,7 +2462,7 @@ with tab_workspace:
                 elif current_bt is not None:
                     st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
 
-        left_col, right_col = st.columns([1.3, 2.4], gap="medium")
+        left_col, right_col = st.columns([1.5, 2.2], gap="medium")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
         with left_col:
@@ -2510,12 +2510,14 @@ with tab_workspace:
                         key=f"stock_table_{st.session_state.table_key}",
                         height=560,
                         column_config={
-                            "代碼": st.column_config.TextColumn("代碼", width=62),
-                            "名稱": st.column_config.TextColumn("名稱", width=80),
-                            "AI評分": st.column_config.ProgressColumn("AI評分", width=90, format="%d", min_value=0, max_value=100),
-                            "收盤": st.column_config.NumberColumn("價格", width=65, format="%.2f"),
-                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=65, format="%.1f%%"),
-                            "量比20日": st.column_config.NumberColumn("量比", width=60, format="%.2fx"),
+                            # [修正] 名稱欄加寬（80→118px），台股名稱常見4~6個中文字，
+                            # 加上熱門股🔥前綴後原本寬度會被截斷；其餘欄位微調挪出空間。
+                            "代碼": st.column_config.TextColumn("代碼", width=56),
+                            "名稱": st.column_config.TextColumn("名稱", width=118),
+                            "AI評分": st.column_config.ProgressColumn("AI評分", width=80, format="%d", min_value=0, max_value=100),
+                            "收盤": st.column_config.NumberColumn("價格", width=60, format="%.2f"),
+                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=58, format="%.1f%%"),
+                            "量比20日": st.column_config.NumberColumn("量比", width=54, format="%.2fx"),
                         }
                     )
                     if event and "selection" in event and event["selection"]["rows"]:
