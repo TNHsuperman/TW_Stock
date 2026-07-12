@@ -65,6 +65,7 @@ for key, default in [
     # [新功能] 自選股／追蹤清單
     ('watchlist_quotes',       pd.DataFrame()),
     ('watchlist_chart_target', None),  # (ticker, name)，選了哪一檔要在下方顯示 K 線
+    ('industry_filter',        None),  # [新功能] 熱門族群卡片點擊後套用的產業別篩選
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1588,7 +1589,16 @@ def fmt_num(value, pattern='{:.2f}', na='N/A'):
 
 
 def render_hot_industries(df: pd.DataFrame):
+    """[設計] 統計『目前候選清單』裡各產業別的集中度與平均分數，用來二次確認
+    訊號品質：某產業集中大量高分候選股，代表族群同步在動、訊號可信度較高；
+    候選股分散在很多產業、各自只有 1-2 檔，代表比較像個股表現而非族群輪動。
+
+    候選股總數 < 10 檔時直接不顯示：太少檔會讓每個產業只分到 1 檔，
+    平均分數等於那一檔股票的分數，統計上沒有意義，顯示出來反而是雜訊。
+    """
     if df.empty or 'industry' not in df.columns or 'AI評分' not in df.columns:
+        return
+    if len(df) < 10:
         return
     hot = (df.groupby('industry')
              .agg(標的數=('code', 'count'), 平均分=('AI評分', 'mean'), 平均量變=('量變動(%)', 'mean'), 平均年增=('營收年增', 'mean'))
@@ -1596,19 +1606,39 @@ def render_hot_industries(df: pd.DataFrame):
     hot = hot[hot['標的數'] >= 1].sort_values(['平均分', '標的數'], ascending=[False, False]).head(8)
     if hot.empty:
         return
-    st.markdown('<div class="tv-section">HOT INDUSTRIES · 熱門族群</div>', unsafe_allow_html=True)
-    cols = st.columns(min(4, len(hot)))
+
+    head_col, clear_col = st.columns([4, 1])
+    with head_col:
+        st.markdown('<div class="tv-section" style="margin-bottom:2px;">HOT INDUSTRIES · 熱門族群</div><div class="candidate-row-hint" style="margin-bottom:10px;">卡片下方按「篩選」，候選清單只顯示該產業別；同一產業集中越多高分候選股，代表族群同步在動、訊號可信度越高。</div>', unsafe_allow_html=True)
+    with clear_col:
+        if st.session_state.get('industry_filter'):
+            if st.button(f"✕ 清除「{st.session_state.industry_filter}」篩選", key="clear_industry_filter_top", use_container_width=True):
+                st.session_state.industry_filter = None
+                st.rerun()
+
+    ncols = min(4, len(hot))
+    cols = st.columns(ncols)
     for i, (_, r) in enumerate(hot.iterrows()):
-        with cols[i % len(cols)]:
+        with cols[i % ncols]:
             yoy_txt = 'N/A' if pd.isna(r['平均年增']) else f"{r['平均年增']:.1f}%"
             vol_txt = 'N/A' if pd.isna(r['平均量變']) else f"{r['平均量變']:.1f}%"
+            is_active = st.session_state.get('industry_filter') == r['industry']
+            active_style = 'border-color:var(--blue)!important;box-shadow:0 0 0 2px rgba(76,141,255,.25);' if is_active else ''
             st.markdown(f"""
-            <div class="tv-card" style="margin-bottom:10px;">
+            <div class="tv-card" style="margin-bottom:6px;{active_style}">
               <div class="tv-label">{r['industry']}</div>
               <div class="tv-value" style="font-size:22px;color:#8fb2ff;">{r['平均分']:.0f}</div>
               <div class="tv-caption">標的 {int(r['標的數'])} · 量變 {vol_txt} · YoY {yoy_txt}</div>
             </div>
             """, unsafe_allow_html=True)
+            # [新功能] 卡片下方的篩選按鈕：點擊後候選清單只顯示該產業別，
+            # 再點一次（同一產業）視為取消篩選，回到全部候選。
+            btn_label = "✓ 篩選中" if is_active else "篩選"
+            if st.button(btn_label, key=f"hot_ind_{r['industry']}", use_container_width=True):
+                st.session_state.industry_filter = None if is_active else r['industry']
+                st.rerun()
+
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
@@ -2296,6 +2326,7 @@ with tab_scan:
         st.session_state.current_idx = 0
         st.session_state.last_selected_row = None
         st.session_state.scan_strategy_used = strategy_name
+        st.session_state.industry_filter = None  # [新功能] 新掃描結果的產業別分布會變，舊篩選清掉避免篩出空清單
         st.rerun()
 
     if st.session_state.is_scanning:
@@ -2422,6 +2453,9 @@ with tab_workspace:
         </div>
         """, unsafe_allow_html=True)
 
+        # ══════════════ 熱門族群：候選股集中度與平均分數，二次確認訊號品質 ══════════════
+        render_hot_industries(df)
+
         # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
         with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
             st.caption(
@@ -2469,6 +2503,16 @@ with tab_workspace:
             with st.container(border=True):
                 st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:8px;">候選股票清單</div><div class="candidate-row-hint">點擊任一列即可切換右側個股工作台。</div>', unsafe_allow_html=True)
 
+                # [新功能] 熱門族群卡片點擊後的產業篩選提示（跟快速篩選是 AND 關係）
+                if st.session_state.get('industry_filter'):
+                    fc1, fc2 = st.columns([2.4, 1])
+                    with fc1:
+                        st.caption(f"🏷 產業篩選中：{st.session_state.industry_filter}")
+                    with fc2:
+                        if st.button("✕ 清除", key="clear_industry_filter_side", use_container_width=True):
+                            st.session_state.industry_filter = None
+                            st.rerun()
+
                 quick_filter = st.selectbox(
                     "快速篩選", ["全部候選", "AI 評分 80 分以上", "營收年增為正", "量比 1.5 倍以上", "突破 20 日高"],
                     key="candidate_filter"
@@ -2482,6 +2526,8 @@ with tab_workspace:
                     view_df = view_df[pd.to_numeric(view_df['量比20日'], errors='coerce') >= 1.5]
                 elif quick_filter == "突破 20 日高":
                     view_df = view_df[view_df['突破20日高'] == True]
+                if st.session_state.get('industry_filter'):
+                    view_df = view_df[view_df['industry'] == st.session_state.industry_filter]
 
                 csv = view_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button("下載目前清單 CSV", csv, f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv', 'text/csv', use_container_width=True)
