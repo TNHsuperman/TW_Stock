@@ -1699,7 +1699,12 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 [data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{border-color:var(--blue)!important;background:#19365b!important;box-shadow:0 0 0 3px rgba(76,141,255,.13)!important}
 [data-testid='stButton']>button[kind='primary']{background:linear-gradient(135deg,#3978e8,#4c8dff)!important;border-color:#679fff!important;color:#fff!important}
 [data-testid='stNumberInput'] input{background:#091625!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:9px!important}.stSlider{padding-top:2px}
-[data-testid='stProgress']>div{background:#13243a!important;border-radius:999px!important;height:9px!important}[data-testid='stProgress']>div>div{background:linear-gradient(90deg,#3978e8,#35c48d)!important;border-radius:999px!important}
+/* [新功能] 進度條加強：加粗、發光、動態流動效果，並顯示 st.progress(text=...) 帶的百分比文字，掃描時一眼就能看到進度 */
+[data-testid='stProgress']{margin:6px 0 4px;}
+[data-testid='stProgress']>div{background:#0d1c30!important;border-radius:999px!important;height:26px!important;border:1px solid rgba(76,141,255,.28)!important;box-shadow:inset 0 0 10px rgba(0,0,0,.35)!important;overflow:visible!important;}
+[data-testid='stProgress']>div>div{background:linear-gradient(90deg,#3978e8,#4c8dff,#35c48d)!important;background-size:200% 100%!important;animation:tv-progress-flow 2.2s linear infinite!important;border-radius:999px!important;box-shadow:0 0 16px rgba(76,141,255,.55),0 0 4px rgba(53,196,141,.5)!important;position:relative!important;min-width:26px!important;}
+[data-testid='stProgress'] p{color:#eaf2ff!important;font-weight:800!important;font-size:14px!important;font-family:'Roboto Mono',monospace!important;margin-bottom:4px!important;}
+@keyframes tv-progress-flow{0%{background-position:0% 0%}100%{background-position:200% 0%}}
 [data-testid='stAlert']{border-radius:12px!important;background:rgba(76,141,255,.09)!important;border:1px solid rgba(76,141,255,.24)!important}
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.tv-card{padding:16px}.tv-label{color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.06em}.tv-value{font-family:'Roboto Mono',monospace;font-size:25px;font-weight:800;margin-top:6px;color:var(--text)}.tv-caption{color:var(--muted);font-size:12px;margin-top:5px}
 .tv-section{font-size:17px;font-weight:800;color:#f4f8ff;margin:22px 0 10px}.quote-panel{padding:18px 20px;margin:18px 0 12px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(8,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}.quote-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.quote-title{font-size:24px;font-weight:800}.quote-tag,.bias-chip{border:1px solid var(--border);background:#13243a;border-radius:999px;padding:5px 10px;color:#b9c9dc;font-size:12px;font-weight:700}.quote-price{font-family:'Roboto Mono',monospace;font-size:38px;font-weight:800;color:var(--green);line-height:1.25}.quote-change{font-family:'Roboto Mono',monospace;font-size:17px;font-weight:700;margin-left:8px}.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(110px,1fr));gap:12px;margin-top:12px;max-width:700px}.metric-k{color:var(--muted);font-size:11px;font-weight:700}.metric-v{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-top:3px}
@@ -1815,8 +1820,13 @@ with tab_scan:
         bar = st.progress(0)
         BATCH = 200
 
-        status.info("步驟 1/3：正在載入上市櫃股票清單…")
-        bar.progress(0.03)
+        def _update_progress(pct: float, msg: str):
+            """[新功能] 進度條同時顯示百分比文字，狀態訊息同步更新，一目了然。"""
+            pct = max(0.0, min(1.0, pct))
+            status.info(msg)
+            bar.progress(pct, text=f"{pct * 100:.0f}%")
+
+        _update_progress(0.03, "步驟 1/3：正在載入上市櫃股票清單…")
         stock_map = get_stock_market_list()
         all_tickers = [s["ticker"] for s in stock_map]
         total_tickers = len(all_tickers)
@@ -1824,23 +1834,26 @@ with tab_scan:
         history_map = {}
         batches = [all_tickers[i:i+BATCH] for i in range(0, total_tickers, BATCH)]
         for bi, batch in enumerate(batches):
-            status.info(f"步驟 2/3：下載歷史行情批次 {bi+1}/{len(batches)}…")
-            bar.progress(0.03 + 0.72 * (bi / max(1, len(batches))))
+            _update_progress(
+                0.03 + 0.72 * (bi / max(1, len(batches))),
+                f"步驟 2/3：下載歷史行情批次 {bi+1}/{len(batches)}…"
+            )
             history_map.update(download_batch_history(tuple(batch)))
 
-        bar.progress(0.75)
-        status.info("步驟 3/3：正在計算均線、量能與候選股票…")
+        _update_progress(0.80, "步驟 3/3：正在計算均線、量能與候選股票…")
         initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
-        bar.progress(0.80)
 
         if initial_hits:
-            status.info(f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
+            _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
             load_official_pe_map(False)
             final_list = []
             with ThreadPoolExecutor(max_workers=6) as ex:
                 f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
                 for j, f in enumerate(as_completed(f_deep), 1):
-                    bar.progress(0.80 + 0.19 * j / len(initial_hits))
+                    _update_progress(
+                        0.80 + 0.19 * j / len(initial_hits),
+                        f"步驟 3/3：補齊個股資料中… ({j}/{len(initial_hits)})"
+                    )
                     deep_res = f.result()
                     base = f_deep[f]
                     row_data = {
@@ -1860,7 +1873,7 @@ with tab_scan:
                     row_data["AI評分"] = score
                     row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
                     final_list.append(row_data)
-            bar.progress(1.0)
+            _update_progress(1.0, "掃描完成，正在整理結果…")
             st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False).reset_index(drop=True)
             status.success(f"掃描完成，共找到 {len(st.session_state.scan_results)} 檔候選股票。")
         else:
