@@ -434,6 +434,29 @@ def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
     return []
 
 
+def _trim_stale_trailing_days(df: pd.DataFrame) -> pd.DataFrame:
+    """[修正] 移除資料尾端「非交易日佔位列」。
+
+    yfinance 在週末/假日（或當日尚未收盤）時，有時會在最後補一筆
+    「收盤價沿用前一日、成交量為 0」的列。若不處理，掃描邏輯拿
+    「最後一筆 vs 倒數第二筆」算漲跌幅／量比時，兩筆會指向同一個
+    真實交易日，導致算出 0.0% 漲跌、0.00x 量比（全市場齊漲跌幅掛零，
+    一看就知道是資料問題而非市場真的沒漲跌）。
+
+    做法：只裁尾端連續的 0 成交量列，保留最近一個「成交量 > 0」的
+    真實交易日作為最後一筆，中間或更早的資料不受影響。
+    """
+    if df is None or df.empty or "volume" not in df.columns:
+        return df
+    nonzero_idx = df.index[df["volume"] > 0]
+    if len(nonzero_idx) == 0:
+        return df.iloc[0:0]
+    last_valid = nonzero_idx[-1]
+    if last_valid == df.index[-1]:
+        return df
+    return df.loc[:last_valid]
+
+
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
@@ -456,6 +479,7 @@ def download_batch_history(tickers: tuple) -> dict:
             df = raw[["Close", "Volume"]].dropna()
             df.columns = ["close", "volume"]
             df["volume"] = (df["volume"] / 1000).astype(int)
+            df = _trim_stale_trailing_days(df)
             result[tk] = df.reset_index(drop=True)
         except:
             pass
@@ -465,6 +489,7 @@ def download_batch_history(tickers: tuple) -> dict:
                 df = raw[tk][["Close", "Volume"]].dropna()
                 df.columns = ["close", "volume"]
                 df["volume"] = (df["volume"] / 1000).astype(int)
+                df = _trim_stale_trailing_days(df)
                 result[tk] = df.reset_index(drop=True)
             except:
                 pass
