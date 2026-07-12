@@ -59,6 +59,9 @@ for key, default in [
     ('chart_mode',       'K線圖'),
     ('chart_period',     '日'),
     ('show_guide',       True),
+    # [新功能] 多策略切換 / 策略回測比較
+    ('scan_strategy_used', '均線多頭排列'),
+    ('backtest_results',   {}),   # {策略名稱: DataFrame} 讓不同策略的回測結果可以並排比較
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -495,48 +498,197 @@ def download_batch_history(tickers: tuple) -> dict:
                 pass
     return result
 
+# ============================================================
+# [新功能] 多策略切換：均線多頭排列 / 量價背離 / 型態突破
+# ============================================================
+# 設計原則：每種策略都拆成「單日條件判斷」函式（輸入 closes/volumes 與索引 i），
+# 這組判斷函式同時被「即時掃描」（判斷最後一天）與「策略回測」（判斷歷史每一天）
+# 共用——確保回測驗證的邏輯跟實際掃描時用的邏輯完全一致，回測結果才有意義。
+
+def _check_ma_condition(closes: pd.Series, volumes: pd.Series, i: int, bias_limit: float):
+    """策略1：均線多頭排列。MA30>MA45>MA60，且股價貼在 30 日均線之上、乖離不超過上限。"""
+    if i < 59:
+        return False, np.nan
+    ma30 = closes.iloc[i-29:i+1].mean()
+    ma45 = closes.iloc[i-44:i+1].mean()
+    ma60 = closes.iloc[i-59:i+1].mean()
+    price = closes.iloc[i]
+    if pd.isna(ma30) or ma30 <= 0:
+        return False, np.nan
+    bias = (price - ma30) / ma30 * 100
+    ok = (ma30 > ma45 > ma60) and (0 <= bias <= bias_limit)
+    return ok, bias
+
+
+def _check_divergence_condition(closes: pd.Series, volumes: pd.Series, i: int, vol_growth_threshold: float):
+    """策略2：量價背離（止跌訊號）。近10日股價持平或小跌，但成交量較前10日
+    明顯放大，且 RSI 從相對低檔回升，視為主力進場布局、量增價穩的背離訊號。"""
+    if i < 24:
+        return False, np.nan
+    prev_price = closes.iloc[i-10]
+    if pd.isna(prev_price) or prev_price <= 0:
+        return False, np.nan
+    price_chg_10d = (closes.iloc[i] / prev_price - 1) * 100
+    recent_vol_avg = volumes.iloc[i-9:i+1].mean()
+    prior_vol_avg = volumes.iloc[i-19:i-9].mean()
+    if pd.isna(prior_vol_avg) or prior_vol_avg <= 0:
+        return False, np.nan
+    vol_chg = (recent_vol_avg / prior_vol_avg - 1) * 100
+    rsi_now = calc_rsi(closes.iloc[:i+1])
+    rsi_prev = calc_rsi(closes.iloc[:i-4]) if i >= 19 else np.nan
+    if pd.isna(rsi_now) or pd.isna(rsi_prev):
+        return False, np.nan
+    ok = (-6 <= price_chg_10d <= 3) and (vol_chg >= vol_growth_threshold) and (rsi_now > rsi_prev) and (rsi_now < 70)
+    return ok, vol_chg
+
+
+def _check_breakout_condition(closes: pd.Series, volumes: pd.Series, i: int, vol_mult_threshold: float):
+    """策略3：型態突破。經過一段整理（近20日波動幅度收斂 ≤12%）後，股價突破
+    近20日高點，且成交量明顯放大確認（避免量能不足的假突破）。"""
+    if i < 20:
+        return False, np.nan
+    price = closes.iloc[i]
+    prior20 = closes.iloc[i-20:i]
+    high20 = prior20.max()
+    low20 = prior20.min()
+    mean20 = prior20.mean()
+    if pd.isna(mean20) or mean20 <= 0:
+        return False, np.nan
+    consolidation = (high20 - low20) / mean20 * 100
+    avg_vol20 = volumes.iloc[i-20:i].mean()
+    if pd.isna(avg_vol20) or avg_vol20 <= 0:
+        return False, np.nan
+    vol_ratio = volumes.iloc[i] / avg_vol20
+    ok = (price > high20) and (vol_ratio >= vol_mult_threshold) and (consolidation <= 12)
+    return ok, vol_ratio
+
+
+def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
+    """三種策略共用的延伸欄位（漲跌、量比、主力成本、RSI、MACD…），
+    確保切換策略不影響既有的 AI 評分／K線／AI分析／公司資訊等下游功能。"""
+    closes = df["close"]
+    volumes = df["volume"]
+    curr_price = float(closes.iloc[-1])
+    vol_today = int(volumes.iloc[-1])
+    vol_yesterday = float(volumes.iloc[-2]) if len(volumes) >= 2 else np.nan
+    avg_vol20 = float(volumes.tail(20).mean())
+    ma30 = closes.rolling(30).mean().iloc[-1]
+    main_cost = calc_main_cost(df, 20)
+    cost_gap = ((curr_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
+    high20 = float(closes.tail(20).max())
+    high60 = float(closes.tail(60).max())
+    prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else np.nan
+    price_change = ((curr_price - prev_close) / prev_close * 100) if pd.notna(prev_close) and prev_close > 0 else np.nan
+    vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if pd.notna(vol_yesterday) and vol_yesterday > 0 else 0
+    bias_30 = ((curr_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 > 0 else np.nan
+    return {**s,
+        "收盤":       round(curr_price, 2),
+        "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
+        "乖離30MA(%)": round(bias_30, 2) if pd.notna(bias_30) else np.nan,
+        "成交量(張)":  vol_today,
+        "量變動(%)":   round(vol_change, 2),
+        "量比20日":    round(vol_today / avg_vol20, 2) if avg_vol20 > 0 else np.nan,
+        "主力成本":    round(main_cost, 2) if pd.notna(main_cost) else np.nan,
+        "主力成本乖離(%)": round(cost_gap, 2) if pd.notna(cost_gap) else np.nan,
+        "RSI14":      round(calc_rsi(closes), 1),
+        "MACD柱":     round(calc_macd_hist(closes), 3),
+        "突破20日高":  curr_price >= high20,
+        "接近60日高":  curr_price >= high60 * 0.97,
+    }
+
+
 def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
+    """策略1：均線多頭排列。"""
     hits = []
     for s in stock_map:
         tk = s["ticker"]
         df = history_map.get(tk)
         if df is None or len(df) < 65:
             continue
-        closes  = df["close"]
+        closes = df["close"]
         volumes = df["volume"]
         if volumes.tail(5).mean() < vol_limit:
             continue
-        ma30 = closes.rolling(30).mean().iloc[-1]
-        ma45 = closes.rolling(45).mean().iloc[-1]
-        ma60 = closes.rolling(60).mean().iloc[-1]
-        curr_price   = float(closes.iloc[-1])
-        vol_today    = int(volumes.iloc[-1])
-        vol_yesterday = float(volumes.iloc[-2])
-        bias_30   = ((curr_price - ma30) / ma30) * 100
-        vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if vol_yesterday > 0 else 0
-        if (ma30 > ma45 > ma60) and (0 <= bias_30 <= bias_limit):
-            avg_vol20 = float(volumes.tail(20).mean())
-            main_cost = calc_main_cost(df, 20)
-            cost_gap = ((curr_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
-            high20 = float(closes.tail(20).max())
-            high60 = float(closes.tail(60).max())
-            prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else np.nan
-            price_change = ((curr_price - prev_close) / prev_close * 100) if pd.notna(prev_close) and prev_close > 0 else np.nan
-            hits.append({**s,
-                "收盤":       round(curr_price, 2),
-                "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
-                "乖離30MA(%)": round(bias_30, 2),
-                "成交量(張)":  vol_today,
-                "量變動(%)":   round(vol_change, 2),
-                "量比20日":    round(vol_today / avg_vol20, 2) if avg_vol20 > 0 else np.nan,
-                "主力成本":    round(main_cost, 2) if pd.notna(main_cost) else np.nan,
-                "主力成本乖離(%)": round(cost_gap, 2) if pd.notna(cost_gap) else np.nan,
-                "RSI14":      round(calc_rsi(closes), 1),
-                "MACD柱":     round(calc_macd_hist(closes), 3),
-                "突破20日高":  curr_price >= high20,
-                "接近60日高":  curr_price >= high60 * 0.97,
-            })
+        i = len(closes) - 1
+        ok, bias = _check_ma_condition(closes, volumes, i, bias_limit)
+        if ok:
+            row = _build_common_signal_fields(s, df)
+            row["策略"] = "均線多頭排列"
+            row["訊號說明"] = f"MA30>MA45>MA60 多頭排列，乖離 {bias:.1f}%"
+            hits.append(row)
     return hits
+
+
+def calc_divergence_signals(history_map, stock_map, vol_growth_threshold, vol_limit):
+    """策略2：量價背離（止跌訊號）。"""
+    hits = []
+    for s in stock_map:
+        tk = s["ticker"]
+        df = history_map.get(tk)
+        if df is None or len(df) < 45:
+            continue
+        closes = df["close"]
+        volumes = df["volume"]
+        if volumes.tail(5).mean() < vol_limit:
+            continue
+        i = len(closes) - 1
+        ok, vol_chg = _check_divergence_condition(closes, volumes, i, vol_growth_threshold)
+        if ok:
+            row = _build_common_signal_fields(s, df)
+            price_chg_10d = (closes.iloc[i] / closes.iloc[i-10] - 1) * 100
+            row["策略"] = "量價背離"
+            row["訊號說明"] = f"近10日股價{price_chg_10d:+.1f}%、量能放大{vol_chg:+.0f}%，RSI回升"
+            hits.append(row)
+    return hits
+
+
+def calc_breakout_signals(history_map, stock_map, vol_mult_threshold, vol_limit):
+    """策略3：型態突破。"""
+    hits = []
+    for s in stock_map:
+        tk = s["ticker"]
+        df = history_map.get(tk)
+        if df is None or len(df) < 45:
+            continue
+        closes = df["close"]
+        volumes = df["volume"]
+        if volumes.tail(5).mean() < vol_limit:
+            continue
+        i = len(closes) - 1
+        ok, vol_ratio = _check_breakout_condition(closes, volumes, i, vol_mult_threshold)
+        if ok:
+            row = _build_common_signal_fields(s, df)
+            high20_excl = float(closes.iloc[i-20:i].max())
+            breakout_pct = (closes.iloc[i] / high20_excl - 1) * 100
+            row["策略"] = "型態突破"
+            row["訊號說明"] = f"突破20日高{breakout_pct:+.1f}%，爆量{vol_ratio:.1f}倍"
+            hits.append(row)
+    return hits
+
+
+# 策略登記表：新增策略只要在這裡註冊，Tab1 的選單與掃描流程會自動支援。
+STRATEGY_REGISTRY = {
+    "均線多頭排列": {
+        "func": calc_ma_signals,
+        "desc": "尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，適合抓穩定趨勢股。",
+        "param_label": "30MA 乖離上限 (%)", "param_help": "數值越小，越偏向尋找貼近 30 日均線的股票。",
+        "param_min": 0.1, "param_max": 15.0, "param_default": 3.0, "param_step": 0.1,
+    },
+    "量價背離": {
+        "func": calc_divergence_signals,
+        "desc": "尋找股價持平或小跌、但成交量明顯放大、RSI 從低檔回升的止跌訊號，適合抓底部布局機會。",
+        "param_label": "量增門檻 (%)", "param_help": "近10日均量相對前10日均量的放大幅度，數值越高訊號越嚴格。",
+        "param_min": 5.0, "param_max": 100.0, "param_default": 25.0, "param_step": 5.0,
+    },
+    "型態突破": {
+        "func": calc_breakout_signals,
+        "desc": "尋找經過整理（近20日波動收斂）後爆量突破近20日高點的股票，適合抓噴出啟動點。",
+        "param_label": "爆量倍數門檻 (x)", "param_help": "當日成交量相對近20日均量的倍數，數值越高代表要求突破時量能越強。",
+        "param_min": 1.1, "param_max": 4.0, "param_default": 1.5, "param_step": 0.1,
+    },
+}
+
+
 
 def clean_percent(text):
     if not text or text == "N/A":
@@ -1179,6 +1331,98 @@ def calc_stock_score(row: dict) -> tuple[int, list[str]]:
     return int(max(0, min(100, round(score)))), radar[:8]
 
 
+# ============================================================
+# [新功能] 策略回測：驗證目前選用策略的歷史勝率
+# ============================================================
+# 只針對「目前候選清單」的股票回測（而非全市場），控制下載與運算成本；
+# 回測用的條件判斷函式跟即時掃描完全共用（_check_*_condition），
+# 確保回測結果反映的就是你實際在用的那套邏輯，不是另一套假的驗證邏輯。
+
+_STRATEGY_CHECKERS = {
+    "均線多頭排列": _check_ma_condition,
+    "量價背離": _check_divergence_condition,
+    "型態突破": _check_breakout_condition,
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float, vol_limit: int) -> pd.DataFrame:
+    """對候選清單股票重放近9個月歷史資料，找出歷史上符合『目前策略』條件的
+    每一個訊號點，計算進場後 5 / 10 / 20 個交易日的持有報酬。
+    同一檔股票 5 個交易日內只取一次訊號（cooldown），避免同一波段訊號重複灌水。
+    """
+    checker = _STRATEGY_CHECKERS.get(strategy_name)
+    if checker is None or not tickers:
+        return pd.DataFrame()
+
+    ticker_str = " ".join(tickers)
+    try:
+        raw = yf.download(ticker_str, period="9mo", interval="1d", group_by="ticker",
+                          auto_adjust=True, progress=False, threads=True)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    records = []
+    for tk in tickers:
+        try:
+            if len(tickers) == 1:
+                sub = raw[["Close", "Volume"]].dropna()
+            else:
+                sub = raw[tk][["Close", "Volume"]].dropna()
+        except Exception:
+            continue
+        if len(sub) < 65:
+            continue
+
+        closes = sub["Close"].astype(float).reset_index(drop=True)
+        volumes = (sub["Volume"].astype(float) / 1000).reset_index(drop=True)
+        dates = sub.index
+        n = len(closes)
+        last_signal_i = -99
+        for i in range(60, n - 1):
+            if i - last_signal_i < 5:
+                continue
+            try:
+                ok, _ = checker(closes, volumes, i, param_value)
+            except Exception:
+                continue
+            if not ok:
+                continue
+            if volumes.iloc[max(0, i - 4):i + 1].mean() < vol_limit:
+                continue
+            entry = float(closes.iloc[i])
+            rec = {
+                'ticker': tk,
+                '訊號日': pd.Timestamp(dates[i]).strftime('%Y-%m-%d'),
+                '進場價': round(entry, 2),
+            }
+            for h in (5, 10, 20):
+                rec[f'{h}日報酬(%)'] = round((float(closes.iloc[i + h]) / entry - 1) * 100, 2) if i + h < n else np.nan
+            records.append(rec)
+            last_signal_i = i
+
+    return pd.DataFrame(records)
+
+
+def summarize_backtest(bt: pd.DataFrame) -> list:
+    """把回測明細整理成每個持有期間（5/10/20日）的勝率、平均報酬等摘要列。"""
+    rows = []
+    for h in (5, 10, 20):
+        col = f'{h}日報酬(%)'
+        s = bt[col].dropna() if col in bt.columns else pd.Series(dtype=float)
+        if s.empty:
+            continue
+        rows.append({
+            '持有期間': f'{h} 日', '訊號數': int(len(s)),
+            '勝率(%)': round(float((s > 0).mean() * 100), 1),
+            '平均報酬(%)': round(float(s.mean()), 2),
+            '中位數(%)': round(float(s.median()), 2),
+        })
+    return rows
+
+
 def build_ai_report(stock: pd.Series) -> dict:
     score = stock.get('AI評分', np.nan)
     rsi = stock.get('RSI14', np.nan)
@@ -1723,9 +1967,25 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 [data-testid='stSegmentedControl']{margin-bottom:14px;}
 [data-testid='stSegmentedControl'] label{border-radius:10px!important;font-weight:800!important;}
 .candidate-row-hint{font-size:11px;color:var(--muted);margin:2px 0 8px;}
+/* [新功能] 手機版卡片清單：桌面顯示表格、手機顯示卡片，兩者都渲染由 CSS 依寬度切換，
+   避免用 JS 偵測螢幕寬度，st.container(key=...) 產生的 st-key-* class 可直接用 CSS 選取。 */
+.st-key-desktop_candidate_list{display:block;}
+.st-key-mobile_candidate_list{display:none;}
+.mobile-stock-card{background:linear-gradient(180deg,rgba(16,33,56,.92),rgba(9,20,35,.96));border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:8px;}
+.mobile-stock-card .msc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+.mobile-stock-card .msc-name{font-size:15px;font-weight:800;color:#f4f8ff;}
+.mobile-stock-card .msc-code{color:var(--muted);font-size:12px;margin-left:6px;}
+.mobile-stock-card .msc-score{font-family:'Roboto Mono',monospace;font-weight:800;font-size:16px;color:#4c8dff;}
+.mobile-stock-card .msc-metrics{display:flex;gap:14px;font-family:'Roboto Mono',monospace;font-size:12.5px;color:#c7d5e6;}
+.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
+.strategy-badge{display:inline-block;background:rgba(76,141,255,.14);color:#9fc0ff;border:1px solid rgba(76,141,255,.3);border-radius:999px;padding:3px 11px;font-size:11px;font-weight:800;margin-left:8px;}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#07111f}::-webkit-scrollbar-thumb{background:#29425f;border-radius:999px}
 @media(max-width:1000px){.block-container{padding:16px 14px 40px!important}.workflow,.stat-grid{grid-template-columns:repeat(2,1fr)}.app-hero{align-items:flex-start}.app-meta{display:none}.workspace-left{max-height:420px;}}
-@media(max-width:700px){.workflow,.stat-grid,.quote-metrics{grid-template-columns:1fr}.app-title{font-size:22px}.quote-price{font-size:31px}.section-help{display:none}}
+@media(max-width:760px){
+  .workflow,.stat-grid,.quote-metrics{grid-template-columns:1fr}.app-title{font-size:22px}.quote-price{font-size:31px}.section-help{display:none}
+  .st-key-desktop_candidate_list{display:none;}
+  .st-key-mobile_candidate_list{display:block;}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1774,21 +2034,36 @@ with tab_scan:
     st.markdown('<div class="section-head"><div><div class="section-title">設定掃描條件</div><div class="section-help">條件越嚴格，候選股票通常越少；第一次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
     with st.container():
         st.markdown('<div class="control-shell">', unsafe_allow_html=True)
-        note_col, bias_col, vol_col = st.columns([1.6, 1, 1], gap="large")
+
+        # [新功能] 策略選單：切換策略時，下方參數與說明會跟著換
+        strategy_name = st.selectbox(
+            "選股策略", list(STRATEGY_REGISTRY.keys()),
+            key="selected_strategy",
+            help="切換策略後，下方的參數欄位與說明會自動對應調整。"
+        )
+        strategy_cfg = STRATEGY_REGISTRY[strategy_name]
+
+        note_col, param_col, vol_col = st.columns([1.6, 1, 1], gap="large")
         with note_col:
-            st.markdown("""
+            st.markdown(f"""
             <div class="control-note">
-              <b>選股策略</b><br>
-              尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，限制股價不可距離 30 日均線過遠，並排除成交量不足的標的。
+              <b>{strategy_name}</b><span class="strategy-badge">STRATEGY</span><br>
+              {strategy_cfg['desc']}
             </div>
             """, unsafe_allow_html=True)
-        with bias_col:
-            mb_bias = st.number_input(
-                "30MA 乖離上限 (%)", 0.1, 15.0,
-                value=float(st.session_state.user_bias), step=0.1, key="mb_bias",
-                help="數值越小，越偏向尋找貼近 30 日均線的股票。"
+        with param_col:
+            # [新功能] 每個策略有自己的關鍵參數（乖離上限 / 量增門檻 / 爆量倍數），
+            # session_state key 依策略名稱區分，切換策略互不干擾、也記得上次調過的值。
+            param_key = f"strategy_param__{strategy_name}"
+            if param_key not in st.session_state:
+                st.session_state[param_key] = strategy_cfg["param_default"]
+            param_value = st.number_input(
+                strategy_cfg["param_label"],
+                strategy_cfg["param_min"], strategy_cfg["param_max"],
+                value=float(st.session_state[param_key]), step=strategy_cfg["param_step"],
+                key=f"input__{param_key}", help=strategy_cfg["param_help"],
             )
-            st.session_state.user_bias = mb_bias
+            st.session_state[param_key] = param_value
         with vol_col:
             mb_vol = st.slider(
                 "最小成交量 (張)", 0, 3000,
@@ -1798,11 +2073,11 @@ with tab_scan:
             st.session_state.user_vol = mb_vol
         st.markdown('</div>', unsafe_allow_html=True)
 
-    user_bias = st.session_state.user_bias
     user_vol = st.session_state.user_vol
+    param_value = st.session_state[f"strategy_param__{strategy_name}"]
     scan_left, scan_right = st.columns([3, 1])
     with scan_left:
-        st.caption(f"目前條件：30MA 乖離 ≤ {user_bias:.1f}%｜成交量 ≥ {user_vol:,} 張｜MA30 > MA45 > MA60")
+        st.caption(f"目前策略：{strategy_name}｜{strategy_cfg['param_label']} = {param_value:g}｜成交量 ≥ {user_vol:,} 張")
     with scan_right:
         scan_clicked = st.button(
             "開始全市場掃描", use_container_width=True,
@@ -1813,12 +2088,16 @@ with tab_scan:
         st.session_state.is_scanning = True
         st.session_state.current_idx = 0
         st.session_state.last_selected_row = None
+        st.session_state.scan_strategy_used = strategy_name
         st.rerun()
 
     if st.session_state.is_scanning:
         status = st.empty()
         bar = st.progress(0)
         BATCH = 200
+        active_strategy = st.session_state.get("scan_strategy_used", strategy_name)
+        active_cfg = STRATEGY_REGISTRY[active_strategy]
+        active_param = st.session_state[f"strategy_param__{active_strategy}"]
 
         def _update_progress(pct: float, msg: str):
             """[新功能] 進度條同時顯示百分比文字，狀態訊息同步更新，一目了然。"""
@@ -1840,8 +2119,8 @@ with tab_scan:
             )
             history_map.update(download_batch_history(tuple(batch)))
 
-        _update_progress(0.80, "步驟 3/3：正在計算均線、量能與候選股票…")
-        initial_hits = calc_ma_signals(history_map, stock_map, user_bias, user_vol)
+        _update_progress(0.80, f"步驟 3/3：套用「{active_strategy}」策略計算候選股票…")
+        initial_hits = active_cfg["func"](history_map, stock_map, active_param, user_vol)
 
         if initial_hits:
             _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
@@ -1867,6 +2146,7 @@ with tab_scan:
                         "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
                         "RSI14": base.get("RSI14", np.nan), "MACD柱": base.get("MACD柱", np.nan),
                         "突破20日高": base.get("突破20日高", False), "接近60日高": base.get("接近60日高", False),
+                        "策略": base.get("策略", active_strategy), "訊號說明": base.get("訊號說明", ""),
                         "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"],
                     }
                     score, radar = calc_stock_score(row_data)
@@ -1933,6 +2213,46 @@ with tab_workspace:
         </div>
         """, unsafe_allow_html=True)
 
+        # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
+        with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
+            st.caption(
+                "針對目前候選清單的股票，重放近9個月歷史資料找出符合『目前策略』條件的歷史訊號點，"
+                "計算進場後 5／10／20 個交易日的持有報酬。切換策略、重新掃描後再跑一次回測，"
+                "下方會列出每個策略跑過的結果，方便互相比較勝率。過去績效不代表未來表現，僅供參考，非投資建議。"
+            )
+            bt_strategy = st.session_state.scan_strategy_used
+            bt_param = st.session_state.get(f"strategy_param__{bt_strategy}", STRATEGY_REGISTRY[bt_strategy]["param_default"])
+            if st.button(f"▶ 執行「{bt_strategy}」回測", key="btn_run_backtest", use_container_width=True):
+                with st.spinner(f"回測中（下載候選清單 {len(df)} 檔股票近9個月資料）..."):
+                    bt_df = run_strategy_backtest(bt_strategy, tuple(df['ticker'].tolist()), float(bt_param), int(user_vol))
+                st.session_state.backtest_results[bt_strategy] = bt_df
+
+            if st.session_state.backtest_results:
+                compare_rows = []
+                for sname, bt_df in st.session_state.backtest_results.items():
+                    if bt_df is None or bt_df.empty:
+                        compare_rows.append({'策略': sname, '訊號數': 0, '20日勝率(%)': None, '20日平均報酬(%)': None})
+                        continue
+                    summary = summarize_backtest(bt_df)
+                    row20 = next((r for r in summary if r['持有期間'] == '20 日'), None)
+                    compare_rows.append({
+                        '策略': sname,
+                        '訊號數': row20['訊號數'] if row20 else len(bt_df),
+                        '20日勝率(%)': row20['勝率(%)'] if row20 else None,
+                        '20日平均報酬(%)': row20['平均報酬(%)'] if row20 else None,
+                    })
+                st.markdown('<div class="candidate-row-hint" style="margin-top:6px;">策略勝率比較（切換策略並各自執行過回測後會累積列在這裡）</div>', unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(compare_rows), hide_index=True, use_container_width=True)
+
+                current_bt = st.session_state.backtest_results.get(bt_strategy)
+                if current_bt is not None and not current_bt.empty:
+                    detail_rows = summarize_backtest(current_bt)
+                    if detail_rows:
+                        st.markdown(f'<div class="candidate-row-hint">「{bt_strategy}」各持有期間明細</div>', unsafe_allow_html=True)
+                        st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+                elif current_bt is not None:
+                    st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
+
         left_col, right_col = st.columns([1.3, 2.4], gap="medium")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
@@ -1957,37 +2277,68 @@ with tab_workspace:
                 csv = view_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button("下載目前清單 CSV", csv, f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv', 'text/csv', use_container_width=True)
 
-                show_cols = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "量比20日"]
-                available_cols = [c for c in show_cols if c in view_df.columns]
-                df_display = view_df[available_cols].rename(columns={"code": "代碼", "name": "名稱"})
+                # [新功能] 桌面版：完整表格。用 st.container(key=...) 讓 CSS 依螢幕寬度
+                # 切換顯示／隱藏（st-key-desktop_candidate_list），手機版改顯示下方卡片清單。
+                with st.container(key="desktop_candidate_list"):
+                    show_cols = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "量比20日"]
+                    available_cols = [c for c in show_cols if c in view_df.columns]
+                    df_display = view_df[available_cols].rename(columns={"code": "代碼", "name": "名稱"})
 
-                def color_tw_style(val):
-                    if pd.isna(val): return ''
-                    color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
-                    return f'color: {color}; font-weight: bold'
+                    def color_tw_style(val):
+                        if pd.isna(val): return ''
+                        color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
+                        return f'color: {color}; font-weight: bold'
 
-                event = st.dataframe(
-                    df_display.style.map(color_tw_style, subset=[c for c in ['漲跌幅(%)'] if c in df_display.columns]),
-                    use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
-                    key=f"stock_table_{st.session_state.table_key}",
-                    height=560,
-                    column_config={
-                        "代碼": st.column_config.TextColumn("代碼", width=62),
-                        "名稱": st.column_config.TextColumn("名稱", width=80),
-                        "AI評分": st.column_config.ProgressColumn("AI評分", width=90, format="%d", min_value=0, max_value=100),
-                        "收盤": st.column_config.NumberColumn("價格", width=65, format="%.2f"),
-                        "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=65, format="%.1f%%"),
-                        "量比20日": st.column_config.NumberColumn("量比", width=60, format="%.2fx"),
-                    }
-                )
-                if event and "selection" in event and event["selection"]["rows"]:
-                    clicked_view_row = event["selection"]["rows"][0]
-                    selected_code = str(view_df.iloc[clicked_view_row]['code'])
-                    matches = df.index[df['code'].astype(str) == selected_code].tolist()
-                    if matches:
-                        st.session_state.current_idx = matches[0]
-                        st.session_state.last_selected_row = clicked_view_row
-                        current_stock = df.iloc[st.session_state.current_idx]
+                    event = st.dataframe(
+                        df_display.style.map(color_tw_style, subset=[c for c in ['漲跌幅(%)'] if c in df_display.columns]),
+                        use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
+                        key=f"stock_table_{st.session_state.table_key}",
+                        height=560,
+                        column_config={
+                            "代碼": st.column_config.TextColumn("代碼", width=62),
+                            "名稱": st.column_config.TextColumn("名稱", width=80),
+                            "AI評分": st.column_config.ProgressColumn("AI評分", width=90, format="%d", min_value=0, max_value=100),
+                            "收盤": st.column_config.NumberColumn("價格", width=65, format="%.2f"),
+                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=65, format="%.1f%%"),
+                            "量比20日": st.column_config.NumberColumn("量比", width=60, format="%.2fx"),
+                        }
+                    )
+                    if event and "selection" in event and event["selection"]["rows"]:
+                        clicked_view_row = event["selection"]["rows"][0]
+                        selected_code = str(view_df.iloc[clicked_view_row]['code'])
+                        matches = df.index[df['code'].astype(str) == selected_code].tolist()
+                        if matches:
+                            st.session_state.current_idx = matches[0]
+                            st.session_state.last_selected_row = clicked_view_row
+                            current_stock = df.iloc[st.session_state.current_idx]
+
+                # [新功能] 手機版：卡片清單。CSS 在寬度 ≤760px 時才顯示這個容器，
+                # 桌面版會被隱藏（不佔畫面），每張卡片用一個按鈕觸發選股，
+                # 效果等同桌面表格的點列選股。
+                with st.container(key="mobile_candidate_list"):
+                    for _, row in view_df.iterrows():
+                        chg = row.get('漲跌幅(%)', np.nan)
+                        chg_color = '#22ab94' if pd.notna(chg) and chg > 0 else '#f23645' if pd.notna(chg) and chg < 0 else '#c7d5e6'
+                        chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.1f}%"
+                        score_val = row.get('AI評分', np.nan)
+                        st.markdown(f"""
+                        <div class="mobile-stock-card">
+                          <div class="msc-head">
+                            <div><span class="msc-name">{row['name']}</span><span class="msc-code">{row['code']}</span></div>
+                            <div class="msc-score">{'N/A' if pd.isna(score_val) else int(score_val)}</div>
+                          </div>
+                          <div class="msc-metrics">
+                            <div><span>價</span>{fmt_num(row.get('收盤', np.nan), '{:.2f}')}</div>
+                            <div><span>漲跌</span><span style="color:{chg_color};">{chg_txt}</span></div>
+                            <div><span>量比</span>{fmt_num(row.get('量比20日', np.nan), '{:.2f}x')}</div>
+                          </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if st.button(f"查看 {row['name']} ({row['code']})", key=f"mobile_card_{row['code']}", use_container_width=True):
+                            matches = df.index[df['code'].astype(str) == str(row['code'])].tolist()
+                            if matches:
+                                st.session_state.current_idx = matches[0]
+                                st.rerun()
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
         with right_col:
