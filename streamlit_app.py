@@ -307,6 +307,133 @@ def get_stock_market_list():
     # 最後保底：回傳舊快取，即使不是今天，也比直接卡住或空白好。
     return load_local_cache(allow_stale=True)
 
+# ============================================================
+# [新功能] 公司簡介 與 季度 EPS 列表
+# ============================================================
+# 台灣公司財報依法為「季揭露」而非月揭露（月度只揭露營收，不含 EPS），
+# 因此這裡呈現的是「近 N 季 EPS 列表」，並非每月更新，避免資料誤導使用者。
+
+INDUSTRY_CODE_MAP_PROFILE = {
+    '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維',
+    '05': '電機機械', '06': '電器電纜', '07': '化學生技醫療', '08': '玻璃陶瓷',
+    '09': '造紙工業', '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業',
+    '14': '建材營造', '15': '航運業', '16': '觀光餐旅', '17': '金融保險業',
+    '18': '貿易百貨業', '20': '其他業', '21': '化學工業', '22': '生技醫療業',
+    '23': '油電燃氣業', '24': '半導體業', '25': '電腦及週邊設備業', '26': '光電業',
+    '27': '通信網路業', '28': '電子零組件業', '29': '電子通路業', '30': '資訊服務業',
+    '31': '其他電子業', '32': '文化創意業', '33': '農業科技業', '34': '電子商務',
+    '35': '綠能環保', '36': '數位雲端', '37': '運動休閒', '38': '居家生活',
+}
+
+
+def _roc_date_to_ad(text: str) -> str:
+    """把 TWSE OpenAPI 日期字串轉成可讀日期，西元 8 碼與民國 7 碼皆容錯。"""
+    s = re.sub(r"\D", "", str(text or ""))
+    if len(s) == 8:  # 西元 YYYYMMDD
+        try:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+        except Exception:
+            return text
+    if len(s) == 7:  # 民國 YYYMMDD
+        try:
+            return f"{int(s[0:3]) + 1911}-{s[3:5]}-{s[5:7]}"
+        except Exception:
+            return text
+    return text or "N/A"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_company_profile(code: str, market_suffix: str) -> dict:
+    """公司基本資料：產業別、董事長、總經理、成立/上市日期、實收資本額、官網等。
+    來源：TWSE OpenAPI t187ap03_L（上市）／ t187ap03_O（上櫃），公開資訊觀測站官方資料。
+    抓不到時回傳空 dict，UI 端顯示「暫無資料」，不影響其他功能。
+    """
+    url = ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L" if market_suffix == "TW"
+           else "https://openapi.twse.com.tw/v1/opendata/t187ap03_O")
+    data = _fetch_json(url, timeout=10)
+    if not isinstance(data, list):
+        return {}
+
+    rec = None
+    for item in data:
+        if isinstance(item, dict) and str(item.get("公司代號", "")).strip() == str(code):
+            rec = item
+            break
+    if not rec:
+        return {}
+
+    industry_raw = str(rec.get("產業別", "")).strip()
+    industry = INDUSTRY_CODE_MAP_PROFILE.get(industry_raw.zfill(2), industry_raw) if industry_raw else "未分類"
+
+    cap_raw = _to_float_or_nan(rec.get("實收資本額"))
+    cap_text = f"{cap_raw / 1e8:,.1f} 億元" if pd.notna(cap_raw) and cap_raw > 0 else "N/A"
+
+    return {
+        "公司名稱": rec.get("公司名稱", "N/A"),
+        "產業別": industry or "未分類",
+        "董事長": rec.get("董事長", "N/A") or "N/A",
+        "總經理": rec.get("總經理", "N/A") or "N/A",
+        "成立日期": _roc_date_to_ad(rec.get("成立日期", "")),
+        "上市日期": _roc_date_to_ad(rec.get("上市日期", "")),
+        "實收資本額": cap_text,
+        "住址": rec.get("住址", "N/A") or "N/A",
+        "網址": rec.get("網址", "") or "",
+        "統一編號": rec.get("營利事業統一編號", "N/A") or "N/A",
+    }
+
+
+def _extract_yahoo_eps_quarterly_from_html(html: str) -> list:
+    """從 Yahoo 台股「每股盈餘」頁面解析單季 EPS 列表。
+    頁面格式如：2026 Q1 22.08 13.17% 58.28% 1,810.00（EPS／季增率／年增率／季均價）。
+    只作為輔助參考資料，非官方財報數字，解析不到時回傳空 list。
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    pattern = r"(20\d{2})\s*Q([1-4])\s+(-?[\d,]+\.?\d*)\s+(-?[\d,]+\.?\d*)%\s+(-?[\d,]+\.?\d*)%\s+(-?[\d,]+\.?\d*)"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        year, q, eps, qoq, yoy, avg_price = m.groups()
+        key = (year, q)
+        if key in seen:
+            continue
+        seen.add(key)
+        eps_val = _to_float_or_nan(eps)
+        if pd.isna(eps_val):
+            continue
+        rows.append({
+            "年季": f"{year} Q{q}",
+            "EPS": eps_val,
+            "季增率(%)": _to_float_or_nan(qoq),
+            "年增率(%)": _to_float_or_nan(yoy),
+            "季均價": _to_float_or_nan(avg_price),
+        })
+        if len(rows) >= 12:  # 最多保留近 12 季，避免頁面雜訊灌太多筆
+            break
+    return rows
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
+    """單季 EPS 列表（近期，依 Yahoo 股市頁面揭露筆數而定，通常近 8~20 季）。
+    台灣公司財報依法為季揭露，這裡的清單以「季」為單位，非每月更新。
+    """
+    ticker = f"{code}.{market_suffix}"
+    try:
+        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/eps",
+                         headers=get_headers(), timeout=8, verify=False)
+        if r.status_code == 200 and r.text:
+            rows = _extract_yahoo_eps_quarterly_from_html(r.text)
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return []
+
+
 @st.cache_data(ttl=3600)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
@@ -564,7 +691,10 @@ def _extract_pe_from_yahoo_html(html: str) -> float:
 # ── 官方 API 本益比高速擷取 ───────────────────────────────
 # 改用 TWSE / TPEx 官方一次性批次資料，不再逐檔爬 Goodinfo。
 # 優點：速度快、穩定、不容易被擋；掃描時只要抓上市 + 上櫃兩包資料。
-PE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "official_pe_cache.json")
+PE_CACHE_FILE = os.path.join(
+    os.path.dirname(__file__) if '__file__' in globals() else '.',
+    "official_pe_cache.json"
+)
 PE_CACHE_LOCK = threading.Lock()
 PE_CACHE_VERSION = "20260609_official_tpex_oldapi_yahoo_fallback_v2"
 
@@ -1860,7 +1990,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "🏢 公司資訊", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -1916,6 +2046,72 @@ with tab_workspace:
                     </div>
                     <div class="side-card"><div class="side-title">風險提醒</div><div style="color:#c7d5e6;font-size:13px;line-height:1.9;">{report['主力成本']}<br><br>AI 評分是條件整合結果，不代表保證獲利；仍需搭配停損、部位控管與市場環境判斷。</div></div>
                     """, unsafe_allow_html=True)
+
+            # ---------- 公司資訊：公司簡介 + 季度 EPS 列表 ----------
+            elif view_mode == "🏢 公司資訊":
+                market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+                profile = get_company_profile(current_stock['code'], market_suffix)
+
+                st.markdown('<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">公司簡介</div><div class="section-help">資料來源：公開資訊觀測站（TWSE OpenAPI）。</div></div></div>', unsafe_allow_html=True)
+                if profile:
+                    website_html = f'<a href="{profile["網址"]}" target="_blank" style="color:#8eb6ff;">{profile["網址"]}</a>' if profile.get("網址") else "N/A"
+                    st.markdown(f"""
+                    <div class="side-card">
+                      <div class="report-row"><span>公司全名</span><span>{profile['公司名稱']}</span></div>
+                      <div class="report-row"><span>產業別</span><span>{profile['產業別']}</span></div>
+                      <div class="report-row"><span>董事長</span><span>{profile['董事長']}</span></div>
+                      <div class="report-row"><span>總經理</span><span>{profile['總經理']}</span></div>
+                      <div class="report-row"><span>成立日期</span><span>{profile['成立日期']}</span></div>
+                      <div class="report-row"><span>上市/上櫃日期</span><span>{profile['上市日期']}</span></div>
+                      <div class="report-row"><span>實收資本額</span><span>{profile['實收資本額']}</span></div>
+                      <div class="report-row"><span>統一編號</span><span>{profile['統一編號']}</span></div>
+                      <div class="report-row" style="border-bottom:0;"><span>公司網址</span><span>{website_html}</span></div>
+                      <div class="tv-caption" style="margin-top:10px;">{profile['住址']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.info("目前無法取得公司基本資料，可能是新股或官方資料尚未更新，請稍後再試。")
+
+                st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></div></div>', unsafe_allow_html=True)
+                eps_rows = fetch_quarterly_eps(current_stock['code'], market_suffix)
+                if eps_rows:
+                    eps_df = pd.DataFrame(eps_rows)
+                    ttm_eps = eps_df['EPS'].head(4).sum()
+                    st.markdown(f"""
+                    <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:10px;">
+                      <div class="tv-card"><div class="tv-label">最新單季 EPS</div><div class="tv-value">{eps_df.iloc[0]['EPS']:.2f}</div><div class="tv-caption">{eps_df.iloc[0]['年季']}</div></div>
+                      <div class="tv-card"><div class="tv-label">近四季 EPS 合計</div><div class="tv-value">{ttm_eps:.2f}</div><div class="tv-caption">近四季加總（TTM）</div></div>
+                      <div class="tv-card"><div class="tv-label">季度年增率</div><div class="tv-value" style="font-size:20px;color:{'var(--green)' if pd.notna(eps_df.iloc[0]['年增率(%)']) and eps_df.iloc[0]['年增率(%)']>=0 else 'var(--red)'};">{fmt_num(eps_df.iloc[0]['年增率(%)'], '{:+.1f}%')}</div><div class="tv-caption">最新一季 YoY</div></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    chart_df = eps_df.iloc[::-1]
+                    fig = go.Figure(go.Bar(
+                        x=chart_df['年季'], y=chart_df['EPS'],
+                        marker_color=['#f23645' if v < 0 else '#35c48d' for v in chart_df['EPS']],
+                        hovertemplate='%{x}<br>EPS %{y:.2f}<extra></extra>',
+                    ))
+                    fig.update_layout(
+                        height=280, template='plotly_dark',
+                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        margin=dict(l=20, r=20, t=10, b=20),
+                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                        yaxis=dict(title='EPS (元)', gridcolor='rgba(148,163,184,0.09)'),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.dataframe(
+                        eps_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "年季": st.column_config.TextColumn("年季", width=80),
+                            "EPS": st.column_config.NumberColumn("EPS(元)", width=80, format="%.2f"),
+                            "季增率(%)": st.column_config.NumberColumn("季增率", width=80, format="%.1f%%"),
+                            "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%.1f%%"),
+                            "季均價": st.column_config.NumberColumn("季均價", width=80, format="%.2f"),
+                        }
+                    )
+                else:
+                    st.info("目前無法取得單季 EPS 資料，可能是新股、金融股（財報格式不同）或資料來源暫時無回應。")
 
             # ---------- 個股新聞 ----------
             else:
