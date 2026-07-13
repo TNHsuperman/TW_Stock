@@ -661,13 +661,22 @@ def get_long_price_history(ticker: str, period: str = "3y") -> pd.DataFrame:
         return pd.DataFrame()
     if raw is None or raw.empty or "Close" not in raw.columns:
         return pd.DataFrame()
-    raw = raw.reset_index()
-    date_col = "Date" if "Date" in raw.columns else raw.columns[0]
-    dates = pd.to_datetime(raw[date_col])
-    if getattr(dates.dt, "tz", None) is not None:
-        dates = dates.dt.tz_localize(None)
-    df = pd.DataFrame({"date": dates, "close": raw["Close"]}).dropna()
-    return df.sort_values("date").reset_index(drop=True)
+    try:
+        raw = raw.reset_index()
+        date_col = "Date" if "Date" in raw.columns else raw.columns[0]
+        dates = pd.to_datetime(raw[date_col])
+        if getattr(dates.dt, "tz", None) is not None:
+            dates = dates.dt.tz_localize(None)
+        close_col = raw["Close"]
+        if isinstance(close_col, pd.DataFrame):  # 極少數情況欄位會是 MultiIndex，保險起見攤平
+            close_col = close_col.iloc[:, 0]
+        df = pd.DataFrame({"date": dates, "close": close_col}).dropna()
+        # [修正] merge_asof 要求兩邊日期欄位的 dtype 完全一致（連解析度 ns/us 都要相同），
+        # 這裡統一轉成 datetime64[ns]，避免跟 eps_df 那邊的日期 dtype 對不上而噴 MergeError。
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[ns]")
+        return df.sort_values("date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 
 def _quarter_report_effective_date(q_text: str):
@@ -688,29 +697,37 @@ def _quarter_report_effective_date(q_text: str):
 
 def build_pe_river_data(code: str, market_suffix: str, ticker: str) -> dict:
     """整合季度 EPS 與長期股價，還原本益比河流圖所需資料。
-    資料不足（新股、EPS 揭露筆數太少、股價資料不足）時回傳 {}，由 UI 端顯示提示。
+    資料不足，或合併過程出現任何預期外的錯誤（例如日期型別對不上），
+    一律回傳 {}，由 UI 端顯示提示，不讓整頁掛掉（fail-open）。
     """
     eps_rows = fetch_quarterly_eps(code, market_suffix)
     if len(eps_rows) < 5:  # 至少要 5 季，才能滾動出 2 個以上的 TTM 資料點
         return {}
 
-    eps_df = pd.DataFrame(eps_rows).iloc[::-1].reset_index(drop=True)  # 轉成舊到新排序
-    eps_df["生效日"] = eps_df["年季"].apply(_quarter_report_effective_date)
-    eps_df = eps_df.dropna(subset=["生效日"]).sort_values("生效日").reset_index(drop=True)
-    eps_df["TTM_EPS"] = eps_df["EPS"].rolling(4).sum()
-    eps_df = eps_df.dropna(subset=["TTM_EPS"])
-    if eps_df.empty:
+    try:
+        eps_df = pd.DataFrame(eps_rows).iloc[::-1].reset_index(drop=True)  # 轉成舊到新排序
+        eps_df["生效日"] = eps_df["年季"].apply(_quarter_report_effective_date)
+        eps_df = eps_df.dropna(subset=["生效日"]).sort_values("生效日").reset_index(drop=True)
+        # [修正] 跟 price_df 使用完全相同的 dtype（datetime64[ns]），避免 merge_asof 因為
+        # 兩邊日期欄位型別（例如 ns / us 解析度）不一致而拋出 MergeError。
+        eps_df["生效日"] = pd.to_datetime(eps_df["生效日"]).astype("datetime64[ns]")
+        eps_df["TTM_EPS"] = eps_df["EPS"].rolling(4).sum()
+        eps_df = eps_df.dropna(subset=["TTM_EPS"])
+        if eps_df.empty:
+            return {}
+
+        price_df = get_long_price_history(ticker, period="3y")
+        if price_df.empty or len(price_df) < 60:
+            return {}
+
+        merged = pd.merge_asof(
+            price_df.sort_values("date"),
+            eps_df[["生效日", "TTM_EPS"]].rename(columns={"生效日": "date"}).sort_values("date"),
+            on="date", direction="backward",
+        )
+    except Exception:
         return {}
 
-    price_df = get_long_price_history(ticker, period="3y")
-    if price_df.empty or len(price_df) < 60:
-        return {}
-
-    merged = pd.merge_asof(
-        price_df.sort_values("date"),
-        eps_df[["生效日", "TTM_EPS"]].rename(columns={"生效日": "date"}).sort_values("date"),
-        on="date", direction="backward",
-    )
     merged = merged.dropna(subset=["TTM_EPS"])
     merged = merged[merged["TTM_EPS"] > 0]
     if len(merged) < 30:
