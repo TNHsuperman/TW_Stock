@@ -643,6 +643,96 @@ def _institutional_streak(rows: list, field: str) -> dict:
 
 
 # ============================================================
+# [新功能] 個股法人（外資／券商）目標價
+# ============================================================
+# 券商／外資評等報告本身是付費資訊，沒有官方免費 API；Anue鉅亨網「外資評等」頁面
+# 是公開網頁、不需登入即可查看，且用標準 HTML <table> 呈現（不像 Yahoo 河流圖需要
+# JS 動態渲染），適合用 pd.read_html 解析——這也是本檔案原本解析本益比表格時
+# 就在用的手法（見 _load_twse_pe 附近），維持同一套作法。
+# 抓不到資料一律回傳空 list／{}，UI 端顯示「暫無資料」，不影響其他功能（fail-open）。
+
+@st.cache_data(ttl=21600, show_spinner=False)  # 評等不會逐分鐘變動，快取拉長到 6 小時
+def fetch_analyst_target_price(code: str) -> list:
+    """個股法人（外資／券商）評等與目標價紀錄，最新一筆在最前面。
+    來源：Anue鉅亨網「外資評等」頁面。
+    """
+    url = f"https://www.cnyes.com/twstock/foreignrating.aspx?code={code}"
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
+        if r.status_code != 200 or not r.text:
+            return []
+        dfs = pd.read_html(StringIO(r.text))
+    except Exception:
+        return []
+
+    target_df = None
+    for df in dfs:
+        cols = [str(c) for c in df.columns]
+        if any("評等日期" in c for c in cols) and any("目標價" in c for c in cols):
+            target_df = df
+            break
+    if target_df is None:
+        return []
+
+    target_df = target_df.rename(columns=lambda c: str(c).strip())
+
+    def _clean_txt(v, default="--"):
+        """把 pandas NaN 安全轉成預設字串，避免 str(np.nan) 變成字面上的 'nan'。"""
+        if pd.isna(v):
+            return default
+        s = str(v).strip()
+        return s if s else default
+
+    rows = []
+    for _, row in target_df.iterrows():
+        date_raw = re.sub(r"\D", "", str(row.get("評等日期", "")))
+        date_txt = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}" if len(date_raw) == 8 else str(row.get("評等日期", "")).strip()
+        target_price = _to_float_or_nan(row.get("目標價"))
+        if pd.isna(target_price) or target_price <= 0:
+            continue  # 目標價是「--」的列（例如只更新財測、沒更新目標價）先濾掉
+        rows.append({
+            "評等日期": date_txt,
+            "券商": _clean_txt(row.get("券商"), "N/A"),
+            "新評等": _clean_txt(row.get("新評等")),
+            "升降": _clean_txt(row.get("升/降")),
+            "財測EPS": _clean_txt(row.get("財測EPS(年度)")),
+            "目標價": target_price,
+            "現價": _to_float_or_nan(row.get("現價")),
+        })
+        if len(rows) >= 30:  # 最多近 30 筆評等紀錄，避免表格太長
+            break
+    return rows
+
+
+def summarize_target_price(rows: list, current_price: float) -> dict:
+    """彙整法人目標價：近期（最近10筆評等）平均／最高／最低目標價，
+    以及平均目標價相對目前股價的潛在漲跌幅。回傳 {} 代表資料不足。
+    """
+    if not rows:
+        return {}
+    prices = [r["目標價"] for r in rows if pd.notna(r["目標價"])]
+    if not prices:
+        return {}
+    recent = prices[:10]  # 近10筆評等紀錄（不是近10天），避免太舊的目標價拉低平均
+    avg_target = float(np.mean(recent))
+    upside = np.nan
+    if pd.notna(current_price) and current_price > 0:
+        upside = (avg_target - current_price) / current_price * 100
+    latest = rows[0]
+    return {
+        "latest_target": latest["目標價"],
+        "latest_broker": latest["券商"],
+        "latest_rating": latest["新評等"],
+        "latest_date": latest["評等日期"],
+        "avg_target": avg_target,
+        "max_target": float(np.max(recent)),
+        "min_target": float(np.min(recent)),
+        "upside_pct": upside,
+        "n_ratings": len(recent),
+    }
+
+
+# ============================================================
 # [新功能] 個股本益比河流圖
 # ============================================================
 # Yahoo 股市官方「本益比河流圖」頁面需要登入 VIP 帳號才能看到實際圖表資料，
@@ -3008,7 +3098,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💰 三大法人", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💰 三大法人", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3341,6 +3431,75 @@ with tab_workspace:
                     )
                 else:
                     st.info("目前無法取得三大法人買賣資料，可能是新股、資料來源暫時無回應，或該標的非集中市場／櫃買中心交易標的，請稍後再試。")
+
+            # ---------- 法人目標價 ----------
+            elif view_mode == "🎯 法人目標價":
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 法人目標價</div><div class="section-help">資料來源：Anue鉅亨網「外資評等」頁面，彙整外資／券商調整目標價與投資評等的歷史紀錄，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+
+                target_rows = fetch_analyst_target_price(current_stock['code'])
+                if target_rows:
+                    current_price = current_stock.get('收盤', np.nan)
+                    summary = summarize_target_price(target_rows, current_price)
+
+                    if summary:
+                        upside = summary.get('upside_pct', np.nan)
+                        upside_color = 'var(--green)' if pd.notna(upside) and upside >= 0 else 'var(--red)'
+                        st.markdown(f"""
+                        <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:10px;">
+                          <div class="tv-card"><div class="tv-label">最新目標價</div><div class="tv-value">{fmt_num(summary['latest_target'], '{:.1f}')}</div><div class="tv-caption">{summary['latest_broker']}｜{summary['latest_date']}</div></div>
+                          <div class="tv-card"><div class="tv-label">近{summary['n_ratings']}筆平均目標價</div><div class="tv-value">{fmt_num(summary['avg_target'], '{:.1f}')}</div><div class="tv-caption">{fmt_num(summary['min_target'], '{:.1f}')} ~ {fmt_num(summary['max_target'], '{:.1f}')}</div></div>
+                          <div class="tv-card"><div class="tv-label">目前股價</div><div class="tv-value">{fmt_num(current_price, '{:.2f}')}</div><div class="tv-caption">最新收盤</div></div>
+                          <div class="tv-card"><div class="tv-label">平均目標價潛在漲跌</div><div class="tv-value" style="color:{upside_color};">{fmt_num(upside, '{:+.1f}%')}</div><div class="tv-caption">相對目前股價</div></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    target_df = pd.DataFrame(target_rows)
+                    chart_df = target_df.iloc[::-1]  # 轉成舊到新排序，繪圖用
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=chart_df['評等日期'], y=chart_df['目標價'], mode='lines+markers', name='法人目標價',
+                        line=dict(width=2.2, color='#4c8dff'), marker=dict(size=6),
+                        hovertemplate='%{x}<br>目標價 %{y:.1f}<extra></extra>',
+                    ))
+                    if pd.notna(current_price):
+                        fig.add_hline(
+                            y=current_price, line=dict(color='#e6edf3', width=1.4, dash='dot'),
+                            annotation_text=f'目前股價 {current_price:.2f}', annotation_position='bottom right',
+                        )
+                    fig.update_layout(
+                        height=320, template='plotly_dark',
+                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        margin=dict(l=20, r=20, t=10, b=20),
+                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                        yaxis=dict(title='目標價 (元)', gridcolor='rgba(148,163,184,0.09)'),
+                        hovermode='x unified',
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    def _rating_change_color(val):
+                        s = str(val)
+                        if "升" in s:
+                            return "color:#35c48d;font-weight:700;"
+                        if "降" in s:
+                            return "color:#f23645;font-weight:700;"
+                        return ""
+
+                    target_styled = target_df.style.map(_rating_change_color, subset=["升降"])
+                    st.dataframe(
+                        target_styled, hide_index=True, use_container_width=True,
+                        column_config={
+                            "評等日期": st.column_config.TextColumn("評等日期", width=90),
+                            "券商": st.column_config.TextColumn("券商/機構", width=100),
+                            "新評等": st.column_config.TextColumn("投資評等", width=100),
+                            "升降": st.column_config.TextColumn("升降", width=60),
+                            "財測EPS": st.column_config.TextColumn("財測EPS(年度)", width=100),
+                            "目標價": st.column_config.NumberColumn("目標價", width=80, format="%.1f"),
+                            "現價": st.column_config.NumberColumn("當時股價", width=80, format="%.2f"),
+                        }
+                    )
+                    st.caption("「近N筆平均目標價」是取最近10筆評等紀錄的目標價平均，不是近10天；評等日期較久遠的紀錄僅供參考歷史趨勢，實際判斷請以最新評等為主。目標價是各券商／外資機構各自估算的數字，不代表官方保證，也不是投資建議。")
+                else:
+                    st.info("目前無法取得法人目標價資料，可能是這檔股票近期沒有外資／券商發布評等報告，或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 個股新聞 ----------
             elif view_mode == "📰 個股新聞":
