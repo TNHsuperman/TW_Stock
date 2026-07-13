@@ -555,6 +555,93 @@ def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
     return []
 
 
+# ============================================================
+# [新功能] 個股三大法人買賣情況
+# ============================================================
+# 台灣證交所／櫃買中心官方 T86 開放資料只提供「最新一個交易日、全市場」的
+# 三大法人買賣超，沒有現成的「單一個股、近期逐日」歷史 API 可直接查詢；
+# 因此改用 Yahoo 股市個股「法人買賣」頁面一次性取得近期逐日資料，
+# 跟既有 fetch_quarterly_eps() 走相同的「單頁解析＋快取＋抓不到就回空」寫法，
+# 抓不到時 UI 端顯示「暫無資料」，不影響其他功能（fail-open）。
+
+def _extract_institutional_daily_from_html(html: str) -> list:
+    """從 Yahoo 台股「法人買賣」頁面解析近期逐日三大法人買賣超（張）。
+    頁面格式如：2026/05/12 35,287 9,427 5,199 49,912 36.98% 10.00% 379,739
+    （日期／外資／投信／自營商／合計／外資籌碼％／漲跌幅％／成交量）。
+    僅作輔助參考，非官方逐筆對帳資料，解析不到時回傳空 list。
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    pattern = r"(20\d{2}/\d{2}/\d{2})\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d.]+)%\s+(-?[\d.]+)%\s+([\d,]+)"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        date_s, foreign, trust, dealer, total, foreign_pct, chg_pct, vol = m.groups()
+        if date_s in seen:
+            continue
+        seen.add(date_s)
+        f_val = _to_float_or_nan(foreign)
+        t_val = _to_float_or_nan(trust)
+        d_val = _to_float_or_nan(dealer)
+        if pd.isna(f_val) and pd.isna(t_val) and pd.isna(d_val):
+            continue
+        rows.append({
+            "日期": date_s.replace("/", "-"),
+            "外資": f_val,
+            "投信": t_val,
+            "自營商": d_val,
+            "合計": _to_float_or_nan(total),
+            "外資籌碼(%)": _to_float_or_nan(foreign_pct),
+            "漲跌幅(%)": _to_float_or_nan(chg_pct),
+            "成交量": _to_float_or_nan(vol),
+        })
+        if len(rows) >= 60:  # 近 60 個交易日（約 3 個月），足夠看趨勢又不會抓過量雜訊
+            break
+    return rows
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_institutional_trading(code: str, market_suffix: str) -> list:
+    """個股三大法人（外資／投信／自營商）近期逐日買賣超（張），最新一筆在最前面。
+    來源：Yahoo 股市個股「法人買賣」頁面。交易日盤後才會更新，快取 1 小時。
+    """
+    ticker = f"{code}.{market_suffix}"
+    try:
+        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/institutional-trading",
+                         headers=get_headers(), timeout=8, verify=False)
+        if r.status_code == 200 and r.text:
+            rows = _extract_institutional_daily_from_html(r.text)
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return []
+
+
+def _institutional_streak(rows: list, field: str) -> dict:
+    """從逐日序列（rows[0] 為最新一日）計算目前連買／連賣天數與同方向累計張數。
+    直接用序列本身往回累加推算，不額外解析頁面上的「連N買」文字，
+    比較不受頁面版型調整影響。
+    """
+    vals = [r.get(field) for r in rows if pd.notna(r.get(field))]
+    if not vals:
+        return {"days": 0, "total": 0.0, "sign": 0}
+    sign = 1 if vals[0] > 0 else (-1 if vals[0] < 0 else 0)
+    if sign == 0:
+        return {"days": 0, "total": 0.0, "sign": 0}
+    days, total = 0, 0.0
+    for v in vals:
+        s = 1 if v > 0 else (-1 if v < 0 else 0)
+        if s != sign:
+            break
+        days += 1
+        total += v
+    return {"days": days, "total": total, "sign": sign}
+
+
 def _trim_stale_trailing_days(df: pd.DataFrame) -> pd.DataFrame:
     """[修正] 移除資料尾端「非交易日佔位列」。
 
@@ -2795,7 +2882,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💰 三大法人", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3000,8 +3087,79 @@ with tab_workspace:
                     else:
                         st.info("目前無法取得單季 EPS 資料，可能是新股、金融股（財報格式不同）或資料來源暫時無回應。")
 
+            # ---------- 三大法人買賣情況 ----------
+            elif view_mode == "💰 三大法人":
+                market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 三大法人買賣情況</div><div class="section-help">資料來源：Yahoo 股市個股「法人買賣」頁面，彙整外資、投信、自營商逐日買賣超，僅供參考，非官方逐筆對帳資料。</div></div></div>', unsafe_allow_html=True)
+
+                inst_rows = fetch_institutional_trading(current_stock['code'], market_suffix)
+                if inst_rows:
+                    latest = inst_rows[0]
+                    streak_f = _institutional_streak(inst_rows, "外資")
+                    streak_t = _institutional_streak(inst_rows, "投信")
+                    streak_d = _institutional_streak(inst_rows, "自營商")
+                    streak_a = _institutional_streak(inst_rows, "合計")
+
+                    def _streak_txt(s):
+                        if s["days"] <= 1 or s["sign"] == 0:
+                            return "非連續買賣"
+                        word = "買" if s["sign"] > 0 else "賣"
+                        return f"連{s['days']}{word}　累計 {s['total']:+,.0f} 張"
+
+                    cards = [
+                        ("外資（張）", latest.get("外資", np.nan), streak_f),
+                        ("投信（張）", latest.get("投信", np.nan), streak_t),
+                        ("自營商（張）", latest.get("自營商", np.nan), streak_d),
+                        ("三大法人合計（張）", latest.get("合計", np.nan), streak_a),
+                    ]
+                    card_html = ""
+                    for label, val, streak in cards:
+                        color = "var(--green)" if pd.notna(val) and val >= 0 else "var(--red)"
+                        val_txt = fmt_num(val, "{:+,.0f}")
+                        card_html += f'<div class="tv-card"><div class="tv-label">{label}</div><div class="tv-value" style="color:{color};">{val_txt}</div><div class="tv-caption">{_streak_txt(streak)}</div></div>'
+
+                    st.markdown(f"""
+                    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px;">
+                      {card_html}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.caption(f"資料時間：{latest['日期']}（近期逐日資料，正數為買超、負數為賣超；連買／連賣依此序列往回累加推算）")
+
+                    chart_df = pd.DataFrame(inst_rows).iloc[::-1]  # 由舊到新排序，繪圖用
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=chart_df['日期'], y=chart_df['外資'], name='外資', marker_color='#2962ff'))
+                    fig.add_trace(go.Bar(x=chart_df['日期'], y=chart_df['投信'], name='投信', marker_color='#f2a900'))
+                    fig.add_trace(go.Bar(x=chart_df['日期'], y=chart_df['自營商'], name='自營商', marker_color='#a855f7'))
+                    fig.update_layout(
+                        barmode='relative', height=320, template='plotly_dark',
+                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        margin=dict(l=20, r=20, t=10, b=20),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                        yaxis=dict(title='買賣超（張）', gridcolor='rgba(148,163,184,0.09)'),
+                        hovermode='x unified',
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    inst_df = pd.DataFrame(inst_rows)
+                    st.dataframe(
+                        inst_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "日期": st.column_config.TextColumn("日期", width=90),
+                            "外資": st.column_config.NumberColumn("外資(張)", width=90, format="%,.0f"),
+                            "投信": st.column_config.NumberColumn("投信(張)", width=90, format="%,.0f"),
+                            "自營商": st.column_config.NumberColumn("自營商(張)", width=90, format="%,.0f"),
+                            "合計": st.column_config.NumberColumn("合計(張)", width=90, format="%,.0f"),
+                            "外資籌碼(%)": st.column_config.NumberColumn("外資籌碼", width=90, format="%.2f%%"),
+                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌幅", width=80, format="%.2f%%"),
+                            "成交量": st.column_config.NumberColumn("成交量(張)", width=100, format="%,.0f"),
+                        }
+                    )
+                else:
+                    st.info("目前無法取得三大法人買賣資料，可能是新股、資料來源暫時無回應，或該標的非集中市場／櫃買中心交易標的，請稍後再試。")
+
             # ---------- 個股新聞 ----------
-            else:
+            elif view_mode == "📰 個股新聞":
                 st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 最新新聞</div><div class="section-help">依標題關鍵字初步標記利多、利空或一般資訊。</div></div></div>', unsafe_allow_html=True)
                 news_list = get_tw_stock_news(current_stock['code'])
                 if news_list:
