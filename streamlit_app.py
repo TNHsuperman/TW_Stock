@@ -827,6 +827,67 @@ def fetch_dividend_history(code: str, market_suffix: str) -> dict:
 
 
 # ============================================================
+# [新功能] 個股融資融券／資券變化
+# ============================================================
+# 跟三大法人一樣，官方 TWSE/TPEx 開放資料只提供「最新一天、全市場」的融資融券，
+# 沒有「單一個股、近期逐日」的現成 API；改用 Yahoo 股市個股「資券變化」頁面，
+# 走跟 institutional-trading 完全相同的「單頁解析＋規則正則＋抓不到就回空」寫法。
+
+def _extract_margin_daily_from_html(html: str) -> list:
+    """從 Yahoo 台股「資券變化」頁面解析近期逐日融資融券增減與餘額。
+    頁面格式如：2026/04/17 12,805 144,081 4.58% 621 2,001 0.06% 1.39% 522
+    （日期／融資增減／融資餘額／融資使用率％／融券增減／融券餘額／
+    融券使用率％／券資比％／資券互抵，單位：張）。
+    僅作輔助參考，非官方逐筆對帳資料，解析不到時回傳空 list。
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    pattern = r"(20\d{2}/\d{2}/\d{2})\s+(-?[\d,]+)\s+([\d,]+)\s+([\d.]+)%\s+(-?[\d,]+)\s+([\d,]+)\s+([\d.]+)%\s+([\d.]+)%\s+([\d,]+)"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        date_s, m_chg, m_bal, m_use, s_chg, s_bal, s_use, ratio, offset = m.groups()
+        if date_s in seen:
+            continue
+        seen.add(date_s)
+        rows.append({
+            "日期": date_s.replace("/", "-"),
+            "融資增減": _to_float_or_nan(m_chg),
+            "融資餘額": _to_float_or_nan(m_bal),
+            "融資使用率(%)": _to_float_or_nan(m_use),
+            "融券增減": _to_float_or_nan(s_chg),
+            "融券餘額": _to_float_or_nan(s_bal),
+            "融券使用率(%)": _to_float_or_nan(s_use),
+            "券資比(%)": _to_float_or_nan(ratio),
+            "資券互抵": _to_float_or_nan(offset),
+        })
+        if len(rows) >= 60:  # 近 60 個交易日（約 3 個月），足夠看趨勢又不會抓過量雜訊
+            break
+    return rows
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_margin_trading(code: str, market_suffix: str) -> list:
+    """個股融資融券近期逐日增減與餘額，最新一筆在最前面。
+    來源：Yahoo 股市個股「資券變化」頁面。交易日盤後才會更新，快取 1 小時。
+    """
+    ticker = f"{code}.{market_suffix}"
+    try:
+        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/margin",
+                         headers=get_headers(), timeout=8, verify=False)
+        if r.status_code == 200 and r.text:
+            rows = _extract_margin_daily_from_html(r.text)
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return []
+
+
+# ============================================================
 # [新功能] 個股本益比河流圖
 # ============================================================
 # Yahoo 股市官方「本益比河流圖」頁面需要登入 VIP 帳號才能看到實際圖表資料，
@@ -3192,7 +3253,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💵 股利／殖利率", "💰 三大法人", "🎯 法人目標價", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💵 股利／殖利率", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3610,6 +3671,78 @@ with tab_workspace:
                     )
                 else:
                     st.info("目前無法取得三大法人買賣資料，可能是新股、資料來源暫時無回應，或該標的非集中市場／櫃買中心交易標的，請稍後再試。")
+
+            # ---------- 資券變化 ----------
+            elif view_mode == "📊 資券變化":
+                market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 融資融券／資券變化</div><div class="section-help">資料來源：Yahoo 股市個股「資券變化」頁面，彙整融資融券逐日增減與餘額，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+
+                margin_rows = fetch_margin_trading(current_stock['code'], market_suffix)
+                if margin_rows:
+                    latest = margin_rows[0]
+                    streak_margin = _institutional_streak(margin_rows, "融資增減")
+                    streak_short = _institutional_streak(margin_rows, "融券增減")
+
+                    def _streak_txt(s, word_pos="增", word_neg="減"):
+                        if s["days"] <= 1 or s["sign"] == 0:
+                            return "非連續增減"
+                        word = word_pos if s["sign"] > 0 else word_neg
+                        return f"連{s['days']}{word}　累計 {s['total']:+,.0f} 張"
+
+                    margin_color = "var(--green)" if pd.notna(latest.get("融資增減")) and latest["融資增減"] >= 0 else "var(--red)"
+                    short_color = "var(--green)" if pd.notna(latest.get("融券增減")) and latest["融券增減"] >= 0 else "var(--red)"
+                    st.markdown(f"""
+                    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px;">
+                      <div class="tv-card"><div class="tv-label">融資餘額（張）</div><div class="tv-value">{fmt_num(latest.get('融資餘額'), '{:,.0f}')}</div><div class="tv-caption" style="color:{margin_color};">今日{fmt_num(latest.get('融資增減'), '{:+,.0f}')}張・{_streak_txt(streak_margin)}</div></div>
+                      <div class="tv-card"><div class="tv-label">融券餘額（張）</div><div class="tv-value">{fmt_num(latest.get('融券餘額'), '{:,.0f}')}</div><div class="tv-caption" style="color:{short_color};">今日{fmt_num(latest.get('融券增減'), '{:+,.0f}')}張・{_streak_txt(streak_short)}</div></div>
+                      <div class="tv-card"><div class="tv-label">券資比</div><div class="tv-value">{fmt_num(latest.get('券資比(%)'), '{:.2f}%')}</div><div class="tv-caption">融券餘額 ÷ 融資餘額</div></div>
+                      <div class="tv-card"><div class="tv-label">資券互抵（張）</div><div class="tv-value">{fmt_num(latest.get('資券互抵'), '{:,.0f}')}</div><div class="tv-caption">當沖：同日融資買進＋融券賣出</div></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.caption(f"資料時間：{latest['日期']}（近期逐日資料）")
+
+                    chart_df = pd.DataFrame(margin_rows).iloc[::-1]  # 轉成舊到新排序，繪圖用
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=chart_df['日期'], y=chart_df['融資餘額'], name='融資餘額', mode='lines',
+                        line=dict(width=2.2, color='#2962ff'),
+                        hovertemplate='%{x}<br>融資餘額 %{y:,.0f} 張<extra></extra>',
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=chart_df['日期'], y=chart_df['融券餘額'], name='融券餘額', mode='lines', yaxis='y2',
+                        line=dict(width=2.2, color='#f2a900'),
+                        hovertemplate='%{x}<br>融券餘額 %{y:,.0f} 張<extra></extra>',
+                    ))
+                    fig.update_layout(
+                        height=340, template='plotly_dark',
+                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        margin=dict(l=20, r=40, t=10, b=20),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                        yaxis=dict(title='融資餘額（張）', gridcolor='rgba(148,163,184,0.09)'),
+                        yaxis2=dict(title='融券餘額（張）', overlaying='y', side='right', showgrid=False),
+                        hovermode='x unified',
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    margin_df = pd.DataFrame(margin_rows)
+                    st.dataframe(
+                        margin_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "日期": st.column_config.TextColumn("日期", width=90),
+                            "融資增減": st.column_config.NumberColumn("融資增減", width=85, format="%,.0f"),
+                            "融資餘額": st.column_config.NumberColumn("融資餘額", width=85, format="%,.0f"),
+                            "融資使用率(%)": st.column_config.NumberColumn("融資使用率", width=90, format="%.2f%%"),
+                            "融券增減": st.column_config.NumberColumn("融券增減", width=85, format="%,.0f"),
+                            "融券餘額": st.column_config.NumberColumn("融券餘額", width=85, format="%,.0f"),
+                            "融券使用率(%)": st.column_config.NumberColumn("融券使用率", width=90, format="%.2f%%"),
+                            "券資比(%)": st.column_config.NumberColumn("券資比", width=80, format="%.2f%%"),
+                            "資券互抵": st.column_config.NumberColumn("資券互抵", width=80, format="%,.0f"),
+                        }
+                    )
+                    st.caption("融資增減／融券增減是正數代表當日餘額比前一日增加，負數代表減少；券資比 = 融券餘額 ÷ 融資餘額，數值愈高代表放空的人相對愈多。資券互抵（資券當沖）是同一交易日內對同一檔股票融資買進又融券賣出、可互相沖銷的張數。")
+                else:
+                    st.info("目前無法取得融資融券資料，可能是這檔股票不適用融資融券交易（例如興櫃股票或處置股），或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 法人目標價 ----------
             elif view_mode == "🎯 法人目標價":
