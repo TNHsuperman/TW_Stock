@@ -642,6 +642,105 @@ def _institutional_streak(rows: list, field: str) -> dict:
     return {"days": days, "total": total, "sign": sign}
 
 
+# ============================================================
+# [新功能] 個股本益比河流圖
+# ============================================================
+# Yahoo 股市官方「本益比河流圖」頁面需要登入 VIP 帳號才能看到實際圖表資料，
+# 沒有公開、免登入的資料來源可直接取用；因此改成自己還原：
+# 用既有的季度 EPS（fetch_quarterly_eps）滾動加總近四季得到 TTM EPS，
+# 乘上「這檔股票自己歷史本益比分布」的幾個分位數，得到隨 EPS 成長而變動的
+# 理論價位帶，畫成河流狀的區域圖，再把實際股價疊在上面。
+# 這是「相對自己過去本益比區間」的估算，不是官方資料、也不是目標價，僅供參考。
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_long_price_history(ticker: str, period: str = "3y") -> pd.DataFrame:
+    """個股長期日收盤價，供本益比河流圖使用。用 yfinance，抓不到回傳空 DataFrame（fail-open）。"""
+    try:
+        raw = yf.Ticker(ticker).history(period=period)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty or "Close" not in raw.columns:
+        return pd.DataFrame()
+    raw = raw.reset_index()
+    date_col = "Date" if "Date" in raw.columns else raw.columns[0]
+    dates = pd.to_datetime(raw[date_col])
+    if getattr(dates.dt, "tz", None) is not None:
+        dates = dates.dt.tz_localize(None)
+    df = pd.DataFrame({"date": dates, "close": raw["Close"]}).dropna()
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def _quarter_report_effective_date(q_text: str):
+    """把「2026 Q1」轉成該季財報大約公告完畢的日期（季底 + 概略公告遞延），
+    當作這一季 TTM EPS 開始生效的時間點。Q4 是年報，公告遞延抓長一點（~90天）；
+    其餘季報抓 ~45 天。屬概略估計，不是精確公告日，僅用來還原河流圖的時間軸。
+    """
+    try:
+        year_s, q_s = q_text.split(" Q")
+        year, q = int(year_s), q_s.strip()
+        end_month = {"1": 3, "2": 6, "3": 9, "4": 12}[q]
+        end_date = pd.Timestamp(year=year, month=end_month, day=1) + pd.offsets.MonthEnd(0)
+        lag_days = 90 if q == "4" else 45
+        return end_date + pd.Timedelta(days=lag_days)
+    except Exception:
+        return pd.NaT
+
+
+def build_pe_river_data(code: str, market_suffix: str, ticker: str) -> dict:
+    """整合季度 EPS 與長期股價，還原本益比河流圖所需資料。
+    資料不足（新股、EPS 揭露筆數太少、股價資料不足）時回傳 {}，由 UI 端顯示提示。
+    """
+    eps_rows = fetch_quarterly_eps(code, market_suffix)
+    if len(eps_rows) < 5:  # 至少要 5 季，才能滾動出 2 個以上的 TTM 資料點
+        return {}
+
+    eps_df = pd.DataFrame(eps_rows).iloc[::-1].reset_index(drop=True)  # 轉成舊到新排序
+    eps_df["生效日"] = eps_df["年季"].apply(_quarter_report_effective_date)
+    eps_df = eps_df.dropna(subset=["生效日"]).sort_values("生效日").reset_index(drop=True)
+    eps_df["TTM_EPS"] = eps_df["EPS"].rolling(4).sum()
+    eps_df = eps_df.dropna(subset=["TTM_EPS"])
+    if eps_df.empty:
+        return {}
+
+    price_df = get_long_price_history(ticker, period="3y")
+    if price_df.empty or len(price_df) < 60:
+        return {}
+
+    merged = pd.merge_asof(
+        price_df.sort_values("date"),
+        eps_df[["生效日", "TTM_EPS"]].rename(columns={"生效日": "date"}).sort_values("date"),
+        on="date", direction="backward",
+    )
+    merged = merged.dropna(subset=["TTM_EPS"])
+    merged = merged[merged["TTM_EPS"] > 0]
+    if len(merged) < 30:
+        return {}
+
+    merged["本益比"] = merged["close"] / merged["TTM_EPS"]
+    latest_pe = float(merged["本益比"].iloc[-1])
+
+    pe_series = merged["本益比"].replace([np.inf, -np.inf], np.nan).dropna()
+    pe_series = pe_series[(pe_series > 0) & (pe_series < 200)]  # 濾掉明顯異常離群值
+    if len(pe_series) < 30:
+        return {}
+
+    quantiles = {
+        "低本益比(10%)": 0.10, "偏低(30%)": 0.30, "中位數(50%)": 0.50,
+        "偏高(70%)": 0.70, "高本益比(90%)": 0.90,
+    }
+    bands = {label: float(pe_series.quantile(q)) for label, q in quantiles.items()}
+    for label, pe_val in bands.items():
+        merged[label] = merged["TTM_EPS"] * pe_val
+
+    return {
+        "df": merged.reset_index(drop=True),
+        "bands": bands,
+        "latest_pe": latest_pe,
+        "pe_min": float(pe_series.min()),
+        "pe_max": float(pe_series.max()),
+    }
+
+
 def _trim_stale_trailing_days(df: pd.DataFrame) -> pd.DataFrame:
     """[修正] 移除資料尾端「非交易日佔位列」。
 
@@ -711,7 +810,7 @@ def download_batch_history(tickers: tuple) -> dict:
 # 共用——確保回測驗證的邏輯跟實際掃描時用的邏輯完全一致，回測結果才有意義。
 
 def _check_ma_condition(closes: pd.Series, volumes: pd.Series, i: int, bias_limit: float):
-    """策略1：均線多頭排列。MA30>MA45>MA60，且股價貼在 30 日均線之上、乖離不超過上限。"""
+    """策略1：均線多頭排列。MA30>MA45>MA60，收盤價須 ≥ 30MA（明確限制，不追高超過乖離上限）。"""
     if i < 59:
         return False, np.nan
     ma30 = closes.iloc[i-29:i+1].mean()
@@ -721,7 +820,9 @@ def _check_ma_condition(closes: pd.Series, volumes: pd.Series, i: int, bias_limi
     if pd.isna(ma30) or ma30 <= 0:
         return False, np.nan
     bias = (price - ma30) / ma30 * 100
-    ok = (ma30 > ma45 > ma60) and (0 <= bias <= bias_limit)
+    # [新限制] 收盤價一定要 >= 30MA（price >= ma30），獨立寫成明確條件，
+    # 不再只靠 bias >= 0 隱含達成；乖離上限則另外限制「不能貼太多、追高太多」。
+    ok = (ma30 > ma45 > ma60) and (price >= ma30) and (bias <= bias_limit)
     return ok, bias
 
 
@@ -819,7 +920,7 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         if ok:
             row = _build_common_signal_fields(s, df)
             row["策略"] = "均線多頭排列"
-            row["訊號說明"] = f"MA30>MA45>MA60 多頭排列，乖離 {bias:.1f}%"
+            row["訊號說明"] = f"MA30>MA45>MA60 多頭排列，收盤價≥30MA，乖離 {bias:.1f}%"
             hits.append(row)
     return hits
 
@@ -875,7 +976,7 @@ def calc_breakout_signals(history_map, stock_map, vol_mult_threshold, vol_limit)
 STRATEGY_REGISTRY = {
     "均線多頭排列": {
         "func": calc_ma_signals,
-        "desc": "尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，適合抓穩定趨勢股。",
+        "desc": "尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，且收盤價須 ≥ 30MA，適合抓穩定趨勢股。",
         "param_label": "30MA 乖離上限 (%)", "param_help": "數值越小，越偏向尋找貼近 30 日均線的股票。",
         "param_min": 0.1, "param_max": 15.0, "param_default": 3.0, "param_step": 0.1,
     },
@@ -3086,6 +3187,53 @@ with tab_workspace:
                         )
                     else:
                         st.info("目前無法取得單季 EPS 資料，可能是新股、金融股（財報格式不同）或資料來源暫時無回應。")
+
+                    # [新功能] 本益比河流圖：Yahoo 官方河流圖需登入 VIP 才能看，這裡用近四季
+                    # EPS(TTM) × 自身歷史本益比分位數自行還原，屬估算版本，僅供參考。
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">本益比河流圖</div><div class="section-help">用近四季 EPS 滾動加總（TTM）× 自身歷史本益比分位數還原評價區間；估算版本，非官方資料，僅供參考、非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    pe_river = build_pe_river_data(current_stock['code'], market_suffix, current_stock['ticker'])
+                    if pe_river:
+                        river_df = pe_river['df']
+                        bands = pe_river['bands']
+                        latest_pe = pe_river.get('latest_pe', np.nan)
+                        latest_close = float(river_df['close'].iloc[-1])
+
+                        st.markdown(f"""
+                        <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:10px;">
+                          <div class="tv-card"><div class="tv-label">目前股價</div><div class="tv-value">{latest_close:.2f}</div><div class="tv-caption">最新收盤</div></div>
+                          <div class="tv-card"><div class="tv-label">目前本益比（TTM）</div><div class="tv-value">{fmt_num(latest_pe, '{:.1f}')}</div><div class="tv-caption">股價 ÷ 近四季EPS</div></div>
+                          <div class="tv-card"><div class="tv-label">近期本益比區間</div><div class="tv-value" style="font-size:18px;">{pe_river['pe_min']:.1f} ~ {pe_river['pe_max']:.1f}</div><div class="tv-caption">資料涵蓋範圍內</div></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        band_colors = ['#f23645', '#f2a900', '#35c48d', '#2962ff', '#a855f7']
+                        band_labels = list(bands.keys())
+                        fig = go.Figure()
+                        for i, label in enumerate(band_labels):
+                            fig.add_trace(go.Scatter(
+                                x=river_df['date'], y=river_df[label], mode='lines',
+                                name=f"{label} {bands[label]:.1f}x",
+                                line=dict(width=1.1, color=band_colors[i % len(band_colors)]),
+                                hovertemplate=f'{label} {bands[label]:.1f}x<br>' + '%{y:.2f}<extra></extra>',
+                            ))
+                        fig.add_trace(go.Scatter(
+                            x=river_df['date'], y=river_df['close'], mode='lines', name='實際股價',
+                            line=dict(width=2.4, color='#e6edf3'),
+                            hovertemplate='%{x|%Y-%m-%d}<br>股價 %{y:.2f}<extra></extra>',
+                        ))
+                        fig.update_layout(
+                            height=380, template='plotly_dark',
+                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            margin=dict(l=20, r=20, t=10, b=20),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=10)),
+                            xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                            yaxis=dict(title='股價 (元)', gridcolor='rgba(148,163,184,0.09)'),
+                            hovermode='x unified',
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption("每條色線＝「近四季 EPS(TTM) × 該分位數的自身歷史本益比」推算出的理論價位，白線為實際股價。股價落在偏低區間，代表相對自己過去的本益比區間便宜；落在偏高區間代表相對較貴。這只是跟自己歷史比較的統計相對位置，不是目標價，也不是買賣建議。")
+                    else:
+                        st.info("目前資料不足以計算本益比河流圖，可能是新股、EPS 揭露筆數太少，或長期股價資料不足，請稍後再試。")
 
             # ---------- 三大法人買賣情況 ----------
             elif view_mode == "💰 三大法人":
