@@ -1931,6 +1931,14 @@ def fmt_num(value, pattern='{:.2f}', na='N/A'):
     return na if pd.isna(value) else pattern.format(value)
 
 
+def _pct_color_style(val):
+    """給 pandas Styler 用：正數綠、負數紅，跟全站漲跌配色（EPS長條圖等）一致。"""
+    if pd.isna(val):
+        return "color:#8f9bad;"
+    color = "#35c48d" if val >= 0 else "#f23645"
+    return f"color:{color};font-weight:700;"
+
+
 def render_hot_industries(df: pd.DataFrame):
     """[設計] 統計『目前候選清單』裡各產業別的集中度與平均分數，用來二次確認
     訊號品質：某產業集中大量高分候選股，代表族群同步在動、訊號可信度較高；
@@ -3192,13 +3200,14 @@ with tab_workspace:
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
+                        eps_styled = eps_df.style.map(_pct_color_style, subset=["季增率(%)", "年增率(%)"])
                         st.dataframe(
-                            eps_df, hide_index=True, use_container_width=True,
+                            eps_styled, hide_index=True, use_container_width=True,
                             column_config={
                                 "年季": st.column_config.TextColumn("年季", width=80),
                                 "EPS": st.column_config.NumberColumn("EPS(元)", width=80, format="%.2f"),
-                                "季增率(%)": st.column_config.NumberColumn("季增率", width=80, format="%.1f%%"),
-                                "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%.1f%%"),
+                                "季增率(%)": st.column_config.NumberColumn("季增率", width=80, format="%+.1f%%"),
+                                "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%+.1f%%"),
                                 "季均價": st.column_config.NumberColumn("季均價", width=80, format="%.2f"),
                             }
                         )
