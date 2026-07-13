@@ -3207,7 +3207,17 @@ with tab_workspace:
 
                     # [新功能] 本益比河流圖：Yahoo 官方河流圖需登入 VIP 才能看，這裡用近四季
                     # EPS(TTM) × 自身歷史本益比分位數自行還原，屬估算版本，僅供參考。
-                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">本益比河流圖</div><div class="section-help">用近四季 EPS 滾動加總（TTM）× 自身歷史本益比分位數還原評價區間；估算版本，非官方資料，僅供參考、非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    # 旁邊並排一顆連結按鈕，直接開 Goodinfo 官方河流圖頁面讓使用者自行比對
+                    # （純外部連結、開新分頁，不爬取／不截圖對方內容，避免反爬蟲與版權疑慮）。
+                    river_head_col, river_link_col = st.columns([4, 1.3])
+                    with river_head_col:
+                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">本益比河流圖</div><div class="section-help">用近四季 EPS 滾動加總（TTM）× 自身歷史本益比分位數還原評價區間；估算版本，非官方資料，僅供參考、非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    with river_link_col:
+                        st.link_button(
+                            "🔗 Goodinfo 官方河流圖",
+                            f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PER&STOCK_ID={current_stock['code']}",
+                            use_container_width=True,
+                        )
                     pe_river = build_pe_river_data(current_stock['code'], market_suffix, current_stock['ticker'])
                     if pe_river:
                         river_df = pe_river['df']
