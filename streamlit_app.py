@@ -3489,12 +3489,18 @@ with tab_workspace:
                     )
                     if event and "selection" in event and event["selection"]["rows"]:
                         clicked_view_row = event["selection"]["rows"][0]
-                        selected_code = str(view_df.iloc[clicked_view_row]['code'])
-                        matches = df.index[df['code'].astype(str) == selected_code].tolist()
-                        if matches:
-                            st.session_state.current_idx = matches[0]
-                            st.session_state.last_selected_row = clicked_view_row
-                            current_stock = df.iloc[st.session_state.current_idx]
+                        # [修正] st.dataframe 的選取狀態會在任何重跑（包含切換右側檢視分頁、
+                        # 手動查詢股票）時持續回傳同一個值，不是只有「真的點了新的一列」才會有值。
+                        # 如果每次都無條件套用，會把手動查詢或上一檔/下一檔剛設定好的 current_idx
+                        # 蓋回這個表格上次點擊過的那一列。這裡改成只有「這次選取列跟上次記錄的不一樣」
+                        # （代表使用者剛剛真的點了新的一列）才更新 current_idx。
+                        if clicked_view_row != st.session_state.last_selected_row:
+                            selected_code = str(view_df.iloc[clicked_view_row]['code'])
+                            matches = df.index[df['code'].astype(str) == selected_code].tolist()
+                            if matches:
+                                st.session_state.current_idx = matches[0]
+                                st.session_state.last_selected_row = clicked_view_row
+                                current_stock = df.iloc[st.session_state.current_idx]
 
                 # [新功能] 手機版：卡片清單。CSS 在寬度 ≤760px 時才顯示這個容器，
                 # 桌面版會被隱藏（不佔畫面），每張卡片用一個按鈕觸發選股，
