@@ -733,7 +733,7 @@ def summarize_target_price(rows: list, current_price: float) -> dict:
 
 
 # ============================================================
-# [新功能] 個股股利政策／殖利率／除權息
+# [新功能] 個股股利政策／除權息
 # ============================================================
 # Yahoo 股市個股「股利」頁面是公開網頁、不需登入，會列出歷年現金股利／股票股利／
 # 殖利率／除息日等資料，但跟法人買賣、EPS 頁面一樣是用 div 排版而非標準 <table>
@@ -741,8 +741,9 @@ def summarize_target_price(rows: list, current_price: float) -> dict:
 # 頁面每一列固定 11 個欄位（發放期間／所屬期間／現金股利／股票股利／現金殖利率／
 # 除息日昨收價／除息日／除權日／現金股利發放日／股票股利發放日／填息天數），
 # 用「發放期間(西元年或-) + 所屬期間(西元年)」這組固定出現的兩個 token 當作
-# 每一列的錨點，找到錨點後固定往後取 9 個 token，比用一條超長正則去比對
-# 每個欄位（很多欄位常是「-」或「尚未公布」等不定內容）更不容易解析失敗。
+# 每一列的錨點，取「這個錨點到下一個錨點之間」當作這一列的欄位範圍（詳見
+# _extract_dividend_rows_from_html 內的說明）。頁面上的殖利率欄位在不少個股
+# 常常是空值、參考價值有限，所以只解析出來做內部驗證，不對外顯示。
 
 def _extract_dividend_rows_from_html(html: str) -> list:
     """從 Yahoo 台股「股利」頁面解析歷年股利政策列表。
@@ -803,7 +804,6 @@ def _extract_dividend_rows_from_html(html: str) -> list:
             "所屬期間": tokens[start + 1],
             "現金股利": _to_float_or_nan(cash_div),
             "股票股利": _to_float_or_nan(stock_div),
-            "現金殖利率(%)": _to_float_or_nan(yield_pct),
             "除息日": ex_div_txt,
             "填息天數": _to_float_or_nan(fill_days),
         })
@@ -835,7 +835,7 @@ def _extract_dividend_rows_from_html(html: str) -> list:
 
 
 def _extract_dividend_summary_from_html(html: str) -> dict:
-    """解析頁面上「已連N年發放股利，合計X元。近5年平均現金殖利率:Y%」這句摘要，
+    """解析頁面上「已連N年發放股利，合計X元。」這句摘要，
     直接用 Yahoo 自己算好的數字，比自己從逐年列表重算更準確、也更省事。
     抓不到就回傳 {}，UI 端改用逐年列表自行彙總當備援。
     """
@@ -843,15 +843,13 @@ def _extract_dividend_summary_from_html(html: str) -> dict:
         return {}
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
-    m = re.search(r"已連\s*(\d+)\s*年發放股利，?合計\s*([\d.]+)\s*元。?近\s*(\d+)\s*年平均現金殖利率\s*[:：]\s*([\d.]+)%", text)
+    m = re.search(r"已連\s*(\d+)\s*年發放股利，?合計\s*([\d.]+)\s*元", text)
     if not m:
         return {}
-    years, total, avg_years, avg_yield = m.groups()
+    years, total = m.groups()
     return {
         "連續配息年數": int(years),
         "歷年合計股利": _to_float_or_nan(total),
-        "平均殖利率年數": int(avg_years),
-        "平均現金殖利率(%)": _to_float_or_nan(avg_yield),
     }
 
 
@@ -3425,7 +3423,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利／殖利率", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3728,9 +3726,9 @@ with tab_workspace:
                     st.info("目前無法取得財務比率資料，可能是這檔股票剛上市、屬於金融／保險等特殊財報格式產業，或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 股利政策／殖利率／除權息 ----------
-            elif view_mode == "💵 股利／殖利率":
+            elif view_mode == "💵 股利政策":
                 market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><div class="section-help">資料來源：Yahoo 股市個股「股利」頁面，彙整歷年現金股利／股票股利／殖利率／除息日，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><div class="section-help">資料來源：Yahoo 股市個股「股利」頁面，彙整歷年現金股利／股票股利／除息日，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
 
                 div_data = fetch_dividend_history(current_stock['code'], market_suffix)
                 div_rows = div_data.get("rows", [])
@@ -3751,11 +3749,7 @@ with tab_workspace:
                                 break
                         streak_years = streak if streak > 0 else None
 
-                    avg_yield = div_summary.get("平均現金殖利率(%)")
-                    avg_yield_years = div_summary.get("平均殖利率年數", 5)
-                    if avg_yield is None or pd.isna(avg_yield):
-                        yields = [r["現金殖利率(%)"] for r in div_rows[:5] if pd.notna(r.get("現金殖利率(%)"))]
-                        avg_yield = float(np.mean(yields)) if yields else np.nan
+                    total_div = div_summary.get("歷年合計股利")
 
                     latest_row = div_rows[0] if div_rows else {}
                     latest_cash_div = latest_row.get("現金股利", np.nan)
@@ -3765,7 +3759,7 @@ with tab_workspace:
                     st.markdown(f"""
                     <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:10px;">
                       <div class="tv-card"><div class="tv-label">連續配息</div><div class="tv-value">{fmt_num(streak_years, '{:.0f}')}</div><div class="tv-caption">年</div></div>
-                      <div class="tv-card"><div class="tv-label">近{avg_yield_years}年平均殖利率</div><div class="tv-value">{fmt_num(avg_yield, '{:.2f}%')}</div><div class="tv-caption">現金殖利率</div></div>
+                      <div class="tv-card"><div class="tv-label">歷年合計股利</div><div class="tv-value">{fmt_num(total_div, '{:.2f}')}</div><div class="tv-caption">元／股</div></div>
                       <div class="tv-card"><div class="tv-label">最新現金股利</div><div class="tv-value">{fmt_num(latest_cash_div, '{:.2f}')}</div><div class="tv-caption">{latest_year}年度</div></div>
                       <div class="tv-card"><div class="tv-label">最新除息日</div><div class="tv-value" style="font-size:18px;">{latest_ex_date}</div><div class="tv-caption">已公告或預告</div></div>
                     </div>
@@ -3780,19 +3774,13 @@ with tab_workspace:
                             marker_color='#4c8dff',
                             hovertemplate='%{x}年度<br>現金股利 %{y:.2f}<extra></extra>',
                         ))
-                        fig.add_trace(go.Scatter(
-                            x=chart_df['所屬期間'], y=chart_df['現金殖利率(%)'], name='現金殖利率(%)',
-                            yaxis='y2', mode='lines+markers', line=dict(color='#f2a900', width=2),
-                            hovertemplate='%{x}年度<br>殖利率 %{y:.2f}%<extra></extra>',
-                        ))
                         fig.update_layout(
                             height=320, template='plotly_dark',
                             paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
-                            margin=dict(l=20, r=40, t=10, b=20),
+                            margin=dict(l=20, r=20, t=10, b=20),
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                             xaxis=dict(title='所屬年度', gridcolor='rgba(148,163,184,0.09)'),
                             yaxis=dict(title='現金股利 (元)', gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis2=dict(title='殖利率 (%)', overlaying='y', side='right', showgrid=False),
                             hovermode='x unified',
                         )
                         st.plotly_chart(fig, use_container_width=True)
@@ -3803,7 +3791,6 @@ with tab_workspace:
                                 "所屬期間": st.column_config.TextColumn("所屬年度", width=80),
                                 "現金股利": st.column_config.NumberColumn("現金股利(元)", width=90, format="%.2f"),
                                 "股票股利": st.column_config.NumberColumn("股票股利(元)", width=90, format="%.2f"),
-                                "現金殖利率(%)": st.column_config.NumberColumn("現金殖利率", width=90, format="%.2f%%"),
                                 "除息日": st.column_config.TextColumn("除息日", width=100),
                                 "填息天數": st.column_config.NumberColumn("填息天數", width=80, format="%.0f"),
                             }
