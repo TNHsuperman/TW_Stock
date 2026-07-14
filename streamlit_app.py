@@ -3027,67 +3027,50 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .workspace-left{background:linear-gradient(180deg,rgba(16,33,56,.96),rgba(9,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:14px;max-height:900px;overflow-y:auto;}
 .workspace-right{min-height:600px;}
 .workspace-left [data-testid='stDataFrame']{border:0!important;box-shadow:none!important;}
-/* [新設計] 個股工作台分段切換頁籤：科技感／金融終端機風格。
-   selector 是從 Streamlit 前端原始碼（BaseButton 元件）比對確認過的正確版本：
-   容器 testid 是 stButtonGroup，個別頁籤未選取時 testid 是
+/* [新設計] 個股工作台分段切換頁籤：柔和膠囊式風格，取代先前偏「重」的
+   終端機發光效果。selector 是從 Streamlit 前端原始碼（BaseButton 元件）比對確認過
+   的正確版本：容器 testid 是 stButtonGroup，個別頁籤未選取時 testid 是
    stBaseButton-segmented_control，選取中則是 stBaseButton-segmented_controlActive
    （舊版用的 [data-testid='stSegmentedControl'] 其實從未在實際 DOM 出現過，等於沒生效）。
-   排版改用 CSS Grid 固定欄數（桌面3欄、平板2欄、手機1欄），取代 Streamlit 預設的
-   flex-wrap——原本按鈕寬度依文字長短各自不同，換行後參差不齊很難看；Grid 每個
-   儲存格等寬等高，9 個分頁剛好排成 3x3，視覺上更像儀表板／控制面板。 */
+   拿掉外層邊框容器、發光陰影跟脈動動畫，改成單純的膠囊按鈕自然換行、留白加大、
+   選取狀態只用柔和的淡藍色底＋細邊框標示，視覺上更安靜、不搶眼。 */
 [data-testid='stButtonGroup']{
-  display:grid!important;
-  grid-template-columns:repeat(3,1fr)!important;
-  background:linear-gradient(135deg,rgba(13,26,43,.94),rgba(7,15,27,.98))!important;
-  border:1px solid rgba(76,141,255,.3)!important;
-  border-radius:14px!important;
-  padding:8px!important;
-  gap:8px!important;
-  box-shadow:inset 0 0 26px rgba(76,141,255,.06),0 10px 26px rgba(0,0,0,.3)!important;
-  margin-bottom:16px!important;
+  display:flex!important;
+  flex-wrap:wrap!important;
+  gap:10px!important;
+  background:transparent!important;
+  border:none!important;
+  padding:0!important;
+  box-shadow:none!important;
+  margin:2px 0 20px!important;
 }
 [data-testid^='stBaseButton-segmented_control']{
-  width:100%!important;
-  display:flex!important;
-  align-items:center!important;
-  justify-content:center!important;
-  font-family:'Roboto Mono',monospace!important;
-  font-weight:700!important;
-  font-size:12.5px!important;
-  letter-spacing:.03em!important;
-  padding:12px 10px!important;
-  border-radius:10px!important;
+  font-family:'Inter','Noto Sans TC',sans-serif!important;
+  font-weight:600!important;
+  font-size:13.5px!important;
+  letter-spacing:0!important;
+  padding:9px 18px!important;
+  border-radius:999px!important;
   white-space:nowrap!important;
-  overflow:hidden!important;
-  text-overflow:ellipsis!important;
-  transition:all .16s ease!important;
+  transition:all .18s ease!important;
 }
 [data-testid='stBaseButton-segmented_control']{
-  background:rgba(9,20,35,.72)!important;
-  border:1px solid rgba(35,58,85,.9)!important;
-  color:#8ea3bd!important;
+  background:rgba(255,255,255,.03)!important;
+  border:1px solid rgba(255,255,255,.09)!important;
+  color:#8697ad!important;
 }
 [data-testid='stBaseButton-segmented_control']:hover{
-  background:rgba(19,36,58,.92)!important;
-  border-color:rgba(76,141,255,.55)!important;
-  color:#d7e6fb!important;
-  box-shadow:0 0 0 3px rgba(76,141,255,.10)!important;
-  transform:translateY(-1px)!important;
+  background:rgba(255,255,255,.06)!important;
+  border-color:rgba(255,255,255,.18)!important;
+  color:#d7e2f0!important;
 }
 [data-testid='stBaseButton-segmented_controlActive']{
-  background:linear-gradient(135deg,#1c69e0,#2fb787)!important;
-  border:1px solid rgba(178,220,255,.75)!important;
-  color:#fff!important;
-  font-weight:800!important;
-  box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 8px 20px rgba(28,105,224,.45),0 0 16px rgba(47,183,135,.28)!important;
-  animation:seg-pulse 2.6s ease-in-out infinite!important;
+  background:rgba(76,141,255,.15)!important;
+  border:1px solid rgba(76,141,255,.5)!important;
+  color:#8fc4ff!important;
+  font-weight:700!important;
+  box-shadow:none!important;
 }
-@keyframes seg-pulse{
-  0%,100%{box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 8px 20px rgba(28,105,224,.45),0 0 12px rgba(47,183,135,.22);}
-  50%{box-shadow:0 0 0 1px rgba(255,255,255,.2) inset,0 8px 24px rgba(28,105,224,.6),0 0 22px rgba(47,183,135,.42);}
-}
-@media(max-width:1200px){[data-testid='stButtonGroup']{grid-template-columns:repeat(2,1fr)!important;}}
-@media(max-width:760px){[data-testid='stButtonGroup']{grid-template-columns:1fr!important;}}
 .candidate-row-hint{font-size:11px;color:var(--muted);margin:2px 0 8px;}
 /* [新功能] 手機版卡片清單：桌面顯示表格、手機顯示卡片，兩者都渲染由 CSS 依寬度切換，
    避免用 JS 偵測螢幕寬度，st.container(key=...) 產生的 st-key-* class 可直接用 CSS 選取。 */
