@@ -3327,21 +3327,22 @@ else:
     total_found = 0
     current_stock = None
 
-# ------------------------------------------------------------
-# TAB 2：候選與分析工作台（主從式雙欄：左清單常駐 + 右側分段切換）
-# ------------------------------------------------------------
-with tab_workspace:
-    # ══════════════ 手動查詢個股：不必等策略掃描，直接輸入代碼即可查看完整工作台 ══════════════
-    with st.container(border=True):
+def render_manual_search_box(key_suffix: str, with_border: bool = True):
+    """手動查詢個股輸入框：不需策略掃描，直接輸入代碼即可查看完整工作台。
+    抽成函式方便在不同位置重複渲染（例如右欄工作台頂端、或完全沒有候選股票時的
+    空狀態），用 key_suffix 讓每個位置的 widget key 不會互相衝突。
+    """
+    ctx = st.container(border=with_border)
+    with ctx:
         st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:6px;">🔍 手動查詢個股</div><div class="candidate-row-hint">直接輸入上市／上櫃股票代碼，不必等策略掃描完成即可查看完整個股工作台（K線、AI分析、財報、法人動向…）。</div>', unsafe_allow_html=True)
         msc1, msc2 = st.columns([3, 1])
         with msc1:
             manual_code_input = st.text_input(
-                "股票代碼", key="manual_stock_code_input", placeholder="輸入代碼，例如：2330、2454",
+                "股票代碼", key=f"manual_stock_code_input_{key_suffix}", placeholder="輸入代碼，例如：2330、2454",
                 label_visibility="collapsed",
             )
         with msc2:
-            manual_search_clicked = st.button("🔍 查詢", key="btn_manual_search", use_container_width=True)
+            manual_search_clicked = st.button("🔍 查詢", key=f"btn_manual_search_{key_suffix}", use_container_width=True)
         if manual_search_clicked:
             code_input = manual_code_input.strip()
             if not code_input:
@@ -3361,6 +3362,11 @@ with tab_workspace:
                     st.session_state.manual_current_code = manual_result["code"]
                     st.rerun()
 
+
+# ------------------------------------------------------------
+# TAB 2：候選與分析工作台（主從式雙欄：左清單常駐 + 右側分段切換）
+# ------------------------------------------------------------
+with tab_workspace:
     if has_results:
         avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
@@ -3554,6 +3560,9 @@ with tab_workspace:
                 if st.button("下一檔 →", use_container_width=True, key="chart_next"):
                     st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                     st.rerun()
+
+            # ══════════════ 手動查詢個股：不必等策略掃描，直接輸入代碼即可查看完整工作台 ══════════════
+            render_manual_search_box(key_suffix="panel")
 
             price = current_stock.get('收盤', np.nan)
             chg = current_stock.get('漲跌幅(%)', np.nan)
@@ -4191,7 +4200,8 @@ with tab_workspace:
                 else:
                     st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
     else:
-        st.info("目前沒有候選股票。可以用上面的「🔍 手動查詢個股」直接輸入代碼查看，或先到「選股掃描」頁籤執行全市場掃描。")
+        st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「選股掃描」頁籤執行全市場掃描。")
+        render_manual_search_box(key_suffix="empty")
 
 # ------------------------------------------------------------
 # TAB 3：自選股／追蹤清單
