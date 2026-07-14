@@ -66,6 +66,9 @@ for key, default in [
     ('watchlist_quotes',       pd.DataFrame()),
     ('watchlist_chart_target', None),  # (ticker, name)，選了哪一檔要在下方顯示 K 線
     ('industry_filter',        None),  # [新功能] 熱門族群卡片點擊後套用的產業別篩選
+    # [新功能] 手動查詢個股：不需策略掃描，直接輸入代碼查詢
+    ('manual_stocks',       []),   # 手動查詢過的股票清單（跟策略掃描結果同格式，最新查詢排最前面）
+    ('manual_current_code', None), # 剛查到的代碼，用來把 current_idx 切過去
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -2208,6 +2211,67 @@ def calc_stock_score(row: dict) -> tuple[int, list[str]]:
 
 
 # ============================================================
+# [新功能] 手動查詢個股：不必等策略掃描，直接輸入代碼就能看完整工作台
+# ============================================================
+# 刻意重用跟策略掃描完全相同的技術指標／AI評分計算管線
+# （_build_common_signal_fields + fetch_deep_info + calc_stock_score），
+# 確保手動查詢跟策略掃描出來的個股，在 K線／AI分析／多空指標…等分頁
+# 呈現的資訊是同一套邏輯、不會兜不起來，也不用另外維護一套簡化版計算。
+
+def build_manual_stock_row(code: str) -> dict:
+    """依股票代碼組出跟策略掃描結果同格式的一筆資料，供個股工作台直接使用。
+    找不到代碼、或抓不到報價資料時回傳 None，由呼叫端顯示錯誤訊息（fail-open）。
+    """
+    code = str(code).strip().upper()
+    if not code:
+        return None
+
+    try:
+        stock_map = get_stock_market_list()
+    except Exception:
+        stock_map = []
+    base = next((s for s in stock_map if str(s.get("code", "")).upper() == code), None)
+    if base is None:
+        return None
+
+    market = "TW" if str(base["ticker"]).endswith(".TW") else "TWO"
+    try:
+        price_df = get_kline_data(base["code"], market)
+    except Exception:
+        price_df = pd.DataFrame()
+    if price_df.empty or len(price_df) < 30:
+        return None
+
+    row_data = _build_common_signal_fields({
+        "ticker": base["ticker"], "code": base["code"], "name": base["name"],
+        "industry": base.get("industry", "未分類"),
+        "市場別": "上市" if market == "TW" else "上櫃",
+    }, price_df)
+
+    try:
+        deep_res = fetch_deep_info(base["ticker"])
+    except Exception:
+        deep_res = {"pe": np.nan, "mom": np.nan, "yoy": np.nan}
+    row_data["本益比"] = deep_res.get("pe", np.nan)
+    row_data["營收月增"] = deep_res.get("mom", np.nan)
+    row_data["營收年增"] = deep_res.get("yoy", np.nan)
+
+    try:
+        hot_codes = get_hot_stock_tickers()
+    except Exception:
+        hot_codes = set()
+    row_data["熱門股"] = base["code"] in hot_codes
+
+    row_data["策略"] = "手動查詢"
+    row_data["訊號說明"] = "使用者手動輸入代碼查詢，非策略掃描結果，僅顯示個股資訊與 AI 評分供參考。"
+
+    score, radar = calc_stock_score(row_data)
+    row_data["AI評分"] = score
+    row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
+    return row_data
+
+
+# ============================================================
 # [新功能] 策略回測：驗證目前選用策略的歷史勝率
 # ============================================================
 # 只針對「目前候選清單」的股票回測（而非全市場），控制下載與運算成本；
@@ -2963,8 +3027,55 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .workspace-left{background:linear-gradient(180deg,rgba(16,33,56,.96),rgba(9,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:14px;max-height:900px;overflow-y:auto;}
 .workspace-right{min-height:600px;}
 .workspace-left [data-testid='stDataFrame']{border:0!important;box-shadow:none!important;}
-[data-testid='stSegmentedControl']{margin-bottom:14px;}
-[data-testid='stSegmentedControl'] label{border-radius:10px!important;font-weight:800!important;}
+/* [新設計] 個股工作台分段切換頁籤：科技感／金融終端機風格。
+   selector 是從 Streamlit 前端原始碼（BaseButton 元件）比對確認過的正確版本：
+   容器 testid 是 stButtonGroup，個別頁籤未選取時 testid 是
+   stBaseButton-segmented_control，選取中則是 stBaseButton-segmented_controlActive
+   （舊版用的 [data-testid='stSegmentedControl'] 其實從未在實際 DOM 出現過，等於沒生效）。*/
+[data-testid='stButtonGroup']{
+  background:linear-gradient(135deg,rgba(13,26,43,.94),rgba(7,15,27,.98))!important;
+  border:1px solid rgba(76,141,255,.3)!important;
+  border-radius:14px!important;
+  padding:7px!important;
+  gap:7px!important;
+  box-shadow:inset 0 0 26px rgba(76,141,255,.06),0 10px 26px rgba(0,0,0,.3)!important;
+  margin-bottom:16px!important;
+  overflow-x:auto!important;
+}
+[data-testid^='stBaseButton-segmented_control']{
+  font-family:'Roboto Mono',monospace!important;
+  font-weight:700!important;
+  font-size:12.5px!important;
+  letter-spacing:.03em!important;
+  padding:10px 15px!important;
+  border-radius:9px!important;
+  white-space:nowrap!important;
+  transition:all .16s ease!important;
+}
+[data-testid='stBaseButton-segmented_control']{
+  background:rgba(9,20,35,.72)!important;
+  border:1px solid rgba(35,58,85,.9)!important;
+  color:#8ea3bd!important;
+}
+[data-testid='stBaseButton-segmented_control']:hover{
+  background:rgba(19,36,58,.92)!important;
+  border-color:rgba(76,141,255,.55)!important;
+  color:#d7e6fb!important;
+  box-shadow:0 0 0 3px rgba(76,141,255,.10)!important;
+  transform:translateY(-1px)!important;
+}
+[data-testid='stBaseButton-segmented_controlActive']{
+  background:linear-gradient(135deg,#1c69e0,#2fb787)!important;
+  border:1px solid rgba(178,220,255,.75)!important;
+  color:#fff!important;
+  font-weight:800!important;
+  box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 8px 20px rgba(28,105,224,.45),0 0 16px rgba(47,183,135,.28)!important;
+  animation:seg-pulse 2.6s ease-in-out infinite!important;
+}
+@keyframes seg-pulse{
+  0%,100%{box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 8px 20px rgba(28,105,224,.45),0 0 12px rgba(47,183,135,.22);}
+  50%{box-shadow:0 0 0 1px rgba(255,255,255,.2) inset,0 8px 24px rgba(28,105,224,.6),0 0 22px rgba(47,183,135,.42);}
+}
 .candidate-row-hint{font-size:11px;color:var(--muted);margin:2px 0 8px;}
 /* [新功能] 手機版卡片清單：桌面顯示表格、手機顯示卡片，兩者都渲染由 CSS 依寬度切換，
    避免用 JS 偵測螢幕寬度，st.container(key=...) 產生的 st-key-* class 可直接用 CSS 選取。 */
@@ -3190,13 +3301,26 @@ with tab_scan:
         </div>
         """, unsafe_allow_html=True)
 
-# 共用結果與目前股票
+# 共用結果與目前股票：合併「策略掃描結果」跟「手動查詢股票」，
+# 兩種來源共用同一份 current_idx / current_stock，個股工作台的程式碼完全不用區分來源。
 has_results = isinstance(st.session_state.scan_results, pd.DataFrame) and not st.session_state.scan_results.empty
-if has_results:
-    df = st.session_state.scan_results.copy()
+has_manual = bool(st.session_state.manual_stocks)
+if has_results or has_manual:
+    scan_df = st.session_state.scan_results.copy() if has_results else pd.DataFrame()
+    manual_df = pd.DataFrame(st.session_state.manual_stocks) if has_manual else pd.DataFrame()
+    if not manual_df.empty and not scan_df.empty:
+        # 手動查詢的股票如果剛好也在掃描候選清單裡，優先用掃描結果那筆
+        # （欄位較完整、含策略訊號），避免同一檔股票出現兩筆重複列。
+        manual_df = manual_df[~manual_df["code"].isin(scan_df["code"])]
+    df = pd.concat([scan_df, manual_df], ignore_index=True) if not manual_df.empty else scan_df
     total_found = len(df)
     if st.session_state.current_idx >= total_found:
         st.session_state.current_idx = 0
+    if st.session_state.manual_current_code:  # 剛手動查到一檔股票，切過去給使用者看
+        matches = df.index[df['code'].astype(str) == st.session_state.manual_current_code].tolist()
+        if matches:
+            st.session_state.current_idx = matches[0]
+        st.session_state.manual_current_code = None
     current_stock = df.iloc[st.session_state.current_idx]
 else:
     df = pd.DataFrame()
@@ -3207,12 +3331,42 @@ else:
 # TAB 2：候選與分析工作台（主從式雙欄：左清單常駐 + 右側分段切換）
 # ------------------------------------------------------------
 with tab_workspace:
+    # ══════════════ 手動查詢個股：不必等策略掃描，直接輸入代碼即可查看完整工作台 ══════════════
+    with st.container(border=True):
+        st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:6px;">🔍 手動查詢個股</div><div class="candidate-row-hint">直接輸入上市／上櫃股票代碼，不必等策略掃描完成即可查看完整個股工作台（K線、AI分析、財報、法人動向…）。</div>', unsafe_allow_html=True)
+        msc1, msc2 = st.columns([3, 1])
+        with msc1:
+            manual_code_input = st.text_input(
+                "股票代碼", key="manual_stock_code_input", placeholder="輸入代碼，例如：2330、2454",
+                label_visibility="collapsed",
+            )
+        with msc2:
+            manual_search_clicked = st.button("🔍 查詢", key="btn_manual_search", use_container_width=True)
+        if manual_search_clicked:
+            code_input = manual_code_input.strip()
+            if not code_input:
+                st.warning("請先輸入股票代碼。")
+            else:
+                with st.spinner(f"查詢 {code_input} 中…"):
+                    manual_result = build_manual_stock_row(code_input)
+                if manual_result is None:
+                    st.error(f"找不到股票代碼「{code_input}」，請確認代碼是否正確（僅支援上市／上櫃股票）。")
+                else:
+                    # 避免同一檔股票在清單裡重複；最新查詢的排最前面，最多保留 20 檔。
+                    st.session_state.manual_stocks = [
+                        r for r in st.session_state.manual_stocks if r["code"] != manual_result["code"]
+                    ]
+                    st.session_state.manual_stocks.insert(0, manual_result)
+                    st.session_state.manual_stocks = st.session_state.manual_stocks[:20]
+                    st.session_state.manual_current_code = manual_result["code"]
+                    st.rerun()
+
     if has_results:
-        avg_score = df['AI評分'].mean() if 'AI評分' in df.columns else np.nan
-        strong_count = int((df['AI評分'] >= 80).sum()) if 'AI評分' in df.columns else 0
+        avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
+        strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
         st.markdown(f"""
         <div class="stat-grid">
-          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{total_found}</div><div class="tv-caption">本次候選股票</div></div>
+          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次候選股票</div></div>
           <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
           <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
           <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">K線／AI分析／新聞同步顯示</div></div>
@@ -3220,7 +3374,7 @@ with tab_workspace:
         """, unsafe_allow_html=True)
 
         # ══════════════ 熱門族群：候選股集中度與平均分數，二次確認訊號品質 ══════════════
-        render_hot_industries(df)
+        render_hot_industries(scan_df)
 
         # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
         with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
@@ -3232,8 +3386,8 @@ with tab_workspace:
             bt_strategy = st.session_state.scan_strategy_used
             bt_param = st.session_state.get(f"strategy_param__{bt_strategy}", STRATEGY_REGISTRY[bt_strategy]["param_default"])
             if st.button(f"▶ 執行「{bt_strategy}」回測", key="btn_run_backtest", use_container_width=True):
-                with st.spinner(f"回測中（下載候選清單 {len(df)} 檔股票近9個月資料）..."):
-                    bt_df = run_strategy_backtest(bt_strategy, tuple(df['ticker'].tolist()), float(bt_param), int(user_vol))
+                with st.spinner(f"回測中（下載候選清單 {len(scan_df)} 檔股票近9個月資料）..."):
+                    bt_df = run_strategy_backtest(bt_strategy, tuple(scan_df['ticker'].tolist()), float(bt_param), int(user_vol))
                 st.session_state.backtest_results[bt_strategy] = bt_df
 
             if st.session_state.backtest_results:
@@ -3262,6 +3416,7 @@ with tab_workspace:
                 elif current_bt is not None:
                     st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
 
+    if has_results or has_manual:
         left_col, right_col = st.columns([1.5, 2.2], gap="medium")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
@@ -4030,7 +4185,7 @@ with tab_workspace:
                 else:
                     st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
     else:
-        st.info("目前沒有候選股票。請先到「選股掃描」頁籤執行掃描。")
+        st.info("目前沒有候選股票。可以用上面的「🔍 手動查詢個股」直接輸入代碼查看，或先到「選股掃描」頁籤執行全市場掃描。")
 
 # ------------------------------------------------------------
 # TAB 3：自選股／追蹤清單
