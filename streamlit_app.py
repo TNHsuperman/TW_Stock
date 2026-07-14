@@ -855,7 +855,7 @@ def _extract_dividend_summary_from_html(html: str) -> dict:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_dividend_history(code: str, market_suffix: str) -> dict:
-    """個股歷年股利政策（現金股利／股票股利／殖利率／除息日）與摘要統計。
+    """個股歷年股利政策（現金股利／股票股利／除息日）與摘要統計。
     來源：Yahoo 股市個股「股利」頁面。股利政策一年頂多變動幾次，快取拉到 24 小時。
     回傳 {"rows": [...], "summary": {...}}，兩者皆可能是空值（fail-open）。
     """
