@@ -3031,25 +3031,35 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
    selector 是從 Streamlit 前端原始碼（BaseButton 元件）比對確認過的正確版本：
    容器 testid 是 stButtonGroup，個別頁籤未選取時 testid 是
    stBaseButton-segmented_control，選取中則是 stBaseButton-segmented_controlActive
-   （舊版用的 [data-testid='stSegmentedControl'] 其實從未在實際 DOM 出現過，等於沒生效）。*/
+   （舊版用的 [data-testid='stSegmentedControl'] 其實從未在實際 DOM 出現過，等於沒生效）。
+   排版改用 CSS Grid 固定欄數（桌面3欄、平板2欄、手機1欄），取代 Streamlit 預設的
+   flex-wrap——原本按鈕寬度依文字長短各自不同，換行後參差不齊很難看；Grid 每個
+   儲存格等寬等高，9 個分頁剛好排成 3x3，視覺上更像儀表板／控制面板。 */
 [data-testid='stButtonGroup']{
+  display:grid!important;
+  grid-template-columns:repeat(3,1fr)!important;
   background:linear-gradient(135deg,rgba(13,26,43,.94),rgba(7,15,27,.98))!important;
   border:1px solid rgba(76,141,255,.3)!important;
   border-radius:14px!important;
-  padding:7px!important;
-  gap:7px!important;
+  padding:8px!important;
+  gap:8px!important;
   box-shadow:inset 0 0 26px rgba(76,141,255,.06),0 10px 26px rgba(0,0,0,.3)!important;
   margin-bottom:16px!important;
-  overflow-x:auto!important;
 }
 [data-testid^='stBaseButton-segmented_control']{
+  width:100%!important;
+  display:flex!important;
+  align-items:center!important;
+  justify-content:center!important;
   font-family:'Roboto Mono',monospace!important;
   font-weight:700!important;
   font-size:12.5px!important;
   letter-spacing:.03em!important;
-  padding:10px 15px!important;
-  border-radius:9px!important;
+  padding:12px 10px!important;
+  border-radius:10px!important;
   white-space:nowrap!important;
+  overflow:hidden!important;
+  text-overflow:ellipsis!important;
   transition:all .16s ease!important;
 }
 [data-testid='stBaseButton-segmented_control']{
@@ -3076,6 +3086,8 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
   0%,100%{box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 8px 20px rgba(28,105,224,.45),0 0 12px rgba(47,183,135,.22);}
   50%{box-shadow:0 0 0 1px rgba(255,255,255,.2) inset,0 8px 24px rgba(28,105,224,.6),0 0 22px rgba(47,183,135,.42);}
 }
+@media(max-width:1200px){[data-testid='stButtonGroup']{grid-template-columns:repeat(2,1fr)!important;}}
+@media(max-width:760px){[data-testid='stButtonGroup']{grid-template-columns:1fr!important;}}
 .candidate-row-hint{font-size:11px;color:var(--muted);margin:2px 0 8px;}
 /* [新功能] 手機版卡片清單：桌面顯示表格、手機顯示卡片，兩者都渲染由 CSS 依寬度切換，
    避免用 JS 偵測螢幕寬度，st.container(key=...) 產生的 st-key-* class 可直接用 CSS 選取。 */
@@ -3593,7 +3605,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
+                ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3612,43 +3624,6 @@ with tab_workspace:
                         pass
                 else:
                     st.warning("無法載入 K 線資料，請稍後再試。")
-
-            # ---------- AI 分析 ----------
-            elif view_mode == "🤖 AI 分析":
-                report = build_ai_report(current_stock)
-                rsi_txt = fmt_num(current_stock.get('RSI14', np.nan), '{:.1f}')
-                macd_txt = fmt_num(current_stock.get('MACD柱', np.nan), '{:.3f}')
-                main_cost_txt = fmt_num(current_stock.get('主力成本', np.nan), '{:.2f}')
-                cost_gap_txt = fmt_num(current_stock.get('主力成本乖離(%)', np.nan), '{:+.2f}%')
-                radar_items = [x for x in str(current_stock.get('飆股雷達', '')).split('、') if x and x != '觀察'] or ['等待更強共振訊號']
-
-                st.markdown(f"""
-                <div class="side-card" style="margin-top:2px;">
-                  <div class="side-title"><span>盤面強弱</span><span class="bias-chip">{report['盤面強弱']}</span></div>
-                  <div class="report-row"><span>RSI14</span><span>{rsi_txt}</span></div>
-                  <div class="report-row"><span>MACD 柱</span><span>{macd_txt}</span></div>
-                  <div class="report-row"><span>主力成本</span><span>{main_cost_txt}</span></div>
-                  <div class="report-row"><span>成本乖離</span><span>{cost_gap_txt}</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                ai_left, ai_right = st.columns([1.6, 1], gap="medium")
-                with ai_left:
-                    st.markdown(f"""
-                    <div class="side-card">
-                      <div class="side-title">AI 綜合判讀</div>
-                      <div style="color:#c7d5e6;font-size:13px;line-height:1.9;"><b>趨勢結構</b><br>{report['趨勢結構']}<br><br><b>動能訊號</b><br>{report['動能訊號']}<br><br><b>財務訊號</b><br>{report['財務訊號']}</div>
-                    </div>
-                    <div class="side-card"><div class="side-title">高機率劇本</div><div style="color:#c7d5e6;font-size:14px;line-height:1.9;">{report['劇本']}</div></div>
-                    """, unsafe_allow_html=True)
-                with ai_right:
-                    st.markdown(f"""
-                    <div class="side-card">
-                      <div class="side-title"><span>飆股雷達</span><span class="bias-chip">HOT</span></div>
-                      <div class="radar-check">{''.join([f'<div><b>✓</b>{item}</div>' for item in radar_items[:8]])}</div>
-                    </div>
-                    <div class="side-card"><div class="side-title">風險提醒</div><div style="color:#c7d5e6;font-size:13px;line-height:1.9;">{report['主力成本']}<br><br>AI 評分是條件整合結果，不代表保證獲利；仍需搭配停損、部位控管與市場環境判斷。</div></div>
-                    """, unsafe_allow_html=True)
 
             # ---------- 多空指標：市場常用技術指標的多空綜合判讀 ----------
             elif view_mode == "📐 多空指標":
