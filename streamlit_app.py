@@ -760,29 +760,78 @@ def _extract_dividend_rows_from_html(html: str) -> list:
     text = text[idx:]
     tokens = text.split(" ")
 
-    rows = []
+    # [修正] 先把所有列的起點錨點（發放期間 + 所屬期間）位置都找出來，
+    # 用「這個錨點到下一個錨點之間」當作這一列的欄位範圍（動態寬度），
+    # 而不是無條件固定往後抓 9 個 token。原本固定抓 9 個的寫法，
+    # 一旦某一列實際欄位數跟預期不同（例如當年度股利尚未公告、
+    # 頁面版型微調等情況），會把下一列的資料錯誤地吃進這一列，
+    # 導致後面看到「同一年度出現兩筆、其中一筆全部空白」的錯位畫面。
+    #
+    # 錨點偵測還有一個容易忽略的陷阱：某一列自己的「填息天數＝-」剛好緊接在
+    # 下一列開頭的真實年份前面時（例如 "... - 2025 2024 ..."），會被誤判成
+    # 另一個「發放期間=- , 所屬期間=2025」的錨點，跟真正的錨點重疊巢狀。
+    # 因此限制「發放期間＝-」只允許出現在整張表最前面那一列（尚未公告的
+    # 預告股利，通常排在最新一列），中間所有列都必須是「YYYY YYYY」的
+    # 完整年份配對；找到錨點後直接跳過這兩個 token 再繼續掃描，避免同一組
+    # token 被重複解讀成不同錨點。
+    this_year = get_tw_now().year
+    anchor_positions = []
     i = 0
-    while i < len(tokens) - 10:
+    found_first = False
+    while i < len(tokens) - 1:
         tok, nxt = tokens[i], tokens[i + 1]
-        if re.fullmatch(r"(\d{4}|-)", tok) and re.fullmatch(r"\d{4}", nxt):
-            remainder = tokens[i + 2:i + 11]
-            if len(remainder) == 9:
-                cash_div, stock_div, yield_pct, prev_close, ex_div_date, ex_right_date, cash_pay_date, stock_pay_date, fill_days = remainder
-                ex_div_txt = ex_div_date if re.fullmatch(r"\d{4}/\d{2}/\d{2}", ex_div_date) else ("尚未公布" if ex_div_date == "尚未公布" else "-")
-                rows.append({
-                    "所屬期間": nxt,
-                    "現金股利": _to_float_or_nan(cash_div),
-                    "股票股利": _to_float_or_nan(stock_div),
-                    "現金殖利率(%)": _to_float_or_nan(yield_pct),
-                    "除息日": ex_div_txt,
-                    "填息天數": _to_float_or_nan(fill_days),
-                })
-                i += 11
+        is_year_pair = bool(re.fullmatch(r"\d{4}", tok)) and bool(re.fullmatch(r"\d{4}", nxt))
+        is_predicted_pair = (not found_first) and tok == "-" and bool(re.fullmatch(r"\d{4}", nxt))
+        if is_year_pair or is_predicted_pair:
+            year_val = int(nxt)
+            if 1960 <= year_val <= this_year + 1:  # 所屬期間要落在合理年份範圍，避免誤判
+                anchor_positions.append(i)
+                found_first = True
+                i += 2
                 continue
         i += 1
+
+    rows = []
+    for k, start in enumerate(anchor_positions):
+        end = anchor_positions[k + 1] if k + 1 < len(anchor_positions) else min(start + 11, len(tokens))
+        remainder = tokens[start + 2:end]
+        if len(remainder) != 9:
+            continue  # 欄位數對不上預期，寧可跳過這一列，也不要顯示錯位資料
+        cash_div, stock_div, yield_pct, prev_close, ex_div_date, ex_right_date, cash_pay_date, stock_pay_date, fill_days = remainder
+        ex_div_txt = ex_div_date if re.fullmatch(r"\d{4}/\d{2}/\d{2}", ex_div_date) else ("尚未公布" if ex_div_date == "尚未公布" else "-")
+        rows.append({
+            "所屬期間": tokens[start + 1],
+            "現金股利": _to_float_or_nan(cash_div),
+            "股票股利": _to_float_or_nan(stock_div),
+            "現金殖利率(%)": _to_float_or_nan(yield_pct),
+            "除息日": ex_div_txt,
+            "填息天數": _to_float_or_nan(fill_days),
+        })
         if len(rows) >= 25:  # 最多近 25 個年度，避免頁面雜訊灌太多筆
             break
-    return rows
+
+    # [修正] 保險起見再去重：同一個所屬年度理論上只會出現一次；如果因為解析誤差
+    # 仍出現重複年度，保留欄位較完整（非空值數量較多）的那一筆，避免同時顯示
+    # 兩筆同年度但互相矛盾的資料。dict 在 Python 3.7+ 會保留原本的插入順序，
+    # 所以就算後面用更完整的資料覆蓋掉，列表原本「最新年度在前」的順序不會跑掉。
+    def _filled_count(row: dict) -> int:
+        n = 0
+        for v in row.values():
+            if v is None:
+                continue
+            if isinstance(v, float) and pd.isna(v):
+                continue
+            if v == "-":
+                continue
+            n += 1
+        return n
+
+    dedup = {}
+    for r in rows:
+        key = r["所屬期間"]
+        if key not in dedup or _filled_count(r) > _filled_count(dedup[key]):
+            dedup[key] = r
+    return list(dedup.values())
 
 
 def _extract_dividend_summary_from_html(html: str) -> dict:
@@ -885,6 +934,129 @@ def fetch_margin_trading(code: str, market_suffix: str) -> list:
     except Exception:
         pass
     return []
+
+
+# ============================================================
+# [新功能] 個股財務體質評分
+# ============================================================
+# TWSE/TPEx 官方財報開放資料（資產負債表／損益表）依產業別分成好幾種格式
+# （一般業／金融業／證券期貨業／金控業／保險業…欄位都不一樣），直接處理
+# 官方原始財報格式很容易因為股票產業別不同而解析失敗；改用 Anue鉅亨網
+# 「年度財務比率」頁面，該頁面已經把負債比率、流動比率、ROE、ROA 等
+# 常用比率算好，且用的是標準 HTML <table>（不像法人買賣、股利頁面是
+# div 排版），可以直接用 pd.read_html 解析，公開網頁不需登入。
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_financial_ratios(code: str) -> dict:
+    """個股年度財務比率（負債比率、流動比率、ROE、ROA、獲利能力等）。
+    來源：Anue鉅亨網「年度財務比率」頁面。回傳 {"year": "2025年", "metrics": {...}}，
+    抓不到時回傳 {}（fail-open）。
+    """
+    url = f"https://www.cnyes.com/twstock/finratio2.aspx?code={code}"
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
+        if r.status_code != 200 or not r.text:
+            return {}
+        dfs = pd.read_html(StringIO(r.text))
+    except Exception:
+        return {}
+
+    ratio_df = None
+    for df in dfs:
+        cols = [str(c) for c in df.columns]
+        if any("項目" in c for c in cols) and any("名稱" in c for c in cols):
+            ratio_df = df
+            break
+    if ratio_df is None:
+        return {}
+
+    ratio_df = ratio_df.rename(columns=lambda c: str(c).strip())
+    # 年度欄位通常由新到舊排列，取第一個當作最新年度。
+    year_cols = [c for c in ratio_df.columns if re.fullmatch(r"\d{4}年", c)]
+    if not year_cols:
+        return {}
+    latest_col = year_cols[0]
+
+    metrics = {}
+    for _, row in ratio_df.iterrows():
+        name = str(row.get("名稱", "")).strip()
+        if not name or name == "nan":
+            continue
+        val = _to_float_or_nan(row.get(latest_col))
+        if pd.notna(val):
+            metrics[name] = val
+    if not metrics:
+        return {}
+    return {"year": latest_col, "metrics": metrics}
+
+
+def _score_linear(value: float, lo: float, hi: float) -> float:
+    """把數值線性映射到 0~100 分。lo 對應 0 分，hi 對應 100 分；
+    lo > hi 時代表「數值越低越好」的指標（例如負債比率），會自動反向計算。
+    結果一律限制在 0~100 之間，不會因為極端值爆出超出範圍的分數。
+    """
+    if pd.isna(value):
+        return np.nan
+    if lo == hi:
+        return 50.0
+    pct = (value - lo) / (hi - lo)
+    return float(np.clip(pct * 100, 0, 100))
+
+
+# 財務體質評分採用的指標：(對應財報項目名稱, 分類, 0分對應值, 100分對應值)。
+# 門檻值是參考台股一般產業常見水準訂出的粗略區間，不同產業（例如重資產的
+# 航運、金融）合理區間本來就不同，這裡的評分僅供快速篩選參考，不是嚴謹的
+# 產業調整後估值模型。
+FINANCIAL_HEALTH_METRICS = {
+    "負債占資產比率": ("負債占資產比率", "財務結構", 80, 20),
+    "流動比率":       ("流動比率", "償債能力", 80, 250),
+    "速動比率":       ("速動比率", "償債能力", 40, 150),
+    "營業利益率":     ("營業利益率", "獲利能力", 0, 20),
+    "純益率":         ("純益率", "獲利能力", 0, 15),
+    "總資產報酬率":   ("總資產報酬率", "獲利能力", 0, 10),
+    "股東權益報酬率": ("股東權益報酬率", "獲利能力", 0, 20),
+}
+
+
+def calc_financial_health_score(metrics: dict) -> dict:
+    """把財報比率轉成 0~100 的財務體質綜合評分，並列出各分類子分數。
+    只用抓得到的指標計算，缺個一兩項不影響整體評分（fail-open）；
+    完全抓不到指標時回傳 {}，由 UI 端顯示提示。
+    """
+    if not metrics:
+        return {}
+
+    items = []
+    for label, (field, category, lo, hi) in FINANCIAL_HEALTH_METRICS.items():
+        raw = metrics.get(field)
+        if raw is None or pd.isna(raw):
+            continue
+        score = _score_linear(raw, lo, hi)
+        items.append({"指標": label, "分類": category, "原始值": raw, "分數": score})
+
+    if not items:
+        return {}
+
+    overall = float(np.mean([it["分數"] for it in items]))
+    if overall >= 75:
+        verdict, color = "體質優良", "var(--green)"
+    elif overall >= 55:
+        verdict, color = "體質穩健", "#8eb6ff"
+    elif overall >= 35:
+        verdict, color = "普通", "var(--yellow)"
+    else:
+        verdict, color = "體質偏弱", "var(--red)"
+
+    by_category = {}
+    for it in items:
+        by_category.setdefault(it["分類"], []).append(it["分數"])
+    category_scores = {cat: float(np.mean(scores)) for cat, scores in by_category.items()}
+
+    return {
+        "overall": overall, "verdict": verdict, "color": color,
+        "items": items, "category_scores": category_scores,
+        "n_metrics": len(items),
+    }
 
 
 # ============================================================
@@ -3253,7 +3425,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "💵 股利／殖利率", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
+                ["📈 K線圖", "🤖 AI 分析", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利／殖利率", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3515,6 +3687,45 @@ with tab_workspace:
                         st.caption("每條色線＝「近四季 EPS(TTM) × 該分位數的自身歷史本益比」推算出的理論價位，白線為實際股價。股價落在偏低區間，代表相對自己過去的本益比區間便宜；落在偏高區間代表相對較貴。這只是跟自己歷史比較的統計相對位置，不是目標價，也不是買賣建議。")
                     else:
                         st.info("目前資料不足以計算本益比河流圖，可能是新股、EPS 揭露筆數太少，或長期股價資料不足，請稍後再試。")
+
+            # ---------- 財務體質評分 ----------
+            elif view_mode == "🩺 財務體質":
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 財務體質評分</div><div class="section-help">資料來源：Anue鉅亨網「年度財務比率」頁面，整合負債比率、流動比率、獲利能力等指標估算；不同產業合理區間本就不同，僅供快速篩選參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+
+                fin_data = fetch_financial_ratios(current_stock['code'])
+                fin_metrics = fin_data.get("metrics", {})
+                health = calc_financial_health_score(fin_metrics)
+
+                if health:
+                    metric_cols = ''.join(
+                        f'<div><div class="metric-k">{cat}</div><div class="metric-v">{score:.0f}</div></div>'
+                        for cat, score in health['category_scores'].items()
+                    )
+                    st.markdown(f"""
+                    <div class="quote-panel" style="margin:4px 0 16px;">
+                      <div class="quote-head"><div class="quote-title" style="color:{health['color']};">綜合評分：{health['overall']:.0f} 分・{health['verdict']}</div></div>
+                      <div class="quote-metrics" style="grid-template-columns:repeat({max(len(health['category_scores']), 1)},minmax(90px,1fr));">
+                        {metric_cols}
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.caption(f"資料時間：{fin_data.get('year', 'N/A')} 年報｜共採用 {health['n_metrics']} 項指標計算")
+
+                    for it in health['items']:
+                        badge_color = 'var(--green)' if it['分數'] >= 60 else ('var(--yellow)' if it['分數'] >= 35 else 'var(--red)')
+                        st.markdown(f"""
+                        <div class="side-card" style="margin-bottom:10px;">
+                          <div class="side-title" style="margin-bottom:4px;">
+                            <span>{it['指標']}（{it['分類']}）</span>
+                            <span style="background:{badge_color}22;color:{badge_color};border:1px solid {badge_color}40;border-radius:999px;padding:3px 12px;font-size:12px;font-weight:800;">{it['分數']:.0f} 分</span>
+                          </div>
+                          <div class="tv-caption" style="font-family:'Roboto Mono',monospace;">原始數值：{it['原始值']:.2f}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.caption("評分是用線性映射把每項指標換算成 0~100 分再平均，區間門檻是參考一般產業常見水準訂出的粗略估計，不同產業（例如重資產的航運、金融）合理區間本來就不同，僅適合同產業內快速比較參考，不是嚴謹的估值模型，也不是投資建議。")
+                else:
+                    st.info("目前無法取得財務比率資料，可能是這檔股票剛上市、屬於金融／保險等特殊財報格式產業，或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 股利政策／殖利率／除權息 ----------
             elif view_mode == "💵 股利／殖利率":
