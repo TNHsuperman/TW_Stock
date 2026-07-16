@@ -121,7 +121,7 @@ def is_in_watchlist(code: str, watchlist: list) -> bool:
 
 
 def add_to_watchlist(stock: dict) -> list:
-    """加入追蹤：記錄加入當下的日期／價格／AI評分，供之後計算累計報酬。"""
+    """加入追蹤：記錄加入當下的日期／價格／財務評分，供之後計算累計報酬。"""
     watchlist = load_watchlist()
     code = str(stock.get('code'))
     if is_in_watchlist(code, watchlist):
@@ -1058,6 +1058,21 @@ def calc_financial_health_score(metrics: dict) -> dict:
         "items": items, "category_scores": category_scores,
         "n_metrics": len(items),
     }
+
+
+def fetch_financial_health_score(code: str) -> float:
+    """抓取個股財務比率並算出財務體質綜合評分（0~100）。
+    取代原本清單／候選表格用的技術面 AI 評分：候選清單、快速篩選、
+    統計卡片、加入追蹤紀錄現在都改用這個分數。抓不到資料或指標不足時
+    回傳 NaN，呼叫端一律要能處理 NaN（fail-open，不讓抓取失敗中斷掃描）。
+    """
+    try:
+        ratios = fetch_financial_ratios(code)
+        metrics = ratios.get("metrics", {}) if ratios else {}
+        health = calc_financial_health_score(metrics)
+        return health.get("overall", np.nan) if health else np.nan
+    except Exception:
+        return np.nan
 
 
 # ============================================================
@@ -2213,10 +2228,11 @@ def calc_stock_score(row: dict) -> tuple[int, list[str]]:
 # ============================================================
 # [新功能] 手動查詢個股：不必等策略掃描，直接輸入代碼就能看完整工作台
 # ============================================================
-# 刻意重用跟策略掃描完全相同的技術指標／AI評分計算管線
-# （_build_common_signal_fields + fetch_deep_info + calc_stock_score），
-# 確保手動查詢跟策略掃描出來的個股，在 K線／AI分析／多空指標…等分頁
-# 呈現的資訊是同一套邏輯、不會兜不起來，也不用另外維護一套簡化版計算。
+# 刻意重用跟策略掃描完全相同的技術指標計算管線
+# （_build_common_signal_fields + fetch_deep_info + calc_stock_score 取飆股雷達，
+# fetch_financial_health_score 取財務評分），確保手動查詢跟策略掃描出來的個股，
+# 在 K線／AI分析／多空指標…等分頁呈現的資訊是同一套邏輯、不會兜不起來，
+# 也不用另外維護一套簡化版計算。
 
 def build_manual_stock_row(code: str) -> dict:
     """依股票代碼組出跟策略掃描結果同格式的一筆資料，供個股工作台直接使用。
@@ -2263,10 +2279,10 @@ def build_manual_stock_row(code: str) -> dict:
     row_data["熱門股"] = base["code"] in hot_codes
 
     row_data["策略"] = "手動查詢"
-    row_data["訊號說明"] = "使用者手動輸入代碼查詢，非策略掃描結果，僅顯示個股資訊與 AI 評分供參考。"
+    row_data["訊號說明"] = "使用者手動輸入代碼查詢，非策略掃描結果，僅顯示個股資訊與財務評分供參考。"
 
-    score, radar = calc_stock_score(row_data)
-    row_data["AI評分"] = score
+    _, radar = calc_stock_score(row_data)
+    row_data["AI評分"] = fetch_financial_health_score(base["code"])
     row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
     return row_data
 
@@ -3107,7 +3123,7 @@ st.markdown(f"""
 <div class="app-hero">
   <div>
     <div class="app-title">台股智慧選股</div>
-    <div class="app-sub">依均線多頭排列、乖離率與成交量快速篩選，再整合 AI 評分、K 線、營收、本益比與個股新聞。</div>
+    <div class="app-sub">依均線多頭排列、乖離率與成交量快速篩選，再整合財務評分、K 線、營收、本益比與個股新聞。</div>
   </div>
   <div class="app-meta">目前訊號 {_signal_count} 檔<br>資料時間 {_now_str}</div>
 </div>
@@ -3233,18 +3249,26 @@ with tab_scan:
         initial_hits = active_cfg["func"](history_map, stock_map, active_param, user_vol)
 
         if initial_hits:
-            _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與 AI 評分…")
+            _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與財務體質評分…")
             load_official_pe_map(False)
             hot_codes = get_hot_stock_tickers()  # [新功能] 熱門股判定：整批只抓一次排行榜，逐檔比對代碼
+
+            def _fetch_deep_and_health(ticker: str, code: str):
+                """[新功能] 候選股清單分數改用財務體質綜合分：跟本益比／營收
+                一起在同一個 worker 裡依序抓取，不額外開一個執行緒池，
+                避免同時對兩個資料來源發出過多平行請求（fail-open：任一步
+                失敗都不影響另一步的結果）。"""
+                return fetch_deep_info(ticker), fetch_financial_health_score(code)
+
             final_list = []
             with ThreadPoolExecutor(max_workers=6) as ex:
-                f_deep = {ex.submit(fetch_deep_info, r["ticker"]): r for r in initial_hits}
+                f_deep = {ex.submit(_fetch_deep_and_health, r["ticker"], r["code"]): r for r in initial_hits}
                 for j, f in enumerate(as_completed(f_deep), 1):
                     _update_progress(
                         0.80 + 0.19 * j / len(initial_hits),
                         f"步驟 3/3：補齊個股資料中… ({j}/{len(initial_hits)})"
                     )
-                    deep_res = f.result()
+                    deep_res, health_score = f.result()
                     base = f_deep[f]
                     row_data = {
                         "ticker": base["ticker"], "code": base["code"], "name": base["name"],
@@ -3261,12 +3285,12 @@ with tab_scan:
                         "熱門股": base["code"] in hot_codes,
                         "本益比": deep_res["pe"], "營收月增": deep_res["mom"], "營收年增": deep_res["yoy"],
                     }
-                    score, radar = calc_stock_score(row_data)
-                    row_data["AI評分"] = score
+                    _, radar = calc_stock_score(row_data)
+                    row_data["AI評分"] = health_score
                     row_data["飆股雷達"] = "、".join(radar) if radar else "觀察"
                     final_list.append(row_data)
             _update_progress(1.0, "掃描完成，正在整理結果…")
-            st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False).reset_index(drop=True)
+            st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False, na_position="last").reset_index(drop=True)
             status.success(f"掃描完成，共找到 {len(st.session_state.scan_results)} 檔候選股票。")
         else:
             st.session_state.scan_results = pd.DataFrame()
@@ -3282,8 +3306,8 @@ with tab_scan:
         st.markdown(f"""
         <div class="stat-grid" style="margin-top:18px;">
           <div class="tv-card"><div class="tv-label">最近掃描結果</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">符合條件股票</div></div>
-          <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
-          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
           <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">候選與分析工作台</div><div class="tv-caption">切換下一個頁籤選股並看圖</div></div>
         </div>
         """, unsafe_allow_html=True)
@@ -3368,8 +3392,8 @@ with tab_workspace:
         st.markdown(f"""
         <div class="stat-grid">
           <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次候選股票</div></div>
-          <div class="tv-card"><div class="tv-label">平均 AI 評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
-          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">AI 評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
           <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">K線／AI分析／新聞同步顯示</div></div>
         </div>
         """, unsafe_allow_html=True)
@@ -3436,11 +3460,11 @@ with tab_workspace:
                             st.rerun()
 
                 quick_filter = st.selectbox(
-                    "快速篩選", ["全部候選", "AI 評分 80 分以上", "營收年增為正", "量比 1.5 倍以上", "突破 20 日高"],
+                    "快速篩選", ["全部候選", "財務評分 80 分以上", "營收年增為正", "量比 1.5 倍以上", "突破 20 日高"],
                     key="candidate_filter"
                 )
                 view_df = df.copy()
-                if quick_filter == "AI 評分 80 分以上":
+                if quick_filter == "財務評分 80 分以上":
                     view_df = view_df[view_df['AI評分'] >= 80]
                 elif quick_filter == "營收年增為正":
                     view_df = view_df[pd.to_numeric(view_df['營收年增'], errors='coerce') > 0]
@@ -3482,7 +3506,7 @@ with tab_workspace:
                             # 加上熱門股🔥前綴後原本寬度會被截斷；其餘欄位微調挪出空間。
                             "代碼": st.column_config.TextColumn("代碼", width=56),
                             "名稱": st.column_config.TextColumn("名稱", width=118),
-                            "AI評分": st.column_config.ProgressColumn("AI評分", width=80, format="%d", min_value=0, max_value=100),
+                            "AI評分": st.column_config.ProgressColumn("財務評分", width=80, format="%d", min_value=0, max_value=100),
                             "收盤": st.column_config.NumberColumn("價格", width=60, format="%.2f"),
                             "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=58, format="%.1f%%"),
                             "量比20日": st.column_config.NumberColumn("量比", width=54, format="%.2fx"),
@@ -3577,7 +3601,7 @@ with tab_workspace:
               <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{hot_tag_html}</div>
               <div><span class="quote-price">{fmt_num(price, '{:.2f}')}</span><span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span></div>
               <div class="quote-metrics">
-                <div><div class="metric-k">AI 評分</div><div class="metric-v">{score_txt}</div></div>
+                <div><div class="metric-k">財務評分</div><div class="metric-v">{score_txt}</div></div>
                 <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
                 <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
               </div>
