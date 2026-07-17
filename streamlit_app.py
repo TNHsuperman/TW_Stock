@@ -938,214 +938,6 @@ def fetch_margin_trading(code: str, market_suffix: str) -> list:
 
 
 # ============================================================
-# [新功能] 月營收 YoY/MoM
-# ============================================================
-# 分成兩層資料，跟本檔案既有的「本益比」（全市場批次）與「三大法人／資券」
-# （單檔逐日）兩種模式對應：
-#   1) load_monthly_revenue_map()：TWSE/TPEx OpenAPI 一次性批次資料，
-#      只有「最新一期」全市場月營收，用來快速查表（比照 load_official_pe_map
-#      的日快取邏輯），之後掃描/策略要用月營收條件篩選時不必逐股即時請求。
-#   2) fetch_monthly_revenue_history()：Yahoo 股市個股「營收」頁面，
-#      單檔近期逐月歷史（含月增率／年增率），用於個股工作台畫趨勢圖
-#      （比照 fetch_institutional_trading／fetch_margin_trading 的寫法）。
-# 兩者互為備援：批次資料抓不到歷史，只顯示最新一期摘要卡片；
-# Yahoo 單檔抓不到時，摘要卡片改用批次資料的最新一期，符合 fail-open 原則。
-
-MONTHLY_REVENUE_CACHE_FILE = os.path.join(
-    os.path.dirname(__file__) if '__file__' in globals() else '.',
-    "monthly_revenue_cache.json"
-)
-MONTHLY_REVENUE_CACHE_LOCK = threading.Lock()
-MONTHLY_REVENUE_CACHE_VERSION = "20260717_twse_tpex_v1"
-
-
-def _revenue_cache_today_key() -> str:
-    return get_tw_now().strftime("%Y-%m-%d")
-
-
-def _load_revenue_disk_cache() -> dict:
-    try:
-        if os.path.exists(MONTHLY_REVENUE_CACHE_FILE):
-            with open(MONTHLY_REVENUE_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data.get("version") == MONTHLY_REVENUE_CACHE_VERSION:
-                return data
-    except Exception:
-        pass
-    return {"version": MONTHLY_REVENUE_CACHE_VERSION, "date": "", "items": {}}
-
-
-def _save_revenue_disk_cache(items: dict) -> None:
-    try:
-        payload = {
-            "version": MONTHLY_REVENUE_CACHE_VERSION,
-            "date": _revenue_cache_today_key(),
-            "updated_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "items": items,
-        }
-        tmp = MONTHLY_REVENUE_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, MONTHLY_REVENUE_CACHE_FILE)
-    except Exception:
-        pass
-
-
-def _parse_monthly_revenue_record(rec: dict) -> dict:
-    """把 TWSE/TPEx OpenAPI 月營收單筆紀錄轉成統一格式。
-    官方欄位名稱在上市／上櫃兩種來源、不同時期可能用「_」或「-」分隔，
-    這裡多列幾種常見寫法兼容，抓不到就回傳空 dict（呼叫端會自動略過）。
-    """
-    if not isinstance(rec, dict):
-        return {}
-
-    code = ""
-    for k, v in rec.items():
-        key = str(k)
-        if "公司代號" in key or key.lower() in ["code", "stockno", "stock_id"]:
-            s = re.sub(r"\D", "", str(v))
-            if len(s) == 4:
-                code = s
-                break
-    if not code:
-        return {}
-
-    def _get(*keys):
-        for k in keys:
-            if k in rec and rec[k] not in (None, ""):
-                return rec[k]
-        return None
-
-    revenue = _to_float_or_nan(_get("營業收入-當月營收", "營業收入_當月營收", "當月營收"))
-    mom = _to_float_or_nan(_get("營業收入-上月比較增減", "營業收入_上月比較增減", "上月比較增減"))
-    yoy = _to_float_or_nan(_get("營業收入-去年同月增減", "營業收入_去年同月增減", "去年同月增減"))
-    ytd_yoy = _to_float_or_nan(_get("累計營業收入-前期比較增減", "累計營業收入_前期比較增減", "前期比較增減"))
-    period = str(_get("資料年月", "data_ym") or "").strip()
-
-    if pd.isna(revenue):
-        return {}
-
-    return {
-        "code": code,
-        "資料年月": period,
-        "當月營收": revenue,
-        "月增率(%)": mom,
-        "年增率(%)": yoy,
-        "累計營收年增率(%)": ytd_yoy,
-    }
-
-
-@st.cache_data(ttl=43200, show_spinner=False)
-def load_monthly_revenue_map(force_refresh: bool = False) -> dict:
-    """一次載入上市 + 上櫃全市場「最新一期」月營收（當月營收／月增率／年增率／
-    累計營收年增率）。同一天只打一次官方 API，比照本益比 load_official_pe_map()
-    的日快取邏輯：掃描或個股工作台都直接查表，不必逐股即時請求。
-
-    回傳 {code: {資料年月, 當月營收, 月增率(%), 年增率(%), 累計營收年增率(%)}}；
-    當日 API 都失敗時，改用前一次成功的舊快取，避免整欄變空值（fail-open）。
-    """
-    if not force_refresh:
-        with MONTHLY_REVENUE_CACHE_LOCK:
-            cache = _load_revenue_disk_cache()
-        if cache.get("date") == _revenue_cache_today_key() and isinstance(cache.get("items"), dict) and cache["items"]:
-            return cache["items"]
-
-    items = {}
-
-    # 上市：TWSE OpenAPI 月營收（全市場批次，最新一期）。
-    data = _fetch_json("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=10)
-    if isinstance(data, list):
-        for rec in data:
-            parsed = _parse_monthly_revenue_record(rec)
-            if parsed.get("code"):
-                items[parsed["code"]] = parsed
-
-    # 上櫃：TPEx OpenAPI 對應端點；不同部署時期路徑可能調整，多試幾個。
-    for url in [
-        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
-        "https://www.tpex.org.tw/openapi/v1/opendata/t187ap05_O",
-    ]:
-        data = _fetch_json(url, timeout=10)
-        if isinstance(data, list) and data:
-            for rec in data:
-                parsed = _parse_monthly_revenue_record(rec)
-                if parsed.get("code"):
-                    items[parsed["code"]] = parsed
-            break
-
-    if not items:
-        with MONTHLY_REVENUE_CACHE_LOCK:
-            old_cache = _load_revenue_disk_cache()
-        old_items = old_cache.get("items", {}) if isinstance(old_cache, dict) else {}
-        if isinstance(old_items, dict) and old_items:
-            return old_items
-        return {}
-
-    with MONTHLY_REVENUE_CACHE_LOCK:
-        _save_revenue_disk_cache(items)
-    return items
-
-
-def _extract_monthly_revenue_history_from_html(html: str) -> list:
-    """從 Yahoo 台股個股「營收」頁面解析近期逐月營收（單月合併，最新一筆在最前面）。
-    頁面格式如：2025/12 838,585 36.90% 731,678 14.61% 9,038,390 7,099,106 27.32%
-    （年度/月份／當月營收／月增率／去年同月營收／年增率／當月累計營收／去年累計營收／累計營收年增率）。
-    僅作輔助參考，非官方逐月對帳資料，解析不到時回傳空 list（fail-open）。
-    """
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    pattern = (
-        r"(20\d{2}/\d{2})\s+([\d,]+)\s+(-?[\d.]+)%\s+([\d,]+)\s+(-?[\d.]+)%\s+"
-        r"([\d,]+)\s+([\d,]+)\s+(-?[\d.]+)%"
-    )
-    rows = []
-    seen = set()
-    for m in re.finditer(pattern, text):
-        period, rev, mom, prev_year_rev, yoy, ytd_rev, ytd_prev, ytd_yoy = m.groups()
-        if period in seen:
-            continue
-        rev_val = _to_float_or_nan(rev)
-        if pd.isna(rev_val):
-            continue
-        seen.add(period)
-        rows.append({
-            "年度/月份": period,
-            "當月營收": rev_val,
-            "月增率(%)": _to_float_or_nan(mom),
-            "去年同月營收": _to_float_or_nan(prev_year_rev),
-            "年增率(%)": _to_float_or_nan(yoy),
-            "當月累計營收": _to_float_or_nan(ytd_rev),
-            "去年累計營收": _to_float_or_nan(ytd_prev),
-            "累計營收年增率(%)": _to_float_or_nan(ytd_yoy),
-        })
-        if len(rows) >= 24:  # 近24個月，足夠看趨勢，不抓過量雜訊
-            break
-    return rows
-
-
-@st.cache_data(ttl=21600, show_spinner=False)  # 每月10日前後才會有新一期，快取拉長到6小時
-def fetch_monthly_revenue_history(code: str, market_suffix: str) -> list:
-    """個股近期逐月營收（含月增率／年增率），最新一筆在最前面。
-    來源：Yahoo 股市個股「營收」頁面。抓不到時回傳空 list，UI 端改用
-    load_monthly_revenue_map() 的最新一期資料頂上（fail-open）。
-    """
-    ticker = f"{code}.{market_suffix}"
-    try:
-        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/revenue",
-                         headers=get_headers(), timeout=8, verify=False)
-        if r.status_code == 200 and r.text:
-            rows = _extract_monthly_revenue_history_from_html(r.text)
-            if rows:
-                return rows
-    except Exception:
-        pass
-    return []
-
-
-# ============================================================
 # [新功能] 個股財務體質評分
 # ============================================================
 # TWSE/TPEx 官方財報開放資料（資產負債表／損益表）依產業別分成好幾種格式
@@ -2754,6 +2546,36 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
+    """還原股價（除權息還原）K線資料，來源 yfinance auto_adjust=True。
+
+    get_kline_data() 抓的是 TWSE/TPEx 官方原始成交價，不會因除權息往回調整；
+    除息當天的價格缺口在原始價格序列上看起來像是「一根跳空長黑」，容易讓均線、
+    型態辨識短暫失真——這也是策略掃描（download_batch_history）改用還原股價
+    判斷訊號的原因。這裡提供同一套還原邏輯給 K 線圖切換使用，方便對照「掃描邏輯
+    看到的樣子」跟「原始成交價看到的樣子」，兩者都能自己驗證。
+    抓不到資料時回傳空 DataFrame，呼叫端會自動退回原始股價（fail-open）。
+    """
+    try:
+        raw = yf.download(ticker, period="1y", interval="1d", auto_adjust=True, progress=False)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    try:
+        # yfinance 新版有時回傳 MultiIndex 欄位（即使只查一檔），統一攤平。
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
+        df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
+                                 "Low": "low", "Close": "close", "Volume": "volume"})
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        df["volume"] = (df["volume"] / 1000).astype(int)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 
 def warm_kline_data_async(stocks):
     """背景預載前後股票 K 線資料，減少點 PREV / NEXT 時等待。"""
@@ -2774,14 +2596,24 @@ def warm_kline_data_async(stocks):
     except Exception:
         pass
 
-def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
+def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted=False):
     """畫出有實際切換功能的金融圖表。
     chart_mode: K線圖 / 走勢圖 / 技術指標
     chart_period: 日 / 週 / 月
+    adjusted: True 時改用除權息還原股價（跟策略掃描同一套邏輯），
+              抓不到還原資料時自動退回原始成交價（fail-open）。
     """
     code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
-    df     = get_kline_data(code, market)
+    used_adjusted = False
+    if adjusted:
+        df = get_kline_data_adjusted(ticker)
+        if not df.empty and len(df) >= 30:
+            used_adjusted = True
+        else:
+            df = get_kline_data(code, market)
+    else:
+        df = get_kline_data(code, market)
     if df.empty or len(df) < 30:
         # [修正] 原本沒有 try/except，Yahoo 連線異常時會直接讓整頁噴例外，
         # 改成失敗時安靜回傳 None，由呼叫端顯示「無法載入 K 線資料」提示。
@@ -2982,6 +2814,16 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日'):
             showgrid=False, zeroline=False, showticklabels=False, fixedrange=True,
         ),
     )
+
+    if used_adjusted:
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.012, y=0.895,
+            text='還原股價（除權息還原）', showarrow=False, align='left',
+            font=dict(size=11, color='#facc15'),
+            bgcolor='rgba(7,13,20,.55)', bordercolor='rgba(250,204,21,.45)', borderwidth=1,
+            borderpad=4,
+        )
+
     return fig
 
 
@@ -3820,7 +3662,7 @@ with tab_workspace:
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
             view_mode = st.segmented_control(
                 "檢視模式",
-                ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "🧾 月營收", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
+                ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
                 default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
@@ -3829,7 +3671,15 @@ with tab_workspace:
 
             # ---------- K 線圖 ----------
             if view_mode == "📈 K線圖":
-                k_fig = draw_k_line(current_stock['ticker'], current_stock['name'], chart_mode='K線圖', chart_period='日')
+                toggle_col, _ = st.columns([1.6, 4])
+                with toggle_col:
+                    show_adjusted = st.toggle(
+                        "還原股價（除權息）", key="kline_show_adjusted",
+                        help="開啟後改用還原除權息的股價繪製K線與均線（跟策略掃描使用的價格序列一致），"
+                             "可以避免除息當天的價格缺口讓均線／型態短暫失真；關閉則顯示交易所公告的原始成交價。"
+                             "抓不到還原資料時會自動退回原始股價。",
+                    )
+                k_fig = draw_k_line(current_stock['ticker'], current_stock['name'], chart_mode='K線圖', chart_period='日', adjusted=show_adjusted)
                 if k_fig:
                     render_kline_chart_with_axis_price(k_fig, height=560)
                     try:
@@ -4084,94 +3934,6 @@ with tab_workspace:
                     st.caption("評分是用線性映射把每項指標換算成 0~100 分再平均，區間門檻是參考一般產業常見水準訂出的粗略估計，不同產業（例如重資產的航運、金融）合理區間本來就不同，僅適合同產業內快速比較參考，不是嚴謹的估值模型，也不是投資建議。")
                 else:
                     st.info("目前無法取得財務比率資料，可能是這檔股票剛上市、屬於金融／保險等特殊財報格式產業，或資料來源暫時無回應，請稍後再試。")
-
-            # ---------- 月營收 YoY/MoM ----------
-            elif view_mode == "🧾 月營收":
-                market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 月營收</div><div class="section-help">資料來源：Yahoo 股市個股「營收」頁面（近期逐月），並比對 TWSE/TPEx 官方最新一期月營收；僅供參考，非官方對帳資料，金融保險等少數產業依法免申報月營收。</div></div></div>', unsafe_allow_html=True)
-
-                rev_map = load_monthly_revenue_map()
-                official = rev_map.get(current_stock['code'], {}) if isinstance(rev_map, dict) else {}
-                rev_rows = fetch_monthly_revenue_history(current_stock['code'], market_suffix)
-
-                if rev_rows or official:
-                    latest = rev_rows[0] if rev_rows else {
-                        "年度/月份": official.get("資料年月", ""),
-                        "當月營收": official.get("當月營收", np.nan),
-                        "月增率(%)": official.get("月增率(%)", np.nan),
-                        "年增率(%)": official.get("年增率(%)", np.nan),
-                        "累計營收年增率(%)": official.get("累計營收年增率(%)", np.nan),
-                    }
-                    streak_yoy = _institutional_streak(rev_rows, "年增率(%)") if rev_rows else {"days": 0, "total": 0.0, "sign": 0}
-
-                    def _revenue_streak_txt(s):
-                        if s["days"] <= 1 or s["sign"] == 0:
-                            return "非連續正／負成長"
-                        word = "正成長" if s["sign"] > 0 else "負成長"
-                        return f"連{s['days']}個月{word}"
-
-                    mom_val = latest.get("月增率(%)", np.nan)
-                    yoy_val = latest.get("年增率(%)", np.nan)
-                    ytd_val = latest.get("累計營收年增率(%)", np.nan)
-                    mom_color = "var(--green)" if pd.notna(mom_val) and mom_val >= 0 else "var(--red)"
-                    yoy_color = "var(--green)" if pd.notna(yoy_val) and yoy_val >= 0 else "var(--red)"
-                    ytd_color = "var(--green)" if pd.notna(ytd_val) and ytd_val >= 0 else "var(--red)"
-
-                    st.markdown(f"""
-                    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:6px;">
-                      <div class="tv-card"><div class="tv-label">當月營收（千元）</div><div class="tv-value">{fmt_num(latest.get('當月營收'), '{:,.0f}')}</div><div class="tv-caption">{latest.get('年度/月份', '')}</div></div>
-                      <div class="tv-card"><div class="tv-label">月增率 MoM</div><div class="tv-value" style="color:{mom_color};">{fmt_num(mom_val, '{:+.2f}%')}</div><div class="tv-caption">較上月</div></div>
-                      <div class="tv-card"><div class="tv-label">年增率 YoY</div><div class="tv-value" style="color:{yoy_color};">{fmt_num(yoy_val, '{:+.2f}%')}</div><div class="tv-caption">{_revenue_streak_txt(streak_yoy)}</div></div>
-                      <div class="tv-card"><div class="tv-label">累計營收年增率</div><div class="tv-value" style="color:{ytd_color};">{fmt_num(ytd_val, '{:+.2f}%')}</div><div class="tv-caption">今年以來累計 vs 去年同期</div></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    if rev_rows:
-                        chart_df = pd.DataFrame(rev_rows).iloc[::-1]  # 舊到新排序，繪圖用
-                        bar_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in chart_df['年增率(%)'].fillna(0)]
-                        fig = go.Figure()
-                        fig.add_trace(go.Bar(
-                            x=chart_df['年度/月份'], y=chart_df['當月營收'], name='當月營收',
-                            marker_color=bar_colors,
-                            hovertemplate='%{x}<br>當月營收 %{y:,.0f} 千元<extra></extra>',
-                        ))
-                        fig.add_trace(go.Scatter(
-                            x=chart_df['年度/月份'], y=chart_df['年增率(%)'], name='年增率(%)',
-                            mode='lines+markers', yaxis='y2',
-                            line=dict(width=2.2, color='#f2a900'),
-                            hovertemplate='%{x}<br>年增率 %{y:+.2f}%<extra></extra>',
-                        ))
-                        fig.update_layout(
-                            height=340, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
-                            margin=dict(l=20, r=40, t=10, b=20),
-                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                            xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis=dict(title='當月營收（千元）', gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis2=dict(title='年增率（%）', overlaying='y', side='right', showgrid=False),
-                            hovermode='x unified',
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        rev_df = pd.DataFrame(rev_rows)
-                        st.dataframe(
-                            rev_df, hide_index=True, use_container_width=True,
-                            column_config={
-                                "年度/月份": st.column_config.TextColumn("年度/月份", width=80),
-                                "當月營收": st.column_config.NumberColumn("當月營收(千元)", width=110, format="%,.0f"),
-                                "月增率(%)": st.column_config.NumberColumn("月增率", width=80, format="%+.2f%%"),
-                                "去年同月營收": st.column_config.NumberColumn("去年同月營收(千元)", width=130, format="%,.0f"),
-                                "年增率(%)": st.column_config.NumberColumn("年增率", width=80, format="%+.2f%%"),
-                                "當月累計營收": st.column_config.NumberColumn("當月累計營收(千元)", width=130, format="%,.0f"),
-                                "去年累計營收": st.column_config.NumberColumn("去年累計營收(千元)", width=130, format="%,.0f"),
-                                "累計營收年增率(%)": st.column_config.NumberColumn("累計營收年增率", width=110, format="%+.2f%%"),
-                            }
-                        )
-                        st.caption("月增率／年增率為正代表營收較上月／去年同月成長；「連N個月正/負成長」是依年增率序列往回累加推算。月營收每月10日前後才會公布上一個月數字，月初資料屬上上月。")
-                    else:
-                        st.caption("目前只取得官方最新一期月營收，暫時無法取得近期逐月歷史數字（資料來源無回應），僅顯示上方摘要卡片，稍後可再試一次。")
-                else:
-                    st.info("目前無法取得這檔股票的月營收資料，可能是金融保險股（依法免申報月營收）、剛上市尚無比較基期，或資料來源暫時無回應，請稍後再試。")
 
             # ---------- 股利政策／殖利率／除權息 ----------
             elif view_mode == "💵 股利政策":
@@ -4551,7 +4313,8 @@ with tab_watchlist:
             if st.session_state.watchlist_chart_target:
                 wl_tk, wl_name = st.session_state.watchlist_chart_target
                 st.markdown(f'<div class="section-head" style="margin-top:20px;"><div><div class="section-title" style="font-size:16px;">{wl_name} K線圖</div></div></div>', unsafe_allow_html=True)
-                wl_fig = draw_k_line(wl_tk, wl_name, chart_mode='K線圖', chart_period='日')
+                wl_show_adjusted = st.toggle("還原股價（除權息）", key="wl_kline_show_adjusted")
+                wl_fig = draw_k_line(wl_tk, wl_name, chart_mode='K線圖', chart_period='日', adjusted=wl_show_adjusted)
                 if wl_fig:
                     render_kline_chart_with_axis_price(wl_fig, height=440)
                 else:
