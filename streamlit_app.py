@@ -1937,6 +1937,113 @@ def build_industry_peer_stats(code: str, industry: str) -> dict:
     }
 
 
+# ============================================================
+# [新功能] 供應鏈上下游（產業鏈地圖）
+# ============================================================
+# 台灣目前沒有免費、結構化的官方「供應鏈關係」API——證交所/櫃買中心合建的
+# 「產業價值鏈資訊平台」(ic.tpex.org.tw) 資料最完整最權威，但該平台有防爬蟲
+# 機制擋掉一般 requests 連線，且頁面本身是前端動態渲染，不是穩定可爬的資料源。
+#
+# 這裡採用「內建常見產業鏈對照表＋官方平台連結」雙軌做法：
+#   1) INDUSTRY_CHAIN_DB：手動整理的熱門產業鏈上中下游對照表，只涵蓋幾條
+#      最常被查詢的產業鏈（半導體、AI伺服器、PCB、面板、被動元件、記憶體、
+#      紡織），每條鏈只列該階段幾檔具代表性、市值/知名度較高的股票，不是
+#      窮舉清單。這份資料是整理自公開產業知識，「不是」官方即時資料，可能
+#      有過時、疏漏，或分類見仁見智的地方，僅供快速參考起點。
+#   2) 查不到、或想看完整/最新資料時，UI 會提供「產業價值鏈資訊平台」官方
+#      連結，使用者自己輸入代碼查詢，資料權威性以官方平台為準。
+#
+# 如果之後想擴充涵蓋的產業鏈，直接在 INDUSTRY_CHAIN_DB 裡新增/修改即可，
+# 不需要改動查詢邏輯。
+
+INDUSTRY_CHAIN_DB = {
+    "半導體（晶圓代工／IC設計／封測）": {
+        "upstream": [("3105", "穩懋"), ("8069", "元太"), ("6488", "環球晶"), ("2455", "全新")],
+        "midstream": [("2330", "台積電"), ("2303", "聯電"), ("5347", "世界先進"), ("3711", "日月光投控")],
+        "downstream": [("2449", "京元電子"), ("6239", "力成"), ("8150", "南茂"), ("3374", "精材")],
+    },
+    "IC設計": {
+        "upstream": [("3529", "力旺"), ("6274", "台燿")],
+        "midstream": [("2454", "聯發科"), ("3034", "聯詠"), ("2379", "瑞昱"), ("3443", "創意"), ("3661", "世芯-KY")],
+        "downstream": [("2449", "京元電子"), ("6239", "力成")],
+    },
+    "AI伺服器／雲端運算": {
+        "upstream": [("3443", "創意"), ("3661", "世芯-KY"), ("2330", "台積電")],
+        "midstream": [("2382", "廣達"), ("2317", "鴻海"), ("6669", "緯穎"), ("2356", "英業達"), ("3231", "緯創")],
+        "downstream": [("3017", "奇鋐"), ("3324", "雙鴻"), ("2308", "台達電"), ("6412", "群電")],
+    },
+    "PCB／載板": {
+        "upstream": [("6274", "台燿"), ("8046", "南電"), ("1305", "華夏")],
+        "midstream": [("3037", "欣興")],
+        "downstream": [],
+    },
+    "面板／顯示器": {
+        "upstream": [("3034", "聯詠"), ("3661", "世芯-KY")],
+        "midstream": [("2409", "友達"), ("3481", "群創")],
+        "downstream": [("2371", "大同"), ("2492", "華新科")],
+    },
+    "被動元件": {
+        "upstream": [("6274", "台燿")],
+        "midstream": [("2327", "國巨"), ("2492", "華新科"), ("2456", "奇力新")],
+        "downstream": [("2330", "台積電"), ("2317", "鴻海")],
+    },
+    "記憶體": {
+        "upstream": [("2408", "南亞科"), ("2337", "旺宏"), ("2344", "華邦電")],
+        "midstream": [("8299", "群聯"), ("2451", "創見")],
+        "downstream": [("6230", "尼盛"), ("5289", "宜鼎")],
+    },
+    "紡織成衣": {
+        "upstream": [("1402", "遠東新"), ("1303", "南亞")],
+        "midstream": [("1476", "儒鴻"), ("1477", "聚陽"), ("1451", "年興")],
+        "downstream": [],
+    },
+}
+
+# 防呆過濾：如果之後手動編輯 INDUSTRY_CHAIN_DB 打錯代碼／漏填名稱，這裡統一擋掉，
+# 避免顯示格式不完整的垃圾資料。
+for _chain_name, _stages in INDUSTRY_CHAIN_DB.items():
+    for _stage_name, _peers in _stages.items():
+        _stages[_stage_name] = [(c, n) for c, n in _peers if n and re.fullmatch(r"\d{4,6}", c)]
+
+
+def find_industry_chain_matches(code: str) -> list:
+    """查這檔股票出現在 INDUSTRY_CHAIN_DB 裡的哪些產業鏈、哪個階段，
+    並整理出「相對這檔股票」的上游／同階段／下游公司名單。
+
+    一家公司可能同時出現在多條產業鏈裡（例如台積電同時是半導體中游、
+    也是 AI 伺服器產業鏈的上游晶片供應方），所以回傳 list，可能有多筆。
+    完全查表操作，沒有網路請求，速度可忽略不計。
+    """
+    matches = []
+    for chain_name, stages in INDUSTRY_CHAIN_DB.items():
+        stage_order = ["upstream", "midstream", "downstream"]
+        stage_labels = {"upstream": "上游", "midstream": "中游", "downstream": "下游"}
+        found_stage = None
+        for stage in stage_order:
+            if any(c == code for c, _ in stages.get(stage, [])):
+                found_stage = stage
+                break
+        if not found_stage:
+            continue
+
+        idx = stage_order.index(found_stage)
+        result = {"chain": chain_name, "stage": stage_labels[found_stage], "groups": []}
+        for stage in stage_order:
+            peers = [(c, n) for c, n in stages.get(stage, []) if c != code]
+            if not peers:
+                continue
+            stage_idx = stage_order.index(stage)
+            if stage_idx < idx:
+                rel_label = f"⬅ 上游｜{stage_labels[stage]}"
+            elif stage_idx > idx:
+                rel_label = f"➡ 下游｜{stage_labels[stage]}"
+            else:
+                rel_label = f"⬌ 同階段｜{stage_labels[stage]}"
+            result["groups"].append({"label": rel_label, "peers": peers})
+        matches.append(result)
+    return matches
+
+
 def _extract_twstock_yahoo_pe_from_html(html: str) -> float:
     """從 Yahoo 台股頁面解析本益比。只作為官方資料缺值時的單檔備援。"""
     if not html:
@@ -4018,6 +4125,30 @@ with tab_workspace:
                         st.caption(f"黃色菱形＝{current_stock['name']}目前本益比，箱型圖呈現「{peer_stats['industry']}」產業內有本益比資料的 {peer_stats['pe_sample_count']} 檔股票分布。本益比較低不代表股票比較好，也可能是市場認為成長性較差，請搭配其他指標一起看。")
                     else:
                         st.caption("這個產業分類的股票數量太少，或本益比資料不足（例如虧損股本益比為負，官方資料不會列出），暫時無法比較同業。")
+
+                    # [新功能] 供應鏈上下游：內建常見熱門產業鏈對照表（非官方即時資料，
+                    # 整理自公開產業知識，僅涵蓋幾條常見產業鏈的代表性股票），
+                    # 搭配官方「產業價值鏈資訊平台」連結作為完整/權威資料的保底。
+                    chain_head_col, chain_link_col = st.columns([4, 1.3])
+                    with chain_head_col:
+                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">供應鏈上下游</div><div class="section-help">內建常見熱門產業鏈對照表，整理自公開產業知識、非官方即時資料，只列代表性股票、不是完整清單，可能有過時或疏漏；一家公司也可能同時橫跨多條產業鏈。完整/最新資料請點右側官方平台連結，輸入代碼查詢。</div></div></div>', unsafe_allow_html=True)
+                    with chain_link_col:
+                        st.link_button(
+                            "🔗 產業價值鏈資訊平台",
+                            "https://ic.tpex.org.tw/",
+                            use_container_width=True,
+                        )
+                    chain_matches = find_industry_chain_matches(current_stock['code'])
+                    if chain_matches:
+                        for m in chain_matches:
+                            st.markdown(f"**{m['chain']}** － {current_stock['name']} 位於本表的**{m['stage']}**")
+                            group_html = ""
+                            for g in m['groups']:
+                                peer_txt = "、".join(f"{n}（{c}）" for c, n in g['peers'])
+                                group_html += f'<div class="report-row"><span>{g["label"]}</span><span style="text-align:right;max-width:70%;">{peer_txt}</span></div>'
+                            st.markdown(f'<div class="side-card" style="margin-bottom:14px;">{group_html}</div>', unsafe_allow_html=True)
+                    else:
+                        st.caption(f"目前內建的產業鏈對照表還沒有收錄「{current_stock['name']}」，可以點上方連結到官方「產業價值鏈資訊平台」直接查詢完整上下游資料。")
 
             # ---------- 財務體質評分 ----------
             elif view_mode == "🩺 財務體質":
