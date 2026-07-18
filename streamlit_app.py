@@ -1878,6 +1878,65 @@ def load_official_pe_map(force_refresh: bool = False) -> dict:
     return {str(k): _clean_pe_value(v) for k, v in items.items()}
 
 
+# ============================================================
+# [新功能] 產業別同儕比較
+# ============================================================
+# 完全用「已經全市場批次快取」的資料算，不逐股即時打 API：
+#   - 股票清單／產業別：get_stock_market_list()（每日快取）
+#   - 本益比：load_official_pe_map()（每日快取，跟本益比河流圖同一份資料）
+# 樣本數太少（例如冷門產業只有 1、2 檔）時直接回傳空 dict，UI 端會顯示「資料不足」，
+# 不勉強比較。
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_industry_peer_stats(code: str, industry: str) -> dict:
+    """算出這檔股票在「同產業」裡的本益比相對位置。
+
+    回傳：{industry, peer_count, pe_sample_count, my_pe, median_pe, min_pe, max_pe,
+           cheaper_than_pct, peer_pe_values}
+    industry 為空、樣本數不足 3 檔、或抓不到股票清單／本益比資料時回傳空 dict。
+    """
+    industry = str(industry or "").strip()
+    if not industry or industry in ("ETF", "未分類", "N/A", "-"):
+        return {}
+
+    stock_map = get_stock_market_list()
+    if not stock_map:
+        return {}
+    peer_codes = [s.get("code") for s in stock_map if s.get("industry") == industry and s.get("code")]
+    if len(peer_codes) < 3:
+        return {}
+
+    pe_map = load_official_pe_map(False)
+    if not pe_map:
+        return {}
+
+    pe_pairs = [(c, _clean_pe_value(pe_map.get(c))) for c in peer_codes]
+    pe_pairs = [(c, v) for c, v in pe_pairs if pd.notna(v)]
+    if len(pe_pairs) < 3:
+        return {}
+
+    all_pe = [v for _, v in pe_pairs]
+    my_pe = dict(pe_pairs).get(code, np.nan)
+
+    percentile = np.nan
+    if pd.notna(my_pe):
+        # 本益比比「這檔股票」高（比較貴）的同業占比 → 這檔股票比多少同業便宜。
+        pricier_count = sum(1 for v in all_pe if v > my_pe)
+        percentile = round(100 * pricier_count / len(all_pe), 1)
+
+    return {
+        "industry": industry,
+        "peer_count": len(peer_codes),
+        "pe_sample_count": len(pe_pairs),
+        "my_pe": my_pe,
+        "median_pe": float(np.median(all_pe)),
+        "min_pe": float(np.min(all_pe)),
+        "max_pe": float(np.max(all_pe)),
+        "cheaper_than_pct": percentile,
+        "peer_pe_values": all_pe,
+    }
+
+
 def _extract_twstock_yahoo_pe_from_html(html: str) -> float:
     """從 Yahoo 台股頁面解析本益比。只作為官方資料缺值時的單檔備援。"""
     if not html:
@@ -2606,10 +2665,26 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
     code   = ticker.split(".")[0]
     market = "TW" if ticker.endswith(".TW") else "TWO"
     used_adjusted = False
+    lag_days = 0
     if adjusted:
         df = get_kline_data_adjusted(ticker)
         if not df.empty and len(df) >= 30:
             used_adjusted = True
+            # [說明] yfinance 的還原股價資料來源跟 TWSE 官方原始股價（get_kline_data）
+            # 不是同一家，Yahoo 的台股資料常常會晚官方收盤資料幾個小時到大半天才更新，
+            # 尤其是台灣凌晨時段（Yahoo 後端多半還在處理前一個交易日的資料），這時候
+            # 還原股價圖表看起來會「少一天」，但其實只是資料源還沒跟上，過幾個小時
+            # 通常就會補齊，不是程式漏抓。這裡跟官方原始資料比對最新交易日，抓到落後
+            # 幾天就在圖上提示，不讓使用者誤以為是程式漏抓資料。
+            try:
+                raw_ref = get_kline_data(code, market)
+                if not raw_ref.empty and not df.empty:
+                    raw_last = pd.to_datetime(raw_ref["date"]).max()
+                    adj_last = pd.to_datetime(df["date"]).max()
+                    if pd.notna(raw_last) and pd.notna(adj_last) and adj_last < raw_last:
+                        lag_days = int((raw_last - adj_last).days)
+            except Exception:
+                lag_days = 0
         else:
             df = get_kline_data(code, market)
     else:
@@ -2816,9 +2891,12 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
     )
 
     if used_adjusted:
+        badge_text = '還原股價（除權息還原）'
+        if lag_days > 0:
+            badge_text += f'　⚠ 資料來源比官方收盤價慢約{lag_days}天，晚點再看通常會補上'
         fig.add_annotation(
             xref='paper', yref='paper', x=0.012, y=0.895,
-            text='還原股價（除權息還原）', showarrow=False, align='left',
+            text=badge_text, showarrow=False, align='left',
             font=dict(size=11, color='#facc15'),
             bgcolor='rgba(7,13,20,.55)', bordercolor='rgba(250,204,21,.45)', borderwidth=1,
             borderpad=4,
@@ -3895,6 +3973,51 @@ with tab_workspace:
                         st.caption("每條色線＝「近四季 EPS(TTM) × 該分位數的自身歷史本益比」推算出的理論價位，白線為實際股價。股價落在偏低區間，代表相對自己過去的本益比區間便宜；落在偏高區間代表相對較貴。這只是跟自己歷史比較的統計相對位置，不是目標價，也不是買賣建議。")
                     else:
                         st.info("目前資料不足以計算本益比河流圖，可能是新股、EPS 揭露筆數太少，或長期股價資料不足，請稍後再試。")
+
+                    # [新功能] 產業別同儕比較：本益比放在同產業裡看相對位置，
+                    # 全部用已經批次快取的資料算（股票清單＋官方本益比表），不逐股即時抓取。
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">同產業比較</div><div class="section-help">用官方本益比批次資料（跟本益比河流圖同一份資料）比較同產業所有股票的本益比分布；只跟同業比較估值高低，不是買賣建議，成長股本益比偏高不一定代表偏貴。</div></div></div>', unsafe_allow_html=True)
+                    peer_stats = build_industry_peer_stats(current_stock['code'], current_stock.get('industry', ''))
+                    if peer_stats:
+                        cheap_pct = peer_stats['cheaper_than_pct']
+                        cheap_txt = f"比 {cheap_pct:.0f}% 的同業便宜" if pd.notna(cheap_pct) else "N/A"
+                        cheap_color = 'var(--green)' if pd.notna(cheap_pct) and cheap_pct >= 50 else 'var(--red)'
+                        st.markdown(f"""
+                        <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:10px;">
+                          <div class="tv-card"><div class="tv-label">本股本益比</div><div class="tv-value">{fmt_num(peer_stats['my_pe'], '{:.1f}')}</div><div class="tv-caption">{current_stock['name']}</div></div>
+                          <div class="tv-card"><div class="tv-label">同業中位數</div><div class="tv-value">{fmt_num(peer_stats['median_pe'], '{:.1f}')}</div><div class="tv-caption">{peer_stats['industry']}</div></div>
+                          <div class="tv-card"><div class="tv-label">同業本益比範圍</div><div class="tv-value" style="font-size:18px;">{peer_stats['min_pe']:.1f} ~ {peer_stats['max_pe']:.1f}</div><div class="tv-caption">有本益比樣本 {peer_stats['pe_sample_count']}/{peer_stats['peer_count']} 檔</div></div>
+                          <div class="tv-card"><div class="tv-label">同業相對位置</div><div class="tv-value" style="font-size:18px;color:{cheap_color};">{cheap_txt}</div><div class="tv-caption">依本益比由低到高排序</div></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        fig = go.Figure()
+                        fig.add_trace(go.Box(
+                            x=peer_stats['peer_pe_values'], orientation='h', name='同業本益比分布',
+                            boxpoints='all', jitter=0.55, pointpos=0,
+                            marker=dict(color='rgba(140,160,190,0.55)', size=5),
+                            line=dict(color='#4c8dff'), fillcolor='rgba(76,141,255,0.12)',
+                            hovertemplate='本益比 %{x:.1f}<extra></extra>',
+                        ))
+                        if pd.notna(peer_stats['my_pe']):
+                            fig.add_trace(go.Scatter(
+                                x=[peer_stats['my_pe']], y=['同業本益比分布'], mode='markers',
+                                name=current_stock['name'],
+                                marker=dict(color='#facc15', size=15, symbol='diamond', line=dict(color='#0b121b', width=1.5)),
+                                hovertemplate=f"{current_stock['name']} 本益比 " + '%{x:.1f}<extra></extra>',
+                            ))
+                        fig.update_layout(
+                            height=190, template='plotly_dark',
+                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            margin=dict(l=20, r=20, t=10, b=30),
+                            showlegend=False,
+                            xaxis=dict(title='本益比（倍）', gridcolor='rgba(148,163,184,0.09)'),
+                            yaxis=dict(showticklabels=False),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption(f"黃色菱形＝{current_stock['name']}目前本益比，箱型圖呈現「{peer_stats['industry']}」產業內有本益比資料的 {peer_stats['pe_sample_count']} 檔股票分布。本益比較低不代表股票比較好，也可能是市場認為成長性較差，請搭配其他指標一起看。")
+                    else:
+                        st.caption("這個產業分類的股票數量太少，或本益比資料不足（例如虧損股本益比為負，官方資料不會列出），暫時無法比較同業。")
 
             # ---------- 財務體質評分 ----------
             elif view_mode == "🩺 財務體質":
