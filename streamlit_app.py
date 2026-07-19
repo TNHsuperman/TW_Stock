@@ -1319,6 +1319,70 @@ def _check_breakout_condition(closes: pd.Series, volumes: pd.Series, i: int, vol
     return ok, vol_ratio
 
 
+def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float):
+    """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。在策略1（MA30>MA45>MA60多頭排列）
+    的基礎上，往前找近期一段「攻擊上漲」（帶量走高、漲幅明顯）的高點，再確認目前
+    正處於拉回整理，且拉回期間成交量較攻擊時明顯萎縮（量縮），同時股價尚未跌破
+    45MA支撐——代表這是主力拉回洗浮額，而非趨勢轉弱。"""
+    if i < 79:
+        return False, np.nan
+    ma30 = closes.iloc[i-29:i+1].mean()
+    ma45 = closes.iloc[i-44:i+1].mean()
+    ma60 = closes.iloc[i-59:i+1].mean()
+    if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
+        return False, np.nan
+    if not (ma30 > ma45 > ma60):
+        return False, np.nan
+
+    price = closes.iloc[i]
+    if pd.isna(price) or price < ma45:
+        return False, np.nan
+
+    lookback = 15
+    window_closes = closes.iloc[i-lookback:i+1]
+    if window_closes.isna().any():
+        return False, np.nan
+    attack_high_pos = int(window_closes.values.argmax())
+    attack_high_idx = i - lookback + attack_high_pos
+    attack_high = float(window_closes.iloc[attack_high_pos])
+
+    days_since_high = i - attack_high_idx
+    if days_since_high < 2:  # 高點必須是「前段」，留出拉回天數
+        return False, np.nan
+
+    # 攻擊段：高點前 5 個交易日視為攻擊上漲區間，量能須明顯高於更早的基準量
+    attack_start = max(0, attack_high_idx - 4)
+    attack_vol_avg = volumes.iloc[attack_start:attack_high_idx+1].mean()
+    base_start = max(0, attack_start - 20)
+    if attack_start <= base_start:
+        return False, np.nan
+    base_vol_avg = volumes.iloc[base_start:attack_start].mean()
+    if pd.isna(base_vol_avg) or base_vol_avg <= 0 or pd.isna(attack_vol_avg):
+        return False, np.nan
+    attack_vol_ratio = attack_vol_avg / base_vol_avg
+
+    pre_attack_price = closes.iloc[attack_start]
+    if pd.isna(pre_attack_price) or pre_attack_price <= 0:
+        return False, np.nan
+    attack_rise_pct = (attack_high / pre_attack_price - 1) * 100
+
+    # 拉回段：高點之後到今天，量能須較攻擊段明顯萎縮
+    pullback_vol_avg = volumes.iloc[attack_high_idx+1:i+1].mean()
+    if pd.isna(pullback_vol_avg) or attack_vol_avg <= 0:
+        return False, np.nan
+    vol_shrink_ratio = pullback_vol_avg / attack_vol_avg
+
+    pullback_pct = (price / attack_high - 1) * 100  # 負值＝拉回幅度
+
+    ok = (
+        attack_vol_ratio >= 1.3 and          # 攻擊段帶量：至少比基準量多30%
+        attack_rise_pct >= 3.0 and           # 攻擊段漲幅至少3%，確認是真的上攻
+        vol_shrink_ratio <= shrink_ratio_limit and  # 拉回量縮到門檻以下
+        -15.0 <= pullback_pct <= -1.0        # 拉回幅度落在合理區間（太淺不算拉回，太深視為破壞）
+    )
+    return ok, vol_shrink_ratio
+
+
 def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
     """三種策略共用的延伸欄位（漲跌、量比、主力成本、RSI、MACD…），
     確保切換策略不影響既有的 AI 評分／K線／AI分析／公司資訊等下游功能。"""
@@ -1422,6 +1486,28 @@ def calc_breakout_signals(history_map, stock_map, vol_mult_threshold, vol_limit)
     return hits
 
 
+def calc_ma_attack_pullback_signals(history_map, stock_map, shrink_ratio_limit, vol_limit):
+    """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。"""
+    hits = []
+    for s in stock_map:
+        tk = s["ticker"]
+        df = history_map.get(tk)
+        if df is None or len(df) < 90:
+            continue
+        closes = df["close"]
+        volumes = df["volume"]
+        if volumes.tail(5).mean() < vol_limit:
+            continue
+        i = len(closes) - 1
+        ok, vol_shrink_ratio = _check_ma_attack_pullback_condition(closes, volumes, i, shrink_ratio_limit)
+        if ok:
+            row = _build_common_signal_fields(s, df)
+            row["策略"] = "均線多頭+攻擊量縮拉回"
+            row["訊號說明"] = f"近期帶量攻擊上漲後拉回整理，拉回量縮至攻擊量的{vol_shrink_ratio*100:.0f}%，站穩45MA"
+            hits.append(row)
+    return hits
+
+
 # 策略登記表：新增策略只要在這裡註冊，Tab1 的選單與掃描流程會自動支援。
 STRATEGY_REGISTRY = {
     "均線多頭排列": {
@@ -1441,6 +1527,12 @@ STRATEGY_REGISTRY = {
         "desc": "尋找經過整理（近20日波動收斂）後爆量突破近20日高點的股票，適合抓噴出啟動點。",
         "param_label": "爆量倍數門檻 (x)", "param_help": "當日成交量相對近20日均量的倍數，數值越高代表要求突破時量能越強。",
         "param_min": 1.1, "param_max": 4.0, "param_default": 1.5, "param_step": 0.1,
+    },
+    "均線多頭+攻擊量縮拉回": {
+        "func": calc_ma_attack_pullback_signals,
+        "desc": "在均線多頭排列（MA30&gt;MA45&gt;MA60）基礎上，尋找近期有帶量攻擊上漲、目前正拉回整理、且拉回量能明顯萎縮、股價仍站穩45MA的股票，適合抓主力洗盤後的續攻布局點。",
+        "param_label": "拉回量縮比門檻 (倍)", "param_help": "拉回期間均量 ÷ 攻擊上漲期間均量的比值上限，數值越小代表要求拉回時量縮得越乾淨。",
+        "param_min": 0.2, "param_max": 0.9, "param_default": 0.6, "param_step": 0.05,
     },
 }
 
@@ -2464,6 +2556,7 @@ _STRATEGY_CHECKERS = {
     "均線多頭排列": _check_ma_condition,
     "量價背離": _check_divergence_condition,
     "型態突破": _check_breakout_condition,
+    "均線多頭+攻擊量縮拉回": _check_ma_attack_pullback_condition,
 }
 
 
