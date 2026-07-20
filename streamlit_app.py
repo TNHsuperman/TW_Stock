@@ -69,6 +69,10 @@ for key, default in [
     # [新功能] 手動查詢個股：不需策略掃描，直接輸入代碼查詢
     ('manual_stocks',       []),   # 手動查詢過的股票清單（跟策略掃描結果同格式，最新查詢排最前面）
     ('manual_current_code', None), # 剛查到的代碼，用來把 current_idx 切過去
+    # [新功能] 個股投資分析報告：量化資料 + 同業比較 + 波動率情境價 + AI敘事
+    ('report_target_code', None),     # 目前報告頁籤鎖定要看的股票代碼
+    ('report_cache',       {}),       # {代碼: 報告dict}，避免每次重跑都重新呼叫AI（成本較高）
+    ('manual_anthropic_key', ''),     # 使用者手動輸入的API金鑰，只存在當前瀏覽器工作階段，不落地儲存
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -3321,6 +3325,193 @@ def get_tw_stock_news(code):
         return None
 
 # ============================================================
+# [新功能] 個股投資分析報告：量化資料 + 同業比較 + 波動率情境價 + AI敘事
+# ============================================================
+# 設計原則：量化區塊（估值旗標、財務健康、同業比較、情境價格區間）完全
+# 用既有資料來源自行計算，不依賴外部AI；只有敘事段落（催化因素、市場
+# 觀點）才呼叫 Claude API，且明確要求模型只能根據提供的資料摘要作答，
+# 不可以編造未提供的具體數字或事件，降低幻覺風險。API 金鑰未設定或呼叫
+# 失敗時，報告的量化部分仍正常顯示，只有敘事段落顯示提示訊息（fail-open）。
+
+ANTHROPIC_REPORT_MODEL = "claude-sonnet-5"
+
+
+def _get_anthropic_api_key() -> str:
+    """依序嘗試 st.secrets、環境變數、使用者手動輸入（僅存在當前 session），
+    找不到就回傳空字串，由呼叫端判斷是否要停用AI敘事功能。"""
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if env_key:
+        return env_key
+    return st.session_state.get("manual_anthropic_key", "")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_industry_peers_table(industry: str, exclude_code: str, max_peers: int = 4) -> pd.DataFrame:
+    """同產業比較表：先用近20日均量篩出流動性較高的同業候選（避免對整個
+    產業逐一呼叫財務評分，成本太高），再對候選計算財務體質評分，取分數
+    最高的幾檔做比較。任何一步失敗都不中斷，最多回傳空表（fail-open）。"""
+    if not industry or industry in ("未分類", ""):
+        return pd.DataFrame()
+    try:
+        stock_map = get_stock_market_list()
+    except Exception:
+        return pd.DataFrame()
+    peers = [s for s in stock_map if s.get("industry") == industry and str(s.get("code")) != str(exclude_code)]
+    if not peers:
+        return pd.DataFrame()
+
+    peer_tickers = tuple(s["ticker"] for s in peers[:60])  # 產業股票數上限保護，避免超大產業拖慢下載
+    history_map = download_batch_history(peer_tickers)
+
+    liquidity = []
+    for s in peers:
+        df = history_map.get(s["ticker"])
+        if df is None or df.empty:
+            continue
+        avg_vol = df["volume"].tail(20).mean()
+        if pd.isna(avg_vol) or avg_vol <= 0:
+            continue
+        liquidity.append((s, df, avg_vol))
+    if not liquidity:
+        return pd.DataFrame()
+
+    liquidity.sort(key=lambda x: x[2], reverse=True)
+    candidates = liquidity[:10]  # 流動性前10檔再進一步算財務評分，控制成本
+
+    def _score_one(item):
+        s, df, _ = item
+        try:
+            score = fetch_financial_health_score(s["code"])
+        except Exception:
+            score = np.nan
+        try:
+            pe = fetch_pe(s["ticker"])
+        except Exception:
+            pe = np.nan
+        return {
+            "代碼": s["code"], "名稱": s["name"],
+            "收盤": round(float(df["close"].iloc[-1]), 2),
+            "本益比": pe, "財務評分": score,
+        }
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        rows = list(ex.map(_score_one, candidates))
+
+    peer_df = pd.DataFrame(rows).dropna(subset=["財務評分"])
+    if peer_df.empty:
+        return pd.DataFrame()
+    return peer_df.sort_values("財務評分", ascending=False).head(max_peers).reset_index(drop=True)
+
+
+def calc_volatility_price_bands(closes: pd.Series, horizon_days: int = 20, lookback_days: int = 60) -> dict:
+    """用近期歷史波動率反推情境價格區間：純統計上的機率分布估算（隨機漫步
+    模型：日報酬標準差 × sqrt(horizon)），不是目標價、也不是基本面判斷。
+    Bear/Bull 抓 ±1 個標準差，Stretched Bull 抓 +1.8 個標準差（機率更低
+    的極端樂觀情境），資料不足時回傳空字典（fail-open）。"""
+    if closes is None or len(closes) < lookback_days + 5:
+        return {}
+    recent = closes.tail(lookback_days).reset_index(drop=True)
+    rets = np.log(recent / recent.shift(1)).dropna()
+    if rets.empty or rets.std() == 0 or pd.isna(rets.std()):
+        return {}
+    daily_std = float(rets.std())
+    horizon_std = daily_std * np.sqrt(horizon_days)
+    current = float(closes.iloc[-1])
+    return {
+        "現價": round(current, 2),
+        "悲觀 Bear (約-1σ)": round(current * np.exp(-1.0 * horizon_std), 2),
+        "基準 Base": round(current, 2),
+        "樂觀 Bull (約+1σ)": round(current * np.exp(1.0 * horizon_std), 2),
+        "極樂觀 Stretched Bull (約+1.8σ)": round(current * np.exp(1.8 * horizon_std), 2),
+        "年化波動率(%)": round(daily_std * np.sqrt(252) * 100, 1),
+        "推算天數": horizon_days,
+    }
+
+
+def _valuation_flag(row_data: dict) -> str:
+    """用財務評分＋乖離率粗略判斷估值旗標，純規則、不涉及AI。"""
+    score = row_data.get("AI評分", np.nan)
+    bias = row_data.get("乖離30MA(%)", np.nan)
+    if pd.isna(score):
+        return "資料不足"
+    if score >= 75 and pd.notna(bias) and bias <= 8:
+        return "偏低估／具吸引力"
+    elif score >= 60:
+        return "合理偏多"
+    elif score >= 45:
+        return "中性"
+    else:
+        return "偏弱／宜觀察"
+
+
+def build_investment_report(row_data: dict, closes: pd.Series, industry_peers: pd.DataFrame, news_list: list) -> dict:
+    """整合量化資料，組出報告需要的所有數據區塊（不含AI敘事，敘事由呼叫端
+    另外決定是否呼叫 generate_ai_investment_narrative 補上）。"""
+    return {
+        "code": row_data.get("code"), "name": row_data.get("name"), "industry": row_data.get("industry"),
+        "收盤": row_data.get("收盤"), "漲跌幅(%)": row_data.get("漲跌幅(%)"),
+        "本益比": row_data.get("本益比"), "財務評分": row_data.get("AI評分"),
+        "營收年增": row_data.get("營收年增"), "營收月增": row_data.get("營收月增"),
+        "RSI14": row_data.get("RSI14"), "MACD柱": row_data.get("MACD柱"),
+        "乖離30MA(%)": row_data.get("乖離30MA(%)"), "主力成本乖離(%)": row_data.get("主力成本乖離(%)"),
+        "飆股雷達": row_data.get("飆股雷達"), "估值判斷旗標": _valuation_flag(row_data),
+        "情境價格區間": calc_volatility_price_bands(closes),
+        "同業比較": industry_peers.to_dict("records") if industry_peers is not None and not industry_peers.empty else [],
+        "新聞標題": [{"title": n["title"], "sentiment": n["sentiment"]} for n in (news_list or [])][:8],
+    }
+
+
+def generate_ai_investment_narrative(context: dict, api_key: str) -> dict:
+    """呼叫 Claude API，依提供的量化資料摘要與新聞標題生成敘事段落。嚴格
+    要求模型只能根據提供的資料回答，不可以杜撰未提供的具體數字或事件；
+    呼叫失敗（金鑰錯誤、逾時、額度用盡等）一律回傳空字典，由呼叫端顯示
+    提示訊息，不影響報告其他量化區塊（fail-open）。"""
+    if not api_key:
+        return {}
+    system_prompt = (
+        "你是台股產業分析助理，只能根據使用者提供的「資料摘要」與「新聞標題」撰寫繁體中文投資分析。"
+        "嚴格規則：(1) 不可以編造使用者未提供的具體數字、金額、事件或資料來源；"
+        "(2) 新聞標題只是標題、沒有內文細節，只能做標題層級的推論，不能假裝知道細節；"
+        "(3) 資訊不足以支撐某個論點時，要明確寫「資訊不足，需進一步查證」，不要硬湊內容；"
+        "(4) 只能輸出JSON本身，不要有任何JSON以外的文字、不要加markdown code fence。"
+        "JSON格式：{\"重點觀察\": string, \"催化因素\": [string,...], "
+        "\"市場忽略但關鍵\": string, \"估值判斷\": string, \"分析總結\": string}"
+    )
+    user_prompt = "資料摘要：\n" + json.dumps(context, ensure_ascii=False, indent=2)
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_REPORT_MODEL,
+                "max_tokens": 1200,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        raw_text = "\n".join(text_blocks).strip()
+        raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text).strip()
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+# ============================================================
 # 3. 全域 CSS（TradingView 機構終端機風格）
 # ============================================================
 
@@ -3474,10 +3665,11 @@ st.markdown(f"""
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
-tab_scan, tab_workspace, tab_watchlist = st.tabs([
+tab_scan, tab_workspace, tab_watchlist, tab_report = st.tabs([
     "🔍 選股掃描",
     "📊 候選與分析工作台",
     "⭐ 自選股追蹤",
+    "📑 投資分析報告",
 ])
 
 # ------------------------------------------------------------
@@ -4666,3 +4858,192 @@ with tab_watchlist:
                     render_kline_chart_with_axis_price(wl_fig, height=440)
                 else:
                     st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
+
+# ------------------------------------------------------------
+# TAB 4：投資分析報告
+# ------------------------------------------------------------
+with tab_report:
+    st.markdown('<div class="section-head"><div><div class="section-title">個股投資分析報告</div><div class="section-help">輸入股票代碼，整合財務健康、同業比較與波動率情境價格區間；催化因素與市場觀點段落由 Claude API 生成（選用）。</div></div></div>', unsafe_allow_html=True)
+
+    with st.expander("🔑 AI 敘事設定（選用）", expanded=False):
+        st.caption(
+            "「催化因素」「市場忽略但關鍵」「估值判斷」「分析總結」這幾段敘事文字由 Claude API 生成，"
+            "需要你自己的 Anthropic API 金鑰，會產生額外費用。建議部署到 Streamlit Cloud 時，"
+            "在 App 的 Secrets 設定 `ANTHROPIC_API_KEY`；這裡輸入的金鑰只存在本次瀏覽器工作階段，不會被儲存或上傳。"
+            "沒有金鑰時，報告的財務、同業比較、情境價格區間等量化區塊仍會正常顯示，只是不會有 AI 敘事段落。"
+        )
+        st.text_input("Anthropic API 金鑰", type="password", key="manual_anthropic_key", placeholder="sk-ant-...")
+
+    rc1, rc2 = st.columns([3, 1])
+    with rc1:
+        report_code_input = st.text_input("股票代碼", key="report_code_input", placeholder="例如 2330、8033", label_visibility="collapsed")
+    with rc2:
+        gen_clicked = st.button("📑 產生報告", use_container_width=True, type="primary", key="btn_gen_report")
+
+    if gen_clicked and report_code_input.strip():
+        st.session_state.report_target_code = report_code_input.strip().upper()
+        st.session_state.report_force_refresh = True
+        st.rerun()
+
+    target_code = st.session_state.get("report_target_code")
+
+    if not target_code:
+        st.markdown("""
+        <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:8px;">
+          <div style="font-size:40px;margin-bottom:12px;">📑</div>
+          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">還沒有產生過報告</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">在上方輸入股票代碼並按「產生報告」，<br>就能看到財務健康、同業比較與情境價格區間的完整分析。</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        cache = st.session_state.setdefault("report_cache", {})
+        force_refresh = st.session_state.pop("report_force_refresh", False)
+
+        if target_code not in cache or force_refresh:
+            with st.spinner(f"正在整理 {target_code} 的財務、同業與新聞資料…"):
+                row_data = build_manual_stock_row(target_code)
+
+            if row_data is None:
+                st.error(f"找不到股票代碼「{target_code}」，或目前抓不到報價資料，請確認代碼是否正確、稍後再試。")
+                cache.pop(target_code, None)
+                target_code = None
+            else:
+                market = "TW" if str(row_data["ticker"]).endswith(".TW") else "TWO"
+                price_df = get_kline_data(row_data["code"], market)
+                closes = price_df["close"] if not price_df.empty else pd.Series(dtype=float)
+
+                with st.spinner("正在尋找同業比較標的…"):
+                    peers_df = fetch_industry_peers_table(row_data.get("industry", ""), row_data["code"])
+
+                news_list = get_tw_stock_news(row_data["code"]) or []
+                report = build_investment_report(row_data, closes, peers_df, news_list)
+
+                api_key = _get_anthropic_api_key()
+                if api_key:
+                    with st.spinner("正在請 AI 撰寫催化因素與市場觀點段落…"):
+                        narrative = generate_ai_investment_narrative(report, api_key)
+                else:
+                    narrative = {}
+                report["narrative"] = narrative
+                report["narrative_available"] = bool(narrative)
+                cache[target_code] = report
+
+        if target_code and target_code in cache:
+            rd = cache[target_code]
+            narrative = rd.get("narrative", {})
+
+            top_l, top_r = st.columns([5, 1])
+            with top_r:
+                if st.button("🔄 重新產生", use_container_width=True, key="btn_regenerate_report"):
+                    st.session_state.report_force_refresh = True
+                    st.rerun()
+
+            # ---------- 報告頭卡：名稱、報價、估值旗標 ----------
+            badge_color = {
+                "偏低估／具吸引力": "var(--green)", "合理偏多": "var(--blue)",
+                "中性": "var(--yellow)", "偏弱／宜觀察": "var(--red)", "資料不足": "#8f9bad",
+            }.get(rd.get("估值判斷旗標"), "#8f9bad")
+            chg = rd.get("漲跌幅(%)", np.nan)
+            chg_color = "var(--green)" if pd.notna(chg) and chg >= 0 else "var(--red)"
+
+            st.markdown(f"""
+            <div class="tv-panel" style="padding:20px 22px;margin-top:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+                <div>
+                  <div style="font-size:22px;font-weight:800;">{rd.get('name','')} ({rd.get('code','')})</div>
+                  <div class="tv-caption">{rd.get('industry','')}</div>
+                </div>
+                <div style="text-align:right;">
+                  <div style="font-size:26px;font-weight:800;font-family:'Roboto Mono',monospace;">{fmt_num(rd.get('收盤'))}</div>
+                  <div style="color:{chg_color};font-weight:700;">{fmt_num(chg, '{:+.2f}%')}</div>
+                </div>
+              </div>
+              <div style="margin-top:14px;">
+                <span style="background:{badge_color};color:#04121f;font-weight:800;padding:4px 12px;border-radius:20px;font-size:13px;">{rd.get('估值判斷旗標','')}</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ---------- 量化指標卡 ----------
+            m1, m2, m3, m4 = st.columns(4)
+            for col, label, val, fmt in [
+                (m1, "本益比", rd.get("本益比"), "{:.1f}"),
+                (m2, "財務評分", rd.get("財務評分"), "{:.0f}"),
+                (m3, "營收年增(%)", rd.get("營收年增"), "{:+.1f}"),
+                (m4, "RSI14", rd.get("RSI14"), "{:.1f}"),
+            ]:
+                with col:
+                    st.markdown(f'<div class="tv-card"><div class="tv-label">{label}</div><div class="tv-value">{fmt_num(val, fmt)}</div></div>', unsafe_allow_html=True)
+
+            # ---------- 重點觀察／催化因素／市場忽略但關鍵 ----------
+            st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📌 重點觀察</div>', unsafe_allow_html=True)
+            if rd.get("narrative_available"):
+                st.markdown(narrative.get("重點觀察", "（AI未提供此段落）"))
+            else:
+                st.info("尚未設定 Anthropic API 金鑰，此區塊沒有 AI 生成的敘事內容；下方量化數據仍完整可用。可在上方「AI 敘事設定」輸入金鑰後按「重新產生」。")
+
+            st.markdown('<div class="section-title" style="margin-top:18px;font-size:16px;">🚀 催化因素</div>', unsafe_allow_html=True)
+            catalysts = narrative.get("催化因素", [])
+            if catalysts:
+                for c in catalysts:
+                    st.markdown(f"- {c}")
+            else:
+                st.caption("目前沒有 AI 生成的催化因素摘要（可能是尚未設定金鑰，或新聞資料不足）。")
+
+            insight = narrative.get("市場忽略但關鍵", "")
+            if insight:
+                st.markdown(f'<div style="border-left:3px solid var(--yellow);padding:12px 16px;background:rgba(255,200,87,0.08);border-radius:6px;margin-top:14px;"><b>💡 市場忽略但關鍵</b><br>{insight}</div>', unsafe_allow_html=True)
+
+            # ---------- 財務健康與競爭估值 ----------
+            st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">🏢 財務健康與競爭估值</div>', unsafe_allow_html=True)
+            val_text = narrative.get("估值判斷", "")
+            if val_text:
+                st.markdown(val_text)
+            peers = rd.get("同業比較", [])
+            if peers:
+                peer_df_display = pd.DataFrame(peers)
+                st.dataframe(
+                    peer_df_display, use_container_width=True, hide_index=True,
+                    column_config={
+                        "代碼": st.column_config.TextColumn("代碼", width=70),
+                        "名稱": st.column_config.TextColumn("名稱", width=100),
+                        "收盤": st.column_config.NumberColumn("收盤", format="%.2f"),
+                        "本益比": st.column_config.NumberColumn("本益比", format="%.1f"),
+                        "財務評分": st.column_config.NumberColumn("財務評分", format="%.0f"),
+                    },
+                )
+                st.caption("同業比較表：自動抓取同產業（依 industry 欄位分類）中流動性較高、財務評分最高的幾檔股票，僅供參考，非投資建議。")
+            else:
+                st.caption("目前找不到足夠的同產業比較標的（可能是產業分類過於冷門或資料不足）。")
+
+            # ---------- 風險報酬對稱性：情境價格區間 ----------
+            st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">⚖️ 風險報酬對稱性（情境價格區間）</div>', unsafe_allow_html=True)
+            bands = rd.get("情境價格區間", {})
+            if bands:
+                b1, b2, b3, b4 = st.columns(4)
+                for col, label, key in [
+                    (b1, "悲觀 Bear", "悲觀 Bear (約-1σ)"),
+                    (b2, "基準 Base", "基準 Base"),
+                    (b3, "樂觀 Bull", "樂觀 Bull (約+1σ)"),
+                    (b4, "極樂觀 Stretched Bull", "極樂觀 Stretched Bull (約+1.8σ)"),
+                ]:
+                    with col:
+                        st.markdown(f'<div class="tv-card"><div class="tv-label">{label}</div><div class="tv-value">{fmt_num(bands.get(key))}</div></div>', unsafe_allow_html=True)
+                st.caption(f"用近60日歷史波動率（年化約{fmt_num(bands.get('年化波動率(%)'), '{:.1f}')}%）反推未來約{bands.get('推算天數','')}個交易日的統計價格區間（隨機漫步模型），屬於機率分布估算，不是目標價、也不是基本面判斷，僅供參考。")
+            else:
+                st.caption("歷史價格資料不足（需近65個交易日以上），無法計算情境價格區間。")
+
+            # ---------- 分析總結 ----------
+            summary_text = narrative.get("分析總結", "")
+            if summary_text:
+                st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📝 分析總結</div>', unsafe_allow_html=True)
+                st.markdown(summary_text)
+
+            # ---------- 參考新聞標題 ----------
+            news_items = rd.get("新聞標題", [])
+            if news_items:
+                st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📰 參考新聞標題</div>', unsafe_allow_html=True)
+                for n in news_items:
+                    st.caption(f"{n.get('sentiment','')} {n.get('title','')}")
+
+            st.markdown('<div class="tv-caption" style="margin-top:24px;">本報告由系統自動整理公開資料與統計方法產生，AI敘事段落可能有誤或不完整，僅供研究參考，不構成投資建議，投資請自行判斷並留意風險。</div>', unsafe_allow_html=True)
