@@ -3607,116 +3607,177 @@ def build_investment_report(row_data: dict, closes: pd.Series, industry_peers: p
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600;700;800&display=swap');
+
 :root{
- --bg:#07111f;--panel:#0d1a2b;--panel2:#102138;--border:#233a55;
- --text:#edf4ff;--muted:#9db0c6;--blue:#4c8dff;--green:#35c48d;
- --red:#ff6474;--yellow:#ffc857;--shadow:0 14px 36px rgba(0,0,0,.22);
+  --bg:#070d17;
+  --surface:#0d1624;
+  --surface-2:#111d2d;
+  --surface-3:#162337;
+  --border:rgba(148,163,184,.16);
+  --border-strong:rgba(110,168,254,.38);
+  --text:#e8eef8;
+  --muted:#8796aa;
+  --accent:#6ea8fe;
+  --blue:#6ea8fe;
+  --accent-strong:#3b82f6;
+  --green:#36c99a;
+  --red:#ff6b7a;
+  --yellow:#f8c766;
+  --shadow:0 12px 30px rgba(0,0,0,.18);
+  --radius:16px;
 }
+
 [data-testid='stHeader'],[data-testid='stToolbar'],[data-testid='stSidebar'],
 [data-testid='collapsedControl'],[data-testid='stSidebarCollapseButton']{display:none!important;}
-html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
- background:radial-gradient(circle at 10% 0%,rgba(76,141,255,.13),transparent 30%),linear-gradient(180deg,#081321,#050c16)!important;
- color:var(--text)!important;font-family:'Inter','Noto Sans TC',sans-serif!important;
-}
-.block-container{max-width:1500px!important;padding:24px 28px 56px!important;}
-.app-hero{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:22px 24px;margin-bottom:16px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(9,20,35,.98));border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);}
-.app-title{font-size:28px;font-weight:800;letter-spacing:.2px;color:#fff}.app-sub{font-size:13px;color:var(--muted);margin-top:7px;line-height:1.7}.app-meta{text-align:right;color:var(--muted);font-family:'Roboto Mono',monospace;font-size:12px;line-height:1.8;white-space:nowrap}
-.workflow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:0 0 16px}.workflow-step{padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:rgba(13,26,43,.85);color:var(--muted);font-size:12px;font-weight:700}.workflow-step b{display:inline-flex;width:23px;height:23px;border-radius:50%;align-items:center;justify-content:center;background:rgba(76,141,255,.18);color:#9fc0ff;margin-right:7px}.workflow-step.active{border-color:#4777b8;background:rgba(76,141,255,.10);color:#eaf2ff}
-.section-head{display:flex;justify-content:space-between;align-items:end;margin:22px 0 10px}.section-title{font-size:18px;font-weight:800;color:#f4f8ff}.section-help{font-size:12px;color:var(--muted)}
-.control-shell,.tv-panel,.tv-card,.side-card,[data-testid='stDataFrame']{background:linear-gradient(180deg,rgba(16,33,56,.96),rgba(9,20,35,.98))!important;border:1px solid var(--border)!important;border-radius:14px!important;box-shadow:var(--shadow)}
-.control-shell{padding:8px 16px 14px;margin-bottom:12px}.control-note{padding:13px 15px;border-radius:11px;background:rgba(76,141,255,.08);border:1px solid rgba(76,141,255,.22);color:#bcd0e8;font-size:13px;line-height:1.75}
-[data-testid='stExpander']{background:transparent!important;border:0!important}[data-testid='stExpander'] details{border:0!important}[data-testid='stExpander'] summary{font-weight:800!important;color:#f1f6ff!important;font-size:15px!important}
-[data-testid='stButton']>button,[data-testid='stDownloadButton']>button{border-radius:10px!important;border:1px solid #34547b!important;background:#142944!important;color:#eff5ff!important;font-weight:800!important;min-height:44px!important;transition:.16s ease!important}
-[data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{border-color:var(--blue)!important;background:#19365b!important;box-shadow:0 0 0 3px rgba(76,141,255,.13)!important}
-[data-testid='stButton']>button[kind='primary']{background:linear-gradient(135deg,#3978e8,#4c8dff)!important;border-color:#679fff!important;color:#fff!important}
-[data-testid='stNumberInput'] input{background:#091625!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:9px!important}.stSlider{padding-top:2px}
-/* [新功能] 進度條加強：加粗、發光、動態流動效果，並顯示 st.progress(text=...) 帶的百分比文字，掃描時一眼就能看到進度 */
-[data-testid='stProgress']{margin:6px 0 4px;}
-[data-testid='stProgress']>div{background:#0d1c30!important;border-radius:999px!important;height:26px!important;border:1px solid rgba(76,141,255,.28)!important;box-shadow:inset 0 0 10px rgba(0,0,0,.35)!important;overflow:visible!important;}
-[data-testid='stProgress']>div>div{background:linear-gradient(90deg,#3978e8,#4c8dff,#35c48d)!important;background-size:200% 100%!important;animation:tv-progress-flow 2.2s linear infinite!important;border-radius:999px!important;box-shadow:0 0 16px rgba(76,141,255,.55),0 0 4px rgba(53,196,141,.5)!important;position:relative!important;min-width:26px!important;}
-[data-testid='stProgress'] p{color:#eaf2ff!important;font-weight:800!important;font-size:14px!important;font-family:'Roboto Mono',monospace!important;margin-bottom:4px!important;}
-@keyframes tv-progress-flow{0%{background-position:0% 0%}100%{background-position:200% 0%}}
-[data-testid='stAlert']{border-radius:12px!important;background:rgba(76,141,255,.09)!important;border:1px solid rgba(76,141,255,.24)!important}
-.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.tv-card{padding:16px}.tv-label{color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.06em}.tv-value{font-family:'Roboto Mono',monospace;font-size:25px;font-weight:800;margin-top:6px;color:var(--text)}.tv-caption{color:var(--muted);font-size:12px;margin-top:5px}
-.tv-section{font-size:17px;font-weight:800;color:#f4f8ff;margin:22px 0 10px}.quote-panel{padding:18px 20px;margin:18px 0 12px;background:linear-gradient(135deg,rgba(16,33,56,.98),rgba(8,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}.quote-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.quote-title{font-size:24px;font-weight:800}.quote-tag,.bias-chip{border:1px solid var(--border);background:#13243a;border-radius:999px;padding:5px 10px;color:#b9c9dc;font-size:12px;font-weight:700}.quote-price{font-family:'Roboto Mono',monospace;font-size:38px;font-weight:800;color:var(--green);line-height:1.25}.quote-change{font-family:'Roboto Mono',monospace;font-size:17px;font-weight:700;margin-left:8px}.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(110px,1fr));gap:12px;margin-top:12px;max-width:700px}.metric-k{color:var(--muted);font-size:11px;font-weight:700}.metric-v{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-top:3px}
-.side-card{padding:16px;margin-bottom:12px}.side-title{display:flex;justify-content:space-between;gap:8px;font-size:16px;font-weight:800;margin-bottom:10px}.report-row{display:flex;justify-content:space-between;border-bottom:1px solid rgba(35,58,85,.65);padding:8px 0;color:#c7d5e6;font-size:13px}.radar-check{font-size:13px;line-height:1.9;color:#c6d4e5}.radar-check b{color:var(--green);margin-right:7px}
 
-[data-baseweb='tab-list']{gap:8px;background:rgba(13,26,43,.78);border:1px solid var(--border);border-radius:14px;padding:7px;margin:4px 0 18px;overflow-x:auto;}
-[data-baseweb='tab']{height:46px;border-radius:10px;padding:0 18px;color:var(--muted)!important;font-weight:800!important;white-space:nowrap;}
-[data-baseweb='tab'][aria-selected='true']{background:linear-gradient(135deg,#3978e8,#4c8dff)!important;color:#fff!important;box-shadow:0 8px 20px rgba(57,120,232,.25);}
-[data-baseweb='tab-highlight']{display:none!important;}
-[data-baseweb='tab-panel']{padding-top:2px;}
-[data-testid='stDataFrame']{overflow:hidden!important}[data-testid='stDataFrame'] *{font-family:'Roboto Mono','Noto Sans TC',monospace!important}.news-card{background:linear-gradient(180deg,rgba(16,33,56,.9),rgba(9,20,35,.96))!important;border-radius:12px!important}.news-title:hover{color:#8eb6ff!important}
-/* [新版面] 主從式雙欄工作台：左側候選清單常駐 + 右側個股工作台（K線/AI/新聞 分段切換） */
-.workspace-left{background:linear-gradient(180deg,rgba(16,33,56,.96),rgba(9,20,35,.98));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:14px;max-height:900px;overflow-y:auto;}
-.workspace-right{min-height:600px;}
-.workspace-left [data-testid='stDataFrame']{border:0!important;box-shadow:none!important;}
-/* [新設計] 個股工作台分段切換頁籤：柔和膠囊式風格，取代先前偏「重」的
-   終端機發光效果。selector 是從 Streamlit 前端原始碼（BaseButton 元件）比對確認過
-   的正確版本：容器 testid 是 stButtonGroup，個別頁籤未選取時 testid 是
-   stBaseButton-segmented_control，選取中則是 stBaseButton-segmented_controlActive
-   （舊版用的 [data-testid='stSegmentedControl'] 其實從未在實際 DOM 出現過，等於沒生效）。
-   拿掉外層邊框容器、發光陰影跟脈動動畫，改成單純的膠囊按鈕自然換行、留白加大、
-   選取狀態只用柔和的淡藍色底＋細邊框標示，視覺上更安靜、不搶眼。 */
-[data-testid='stButtonGroup']{
-  display:flex!important;
-  flex-wrap:wrap!important;
-  gap:10px!important;
-  background:transparent!important;
-  border:none!important;
-  padding:0!important;
-  box-shadow:none!important;
-  margin:2px 0 20px!important;
-}
-[data-testid^='stBaseButton-segmented_control']{
+html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
+  background:
+    radial-gradient(circle at 18% -10%,rgba(59,130,246,.12),transparent 30%),
+    radial-gradient(circle at 92% 0%,rgba(54,201,154,.06),transparent 24%),
+    var(--bg)!important;
+  color:var(--text)!important;
   font-family:'Inter','Noto Sans TC',sans-serif!important;
-  font-weight:600!important;
-  font-size:13.5px!important;
-  letter-spacing:0!important;
-  padding:9px 18px!important;
-  border-radius:999px!important;
-  white-space:nowrap!important;
-  transition:all .18s ease!important;
 }
-[data-testid='stBaseButton-segmented_control']{
-  background:rgba(255,255,255,.03)!important;
-  border:1px solid rgba(255,255,255,.09)!important;
-  color:#8697ad!important;
+
+.block-container{max-width:1680px!important;padding:22px 30px 72px!important;}
+
+/* ── 頁首：單一主視覺，不再堆疊厚重卡片 ── */
+.app-hero{
+  display:flex;justify-content:space-between;align-items:center;gap:28px;
+  padding:26px 28px;margin-bottom:12px;
+  background:linear-gradient(115deg,rgba(17,29,45,.98),rgba(10,18,30,.98));
+  border:1px solid var(--border);border-radius:22px;box-shadow:var(--shadow);
+  position:relative;overflow:hidden;
 }
-[data-testid='stBaseButton-segmented_control']:hover{
-  background:rgba(255,255,255,.06)!important;
-  border-color:rgba(255,255,255,.18)!important;
-  color:#d7e2f0!important;
+.app-hero:after{content:'';position:absolute;right:-70px;top:-110px;width:250px;height:250px;border-radius:50%;background:rgba(110,168,254,.09);filter:blur(2px);pointer-events:none;}
+.app-kicker{font-size:11px;font-weight:800;letter-spacing:.16em;color:var(--accent);margin-bottom:8px;}
+.app-title{font-size:31px;font-weight:800;letter-spacing:-.02em;color:#f7faff;line-height:1.2;}
+.app-sub{max-width:820px;font-size:13px;color:var(--muted);margin-top:9px;line-height:1.8;}
+.app-meta{display:grid;grid-template-columns:repeat(2,minmax(112px,1fr));gap:10px;min-width:270px;z-index:1;}
+.meta-item{padding:12px 14px;border:1px solid var(--border);border-radius:13px;background:rgba(255,255,255,.025);}
+.meta-k{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;}
+.meta-v{margin-top:5px;font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;color:#f4f8ff;white-space:nowrap;}
+
+/* ── 精簡步驟條 ── */
+.workflow{display:flex;align-items:center;gap:6px;margin:0 0 18px;padding:0 4px;overflow-x:auto;}
+.workflow-step{display:flex;align-items:center;gap:7px;padding:8px 10px;color:#66778e;font-size:11px;font-weight:700;white-space:nowrap;}
+.workflow-step:not(:last-child):after{content:'›';margin-left:7px;color:#35465c;font-size:15px;}
+.workflow-step b{display:inline-flex;width:21px;height:21px;border-radius:50%;align-items:center;justify-content:center;background:#111c2c;border:1px solid var(--border);color:#6f8097;font-size:10px;}
+.workflow-step.active{color:#cdd9e8;}.workflow-step.active b{background:rgba(110,168,254,.14);border-color:var(--border-strong);color:#9fc5ff;}
+
+/* ── 頂層導覽 ── */
+[data-baseweb='tab-list']{
+  position:sticky;top:0;z-index:50;
+  gap:4px;background:rgba(9,16,27,.88);backdrop-filter:blur(14px);
+  border:1px solid var(--border);border-radius:15px;padding:5px;margin:0 0 24px;overflow-x:auto;
 }
-[data-testid='stBaseButton-segmented_controlActive']{
-  background:rgba(76,141,255,.15)!important;
-  border:1px solid rgba(76,141,255,.5)!important;
-  color:#8fc4ff!important;
-  font-weight:700!important;
-  box-shadow:none!important;
+[data-baseweb='tab']{height:42px;border-radius:10px;padding:0 17px;color:var(--muted)!important;font-size:13px!important;font-weight:700!important;white-space:nowrap;}
+[data-baseweb='tab']:hover{background:rgba(255,255,255,.035)!important;color:#d9e4f2!important;}
+[data-baseweb='tab'][aria-selected='true']{background:var(--surface-3)!important;color:#fff!important;box-shadow:inset 0 0 0 1px rgba(110,168,254,.28);}
+[data-baseweb='tab-highlight']{display:none!important;}
+[data-baseweb='tab-panel']{padding-top:0;}
+
+/* ── 標題與留白 ── */
+.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:30px 0 14px;}
+.section-title{font-size:18px;font-weight:800;letter-spacing:-.01em;color:#f3f7fd;}
+.section-help{font-size:12px;color:var(--muted);line-height:1.65;}
+.tv-section{font-size:15px;font-weight:800;color:#edf3fb;margin:18px 0 10px;}
+.candidate-row-hint{font-size:11.5px;color:var(--muted);margin:3px 0 10px;line-height:1.6;}
+
+/* ── 統一卡片語言：低陰影、細邊框、較大留白 ── */
+.tv-panel,.tv-card,.side-card,.quote-panel,.news-card,[data-testid='stDataFrame']{
+  background:var(--surface)!important;border:1px solid var(--border)!important;border-radius:var(--radius)!important;box-shadow:none!important;
 }
-.candidate-row-hint{font-size:11px;color:var(--muted);margin:2px 0 8px;}
-/* [新功能] 手機版卡片清單：桌面顯示表格、手機顯示卡片，兩者都渲染由 CSS 依寬度切換，
-   避免用 JS 偵測螢幕寬度，st.container(key=...) 產生的 st-key-* class 可直接用 CSS 選取。 */
-.st-key-desktop_candidate_list{display:block;}
-.st-key-mobile_candidate_list{display:none;}
-.mobile-stock-card{background:linear-gradient(180deg,rgba(16,33,56,.92),rgba(9,20,35,.96));border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:8px;}
-.mobile-stock-card .msc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
-.mobile-stock-card .msc-name{font-size:15px;font-weight:800;color:#f4f8ff;}
-.mobile-stock-card .msc-code{color:var(--muted);font-size:12px;margin-left:6px;}
-.mobile-stock-card .msc-score{font-family:'Roboto Mono',monospace;font-weight:800;font-size:16px;color:#4c8dff;}
-.mobile-stock-card .msc-metrics{display:flex;gap:14px;font-family:'Roboto Mono',monospace;font-size:12.5px;color:#c7d5e6;}
-.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
-.strategy-badge{display:inline-block;background:rgba(76,141,255,.14);color:#9fc0ff;border:1px solid rgba(76,141,255,.3);border-radius:999px;padding:3px 11px;font-size:11px;font-weight:800;margin-left:8px;}
-/* [新功能] 熱門股 Tag：橘紅色系，跟其他中性 quote-tag 拉開視覺區別，一眼看出是熱門股 */
-.hot-tag{background:rgba(255,138,61,.16)!important;border-color:rgba(255,138,61,.45)!important;color:#ffb37a!important;font-weight:800!important;}
-.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
-::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#07111f}::-webkit-scrollbar-thumb{background:#29425f;border-radius:999px}
-@media(max-width:1000px){.block-container{padding:16px 14px 40px!important}.workflow,.stat-grid{grid-template-columns:repeat(2,1fr)}.app-hero{align-items:flex-start}.app-meta{display:none}.workspace-left{max-height:420px;}}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:0 0 20px;}
+.tv-card{padding:17px 18px;min-height:104px;}
+.tv-label{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;}
+.tv-value{font-family:'Roboto Mono',monospace;font-size:27px;font-weight:700;margin-top:9px;color:#f4f8ff;line-height:1.15;}
+.tv-caption{color:var(--muted);font-size:11.5px;margin-top:7px;line-height:1.55;}
+.side-card{padding:18px;margin-bottom:13px;}
+.side-title{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:15px;font-weight:800;margin-bottom:10px;}
+.report-row{display:flex;justify-content:space-between;gap:18px;border-bottom:1px solid rgba(148,163,184,.11);padding:10px 0;color:#cbd6e4;font-size:13px;}
+.report-row:last-child{border-bottom:0;}
+.radar-check{font-size:13px;line-height:1.95;color:#c8d4e3;}.radar-check b{color:var(--green);margin-right:7px;}
+
+/* ── Streamlit 容器與表單 ── */
+[data-testid='stVerticalBlockBorderWrapper']{background:var(--surface)!important;border-color:var(--border)!important;border-radius:var(--radius)!important;box-shadow:none!important;}
+.st-key-scan_control_panel [data-testid='stVerticalBlockBorderWrapper']{padding:8px 4px 2px;}
+.st-key-candidate_sidebar [data-testid='stVerticalBlockBorderWrapper']{position:sticky;top:70px;max-height:calc(100vh - 92px);overflow-y:auto;}
+.control-note{padding:15px 16px;border-radius:13px;background:rgba(110,168,254,.07);border:1px solid rgba(110,168,254,.20);color:#bdcce0;font-size:13px;line-height:1.75;min-height:100%;}
+.strategy-badge{display:inline-block;background:rgba(110,168,254,.11);color:#9fc5ff;border:1px solid rgba(110,168,254,.25);border-radius:999px;padding:3px 9px;font-size:9px;font-weight:800;letter-spacing:.08em;margin-left:7px;}
+
+[data-baseweb='select']>div,[data-testid='stTextInput'] input,[data-testid='stNumberInput'] input{
+  background:#0a1320!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:10px!important;min-height:42px!important;
+}
+[data-baseweb='select']>div:focus-within,[data-testid='stTextInput'] input:focus,[data-testid='stNumberInput'] input:focus{border-color:var(--border-strong)!important;box-shadow:0 0 0 3px rgba(59,130,246,.10)!important;}
+label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!important;font-weight:700!important;}
+.stSlider{padding-top:4px;}
+
+[data-testid='stButton']>button,[data-testid='stDownloadButton']>button{
+  min-height:40px!important;border-radius:10px!important;border:1px solid var(--border)!important;
+  background:#121f31!important;color:#e8eef8!important;font-weight:700!important;font-size:12px!important;transition:.16s ease!important;
+}
+[data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{border-color:rgba(110,168,254,.45)!important;background:#17283f!important;color:#fff!important;box-shadow:none!important;}
+[data-testid='stButton']>button[kind='primary']{background:var(--accent-strong)!important;border-color:#5a96f5!important;color:#fff!important;}
+[data-testid='stButton']>button[kind='primary']:hover{background:#4a8df5!important;}
+
+[data-testid='stExpander']{background:transparent!important;border:0!important;margin:6px 0 14px;}
+[data-testid='stExpander'] details{background:rgba(13,22,36,.62)!important;border:1px solid var(--border)!important;border-radius:14px!important;overflow:hidden;}
+[data-testid='stExpander'] summary{font-weight:750!important;color:#dce6f3!important;font-size:13px!important;padding:4px 2px!important;}
+[data-testid='stAlert']{border-radius:12px!important;background:rgba(110,168,254,.07)!important;border:1px solid rgba(110,168,254,.20)!important;}
+
+/* ── 乾淨進度條 ── */
+[data-testid='stProgress']{margin:10px 0 5px;}
+[data-testid='stProgress']>div{background:#111d2d!important;border-radius:999px!important;height:12px!important;border:1px solid var(--border)!important;overflow:hidden!important;}
+[data-testid='stProgress']>div>div{background:linear-gradient(90deg,var(--accent-strong),var(--green))!important;border-radius:999px!important;box-shadow:none!important;}
+[data-testid='stProgress'] p{color:#cdd9e8!important;font-weight:700!important;font-size:12px!important;font-family:'Roboto Mono',monospace!important;margin-bottom:5px!important;}
+
+/* ── 報價主卡 ── */
+.quote-panel{padding:22px 24px;margin:12px 0 18px;position:relative;overflow:hidden;}
+.quote-panel:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
+.quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
+.quote-title{font-size:23px;font-weight:800;letter-spacing:-.015em;}
+.quote-tag,.bias-chip{border:1px solid var(--border);background:#121e2f;border-radius:999px;padding:4px 9px;color:#aebdd0;font-size:10.5px;font-weight:700;}
+.quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;color:var(--green);line-height:1.2;letter-spacing:-.04em;}
+.quote-change{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-left:9px;}
+.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-top:15px;max-width:720px;}
+.quote-metrics>div{padding:10px 12px;background:rgba(255,255,255,.022);border:1px solid rgba(148,163,184,.10);border-radius:11px;}
+.metric-k{color:var(--muted);font-size:10px;font-weight:700;}.metric-v{font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;margin-top:4px;}
+.hot-tag{background:rgba(248,145,75,.12)!important;border-color:rgba(248,145,75,.32)!important;color:#ffb17a!important;}.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
+.detail-nav-title{font-size:11px;font-weight:800;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;margin:4px 0 7px;}
+
+/* ── 工作台 ── */
+.workspace-left{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;max-height:900px;overflow-y:auto;}
+.workspace-right{min-height:600px;}
+.workspace-left [data-testid='stDataFrame']{border:0!important;}
+[data-testid='stDataFrame']{overflow:hidden!important;}
+[data-testid='stDataFrame'] *{font-family:'Roboto Mono','Noto Sans TC',monospace!important;}
+.news-card{padding:16px 18px!important;margin-bottom:11px!important;}.news-title:hover{color:#9fc5ff!important;}
+
+/* 手機候選卡 */
+.st-key-desktop_candidate_list{display:block;}.st-key-mobile_candidate_list{display:none;}
+.mobile-stock-card{background:var(--surface-2);border:1px solid var(--border);border-radius:13px;padding:13px 14px;margin-bottom:9px;}
+.mobile-stock-card .msc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;}
+.mobile-stock-card .msc-name{font-size:14px;font-weight:800;color:#f2f6fc;}.mobile-stock-card .msc-code{color:var(--muted);font-size:11px;margin-left:6px;}
+.mobile-stock-card .msc-score{font-family:'Roboto Mono',monospace;font-weight:700;font-size:16px;color:var(--accent);}
+.mobile-stock-card .msc-metrics{display:flex;gap:13px;font-family:'Roboto Mono',monospace;font-size:12px;color:#c8d4e3;}.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
+
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#09111d}::-webkit-scrollbar-thumb{background:#26364b;border-radius:999px}::-webkit-scrollbar-thumb:hover{background:#334862}
+
+@media(max-width:1100px){
+  .block-container{padding:18px 18px 52px!important;}
+  .app-hero{align-items:flex-start;}.app-meta{min-width:230px;}
+  .st-key-candidate_sidebar [data-testid='stVerticalBlockBorderWrapper']{position:static;max-height:none;}
+}
+@media(max-width:850px){
+  .app-hero{display:block;padding:22px;}.app-meta{margin-top:18px;max-width:360px;min-width:0;}
+  .section-help{display:none;}.quote-metrics{grid-template-columns:1fr 1fr;}
+}
 @media(max-width:760px){
-  .workflow,.stat-grid,.quote-metrics{grid-template-columns:1fr}.app-title{font-size:22px}.quote-price{font-size:31px}.section-help{display:none}
-  .st-key-desktop_candidate_list{display:none;}
-  .st-key-mobile_candidate_list{display:block;}
+  .block-container{padding:14px 12px 40px!important;}.app-title{font-size:25px;}.app-meta{grid-template-columns:1fr 1fr;}
+  .workflow{padding:0;}.workflow-step{font-size:10px;padding:7px 5px;}.workflow-step:not(:last-child):after{margin-left:4px;}
+  .stat-grid,.quote-metrics{grid-template-columns:1fr;}.quote-price{font-size:34px;}.quote-panel{padding:19px 17px;}
+  .st-key-desktop_candidate_list{display:none;}.st-key-mobile_candidate_list{display:block;}
 }
 </style>
 """, unsafe_allow_html=True)
@@ -3730,16 +3791,20 @@ _current_step = 3 if _signal_count else (2 if st.session_state.is_scanning else 
 st.markdown(f"""
 <div class="app-hero">
   <div>
-    <div class="app-title">台股智慧選股</div>
-    <div class="app-sub">依均線多頭排列、乖離率與成交量快速篩選，再整合財務評分、K 線、營收、本益比與個股新聞。</div>
+    <div class="app-kicker">TAIWAN EQUITY INTELLIGENCE</div>
+    <div class="app-title">台股決策中心</div>
+    <div class="app-sub">從全市場策略掃描，到個股技術面、基本面、法人籌碼與研究報告，集中在同一個清楚的分析工作台。</div>
   </div>
-  <div class="app-meta">目前訊號 {_signal_count} 檔<br>資料時間 {_now_str}</div>
+  <div class="app-meta">
+    <div class="meta-item"><div class="meta-k">目前訊號</div><div class="meta-v">{_signal_count} 檔</div></div>
+    <div class="meta-item"><div class="meta-k">資料時間</div><div class="meta-v">{_now_str}</div></div>
+  </div>
 </div>
 <div class="workflow">
-  <div class="workflow-step {'active' if _current_step >= 1 else ''}"><b>1</b>設定篩選條件</div>
-  <div class="workflow-step {'active' if _current_step >= 2 else ''}"><b>2</b>執行全市場掃描</div>
-  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>3</b>從清單選擇股票</div>
-  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>4</b>查看圖表與分析</div>
+  <div class="workflow-step {'active' if _current_step >= 1 else ''}"><b>1</b>設定策略</div>
+  <div class="workflow-step {'active' if _current_step >= 2 else ''}"><b>2</b>掃描市場</div>
+  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>3</b>挑選標的</div>
+  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>4</b>深入研究</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -3755,10 +3820,10 @@ user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
 tab_scan, tab_workspace, tab_watchlist, tab_report = st.tabs([
-    "🔍 選股掃描",
-    "📊 候選與分析工作台",
-    "⭐ 自選股追蹤",
-    "📑 投資分析報告",
+    "市場掃描",
+    "個股工作台",
+    "追蹤清單",
+    "研究報告",
 ])
 
 # ------------------------------------------------------------
@@ -3766,9 +3831,7 @@ tab_scan, tab_workspace, tab_watchlist, tab_report = st.tabs([
 # ------------------------------------------------------------
 with tab_scan:
     st.markdown('<div class="section-head"><div><div class="section-title">設定掃描條件</div><div class="section-help">條件越嚴格，候選股票通常越少；第一次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
-    with st.container():
-        st.markdown('<div class="control-shell">', unsafe_allow_html=True)
-
+    with st.container(border=True, key="scan_control_panel"):
         # [新功能] 策略選單：切換策略時，下方參數與說明會跟著換
         strategy_name = st.selectbox(
             "選股策略", list(STRATEGY_REGISTRY.keys()),
@@ -3805,7 +3868,6 @@ with tab_scan:
                 help="排除流動性較低的股票。"
             )
             st.session_state.user_vol = mb_vol
-        st.markdown('</div>', unsafe_allow_html=True)
 
     user_vol = st.session_state.user_vol
     param_value = st.session_state[f"strategy_param__{strategy_name}"]
@@ -3913,11 +3975,10 @@ with tab_scan:
         avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
         st.markdown(f"""
-        <div class="stat-grid" style="margin-top:18px;">
-          <div class="tv-card"><div class="tv-label">最近掃描結果</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">符合條件股票</div></div>
-          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
-          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
-          <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">候選與分析工作台</div><div class="tv-caption">切換下一個頁籤選股並看圖</div></div>
+        <div class="stat-grid" style="margin-top:20px;">
+          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次掃描候選股票</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">候選標的平均分數</div></div>
+          <div class="tv-card"><div class="tv-label">高分候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
         </div>
         """, unsafe_allow_html=True)
     elif not st.session_state.is_scanning:
@@ -3925,7 +3986,7 @@ with tab_scan:
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:18px;">
           <div style="font-size:40px;margin-bottom:12px;">🔎</div>
           <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「候選與分析工作台」頁籤。</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「個股工作台」頁籤。</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -3960,9 +4021,11 @@ def render_manual_search_box(key_suffix: str, with_border: bool = True):
     抽成函式方便在不同位置重複渲染（例如右欄工作台頂端、或完全沒有候選股票時的
     空狀態），用 key_suffix 讓每個位置的 widget key 不會互相衝突。
     """
-    ctx = st.container(border=with_border)
+    ctx = (st.expander("快速查詢其他股票", expanded=False)
+           if key_suffix == "panel"
+           else st.container(border=with_border, key=f"manual_search_{key_suffix}"))
     with ctx:
-        st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:6px;">🔍 手動查詢個股</div><div class="candidate-row-hint">直接輸入上市／上櫃股票代碼，不必等策略掃描完成即可查看完整個股工作台（K線、AI分析、財報、法人動向…）。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="candidate-row-hint">輸入上市／上櫃股票代碼，即可直接開啟完整個股分析，不必重新執行全市場掃描。</div>', unsafe_allow_html=True)
         msc1, msc2 = st.columns([3, 1])
         with msc1:
             manual_code_input = st.text_input(
@@ -4000,15 +4063,15 @@ with tab_workspace:
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
         st.markdown(f"""
         <div class="stat-grid">
-          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次候選股票</div></div>
-          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
-          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
-          <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">K線／AI分析／新聞同步顯示</div></div>
+          <div class="tv-card"><div class="tv-label">候選股票</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">目前策略掃描結果</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">候選標的整體品質</div></div>
+          <div class="tv-card"><div class="tv-label">高分候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
         </div>
         """, unsafe_allow_html=True)
 
-        # ══════════════ 熱門族群：候選股集中度與平均分數，二次確認訊號品質 ══════════════
-        render_hot_industries(scan_df)
+        # ══════════════ 熱門族群：改為收合區，避免一進工作台就被大量卡片占滿 ══════════════
+        with st.expander("🔥 熱門族群與產業集中度", expanded=False):
+            render_hot_industries(scan_df)
 
         # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
         with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
@@ -4051,11 +4114,11 @@ with tab_workspace:
                     st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
 
     if has_results or has_manual:
-        left_col, right_col = st.columns([1.5, 2.2], gap="medium")
+        left_col, right_col = st.columns([1.2, 2.5], gap="large")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
         with left_col:
-            with st.container(border=True):
+            with st.container(border=True, key="candidate_sidebar"):
                 st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:8px;">候選股票清單</div><div class="candidate-row-hint">點擊任一列即可切換右側個股工作台。</div>', unsafe_allow_html=True)
 
                 # [新功能] 熱門族群卡片點擊後的產業篩選提示（跟快速篩選是 AND 關係）
@@ -4167,7 +4230,7 @@ with tab_workspace:
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
         with right_col:
-            nav_star, nav_space, nav1, nav2 = st.columns([0.9, 2.5, 0.8, 0.8])
+            nav_star, nav_space, nav1, nav2 = st.columns([1.1, 3.2, 0.9, 0.9])
             with nav_star:
                 # [新功能] 自選股／追蹤清單：星號切換加入/移除，重新讀檔即時反映目前狀態
                 _wl_now = load_watchlist()
@@ -4188,9 +4251,6 @@ with tab_workspace:
                 if st.button("下一檔 →", use_container_width=True, key="chart_next"):
                     st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                     st.rerun()
-
-            # ══════════════ 手動查詢個股：不必等策略掃描，直接輸入代碼即可查看完整工作台 ══════════════
-            render_manual_search_box(key_suffix="panel")
 
             price = current_stock.get('收盤', np.nan)
             chg = current_stock.get('漲跌幅(%)', np.nan)
@@ -4217,16 +4277,17 @@ with tab_workspace:
             </div>
             """, unsafe_allow_html=True)
 
-            # [新版面] 分段切換：取代原本 K線圖／AI分析／個股新聞 三個獨立頁籤，
+            render_manual_search_box(key_suffix="panel")
+
+            # [新版面] 使用單一分析選單，避免九個膠囊按鈕同時擠在畫面上。
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
-            view_mode = st.segmented_control(
-                "檢視模式",
-                ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
-                default="📈 K線圖",
+            st.markdown('<div class="detail-nav-title">分析內容</div>', unsafe_allow_html=True)
+            view_options = ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"]
+            view_mode = st.selectbox(
+                "分析內容", view_options,
                 key="detail_view_mode",
                 label_visibility="collapsed",
             )
-            view_mode = view_mode or "📈 K線圖"
 
             # ---------- K 線圖 ----------
             if view_mode == "📈 K線圖":
@@ -4868,7 +4929,7 @@ with tab_workspace:
                 else:
                     st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
     else:
-        st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「選股掃描」頁籤執行全市場掃描。")
+        st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「市場掃描」頁籤執行全市場掃描。")
         render_manual_search_box(key_suffix="empty")
 
 # ------------------------------------------------------------
@@ -4878,7 +4939,7 @@ with tab_workspace:
 # 不用每次都全市場重新掃描才看得到它們。清單存在本機 JSON 檔案
 # （watchlist_v1.json），跟 get_stock_market_list() 用同一套持久化寫法。
 with tab_watchlist:
-    st.markdown('<div class="section-head"><div><div class="section-title">自選股／追蹤清單</div><div class="section-help">在「候選與分析工作台」右上角點 ☆ 加入追蹤，這裡會持續記錄，不受重新掃描影響。</div></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div><div class="section-title">自選股／追蹤清單</div><div class="section-help">在「個股工作台」右上角點 ☆ 加入追蹤，這裡會持續記錄，不受重新掃描影響。</div></div></div>', unsafe_allow_html=True)
 
     watchlist = load_watchlist()
     if not watchlist:
@@ -4886,7 +4947,7 @@ with tab_watchlist:
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:8px;">
           <div style="font-size:40px;margin-bottom:12px;">⭐</div>
           <div style="font-size:20px;font-weight:800;color:#f4f8ff;">追蹤清單目前是空的</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">掃描完成後，在「候選與分析工作台」右上角點「☆ 加入追蹤」，<br>就能把還沒達標、但值得持續觀察的股票留在這裡。</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">掃描完成後，在「個股工作台」右上角點「☆ 加入追蹤」，<br>就能把還沒達標、但值得持續觀察的股票留在這裡。</div>
         </div>
         """, unsafe_allow_html=True)
     else:
