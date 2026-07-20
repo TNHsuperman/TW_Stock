@@ -1323,68 +1323,115 @@ def _check_breakout_condition(closes: pd.Series, volumes: pd.Series, i: int, vol
     return ok, vol_ratio
 
 
-def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float):
-    """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。在策略1（MA30>MA45>MA60多頭排列）
-    的基礎上，往前找近期一段「攻擊上漲」（帶量走高、漲幅明顯）的高點，再確認目前
-    正處於拉回整理，且拉回期間成交量較攻擊時明顯萎縮（量縮），同時股價尚未跌破
-    45MA支撐——代表這是主力拉回洗浮額，而非趨勢轉弱。"""
-    if i < 79:
-        return False, np.nan
-    ma30 = closes.iloc[i-29:i+1].mean()
-    ma45 = closes.iloc[i-44:i+1].mean()
-    ma60 = closes.iloc[i-59:i+1].mean()
-    if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
-        return False, np.nan
+def _find_ma_attack_pullback_setup(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float) -> dict:
+    """找出最近一個有效的「帶量攻擊後量縮拉回」波段。
+
+    舊版只取最近區間的單一最高收盤價當攻擊高點；若該高點本身沒有帶量，
+    即使區間內另有有效攻擊波段，也會整檔判定失敗。新版會逐一檢查
+    最近 22 日內、距今天至少 2 日的候選高點，再挑選條件最佳的一組。
+    """
+    if i < 59:
+        return {}
+
+    close_s = pd.to_numeric(closes.iloc[:i + 1], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    volume_s = pd.to_numeric(volumes.iloc[:i + 1], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if len(close_s) < 60 or close_s.tail(60).isna().any():
+        return {}
+
+    ma30 = float(close_s.tail(30).mean())
+    ma45 = float(close_s.tail(45).mean())
+    ma60 = float(close_s.tail(60).mean())
+    price = float(close_s.iloc[-1])
+    if not all(np.isfinite(v) and v > 0 for v in [ma30, ma45, ma60, price]):
+        return {}
     if not (ma30 > ma45 > ma60):
-        return False, np.nan
+        return {}
+    if price < ma45:
+        return {}
 
-    price = closes.iloc[i]
-    if pd.isna(price) or price < ma45:
-        return False, np.nan
+    first_peak_idx = max(24, i - 22)
+    candidates = []
+    for peak_idx in range(i - 2, first_peak_idx - 1, -1):
+        attack_high = float(close_s.iloc[peak_idx])
+        if not np.isfinite(attack_high) or attack_high <= 0:
+            continue
 
-    lookback = 15
-    window_closes = closes.iloc[i-lookback:i+1]
-    if window_closes.isna().any():
-        return False, np.nan
-    attack_high_pos = int(window_closes.values.argmax())
-    attack_high_idx = i - lookback + attack_high_pos
-    attack_high = float(window_closes.iloc[attack_high_pos])
+        pullback_pct = (price / attack_high - 1) * 100
+        if not (-15.0 <= pullback_pct <= -0.8):
+            continue
 
-    days_since_high = i - attack_high_idx
-    if days_since_high < 2:  # 高點必須是「前段」，留出拉回天數
-        return False, np.nan
+        # 攻擊高點要接近局部高點，避免把一般震盪日誤認為攻擊點。
+        local_left = max(0, peak_idx - 2)
+        local_right = min(i + 1, peak_idx + 3)
+        local_high = float(close_s.iloc[local_left:local_right].max())
+        if attack_high < local_high * 0.995:
+            continue
 
-    # 攻擊段：高點前 5 個交易日視為攻擊上漲區間，量能須明顯高於更早的基準量
-    attack_start = max(0, attack_high_idx - 4)
-    attack_vol_avg = volumes.iloc[attack_start:attack_high_idx+1].mean()
-    base_start = max(0, attack_start - 20)
-    if attack_start <= base_start:
-        return False, np.nan
-    base_vol_avg = volumes.iloc[base_start:attack_start].mean()
-    if pd.isna(base_vol_avg) or base_vol_avg <= 0 or pd.isna(attack_vol_avg):
-        return False, np.nan
-    attack_vol_ratio = attack_vol_avg / base_vol_avg
+        attack_start = peak_idx - 4
+        base_start = attack_start - 20
+        if base_start < 0:
+            continue
 
-    pre_attack_price = closes.iloc[attack_start]
-    if pd.isna(pre_attack_price) or pre_attack_price <= 0:
+        attack_prices = close_s.iloc[attack_start:peak_idx + 1]
+        attack_volumes = volume_s.iloc[attack_start:peak_idx + 1]
+        base_volumes = volume_s.iloc[base_start:attack_start]
+        pullback_volumes = volume_s.iloc[peak_idx + 1:i + 1]
+        if (
+            attack_prices.isna().any()
+            or attack_volumes.isna().any()
+            or base_volumes.isna().all()
+            or pullback_volumes.isna().all()
+        ):
+            continue
+
+        pre_attack_price = float(attack_prices.iloc[0])
+        attack_vol_avg = float(attack_volumes.mean())
+        base_vol_avg = float(base_volumes.mean())
+        pullback_vol_avg = float(pullback_volumes.mean())
+        if not all(np.isfinite(v) and v > 0 for v in [pre_attack_price, attack_vol_avg, base_vol_avg, pullback_vol_avg]):
+            continue
+
+        attack_rise_pct = (attack_high / pre_attack_price - 1) * 100
+        attack_vol_ratio = attack_vol_avg / base_vol_avg
+        vol_shrink_ratio = pullback_vol_avg / attack_vol_avg
+
+        # 保留合理容錯，避免單日量能波動把完整的攻擊—拉回結構全部排除。
+        if attack_rise_pct < 2.5:
+            continue
+        if attack_vol_ratio < 1.20:
+            continue
+        if vol_shrink_ratio > shrink_ratio_limit:
+            continue
+
+        quality = (attack_rise_pct * attack_vol_ratio) / max(vol_shrink_ratio, 0.05)
+        candidates.append({
+            "attack_high_idx": peak_idx,
+            "days_since_high": i - peak_idx,
+            "attack_rise_pct": attack_rise_pct,
+            "attack_vol_ratio": attack_vol_ratio,
+            "vol_shrink_ratio": vol_shrink_ratio,
+            "pullback_pct": pullback_pct,
+            "ma30": ma30,
+            "ma45": ma45,
+            "ma60": ma60,
+            "quality": quality,
+        })
+
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda x: x["quality"])
+
+
+def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float):
+    """策略4：均線多頭 + 帶量攻擊 + 量縮拉回。
+
+    維持原本 ``(是否符合, 拉回量縮比)`` 回傳格式，讓即時掃描與回測
+    可繼續共用同一個 checker。
+    """
+    setup = _find_ma_attack_pullback_setup(closes, volumes, i, shrink_ratio_limit)
+    if not setup:
         return False, np.nan
-    attack_rise_pct = (attack_high / pre_attack_price - 1) * 100
-
-    # 拉回段：高點之後到今天，量能須較攻擊段明顯萎縮
-    pullback_vol_avg = volumes.iloc[attack_high_idx+1:i+1].mean()
-    if pd.isna(pullback_vol_avg) or attack_vol_avg <= 0:
-        return False, np.nan
-    vol_shrink_ratio = pullback_vol_avg / attack_vol_avg
-
-    pullback_pct = (price / attack_high - 1) * 100  # 負值＝拉回幅度
-
-    ok = (
-        attack_vol_ratio >= 1.3 and          # 攻擊段帶量：至少比基準量多30%
-        attack_rise_pct >= 3.0 and           # 攻擊段漲幅至少3%，確認是真的上攻
-        vol_shrink_ratio <= shrink_ratio_limit and  # 拉回量縮到門檻以下
-        -15.0 <= pullback_pct <= -1.0        # 拉回幅度落在合理區間（太淺不算拉回，太深視為破壞）
-    )
-    return ok, vol_shrink_ratio
+    return True, float(setup["vol_shrink_ratio"])
 
 
 def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
@@ -1493,22 +1540,33 @@ def calc_breakout_signals(history_map, stock_map, vol_mult_threshold, vol_limit)
 def calc_ma_attack_pullback_signals(history_map, stock_map, shrink_ratio_limit, vol_limit):
     """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。"""
     hits = []
-    for s in stock_map:
-        tk = s["ticker"]
-        df = history_map.get(tk)
-        if df is None or len(df) < 90:
+    for stock in stock_map:
+        ticker = stock["ticker"]
+        df = history_map.get(ticker)
+        if df is None or len(df) < 65:
             continue
-        closes = df["close"]
-        volumes = df["volume"]
-        if volumes.tail(5).mean() < vol_limit:
+
+        closes = pd.to_numeric(df["close"], errors="coerce")
+        volumes = pd.to_numeric(df["volume"], errors="coerce")
+
+        # 這是量縮拉回策略，不能用最近 5 日均量做最低量過濾；
+        # 否則最符合策略的低量拉回股會先被剔除。改用近 20 日平均量。
+        liquidity_avg = float(volumes.tail(20).mean())
+        if not np.isfinite(liquidity_avg) or liquidity_avg < vol_limit:
             continue
+
         i = len(closes) - 1
-        ok, vol_shrink_ratio = _check_ma_attack_pullback_condition(closes, volumes, i, shrink_ratio_limit)
-        if ok:
-            row = _build_common_signal_fields(s, df)
-            row["策略"] = "均線多頭+攻擊量縮拉回"
-            row["訊號說明"] = f"近期帶量攻擊上漲後拉回整理，拉回量縮至攻擊量的{vol_shrink_ratio*100:.0f}%，站穩45MA"
-            hits.append(row)
+        setup = _find_ma_attack_pullback_setup(closes, volumes, i, shrink_ratio_limit)
+        if not setup:
+            continue
+
+        row = _build_common_signal_fields(stock, df)
+        row["策略"] = "均線多頭+攻擊量縮拉回"
+        row["訊號說明"] = (
+            f"攻擊段上漲{setup['attack_rise_pct']:.1f}%、量能{setup['attack_vol_ratio']:.1f}倍；"
+            f"拉回{abs(setup['pullback_pct']):.1f}%、量縮至攻擊量的{setup['vol_shrink_ratio']*100:.0f}%，仍站穩45MA"
+        )
+        hits.append(row)
     return hits
 
 
@@ -2566,7 +2624,7 @@ _STRATEGY_CHECKERS = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float, vol_limit: int) -> pd.DataFrame:
-    """對候選清單股票重放近9個月歷史資料，找出歷史上符合『目前策略』條件的
+    """對候選清單股票重放近1年歷史資料，找出歷史上符合『目前策略』條件的
     每一個訊號點，計算進場後 5 / 10 / 20 個交易日的持有報酬。
     同一檔股票 5 個交易日內只取一次訊號（cooldown），避免同一波段訊號重複灌水。
     """
@@ -2576,7 +2634,7 @@ def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float
 
     ticker_str = " ".join(tickers)
     try:
-        raw = yf.download(ticker_str, period="9mo", interval="1d", group_by="ticker",
+        raw = yf.download(ticker_str, period="1y", interval="1d", group_by="ticker",
                           auto_adjust=True, progress=False, threads=True)
     except Exception:
         return pd.DataFrame()
@@ -4074,7 +4132,7 @@ with tab_workspace:
             render_hot_industries(scan_df)
 
         # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
-        with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
+        with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近1年）", expanded=False):
             st.caption(
                 "針對目前候選清單的股票，重放近9個月歷史資料找出符合『目前策略』條件的歷史訊號點，"
                 "計算進場後 5／10／20 個交易日的持有報酬。切換策略、重新掃描後再跑一次回測，"
@@ -4111,7 +4169,7 @@ with tab_workspace:
                         st.markdown(f'<div class="candidate-row-hint">「{bt_strategy}」各持有期間明細</div>', unsafe_allow_html=True)
                         st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
                 elif current_bt is not None:
-                    st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
+                    st.info(f"「{bt_strategy}」在候選清單範圍內近1年沒有找到符合條件的歷史訊號。")
 
     if has_results or has_manual:
         left_col, right_col = st.columns([1.2, 2.5], gap="large")
