@@ -77,6 +77,53 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+# ============================================================
+# [改版] 深／淺雙主題調色盤
+# ============================================================
+# 主題切換開關（st.toggle, key="ui_theme_toggle"）放在頁首右側；
+# widget 狀態在使用者點擊後的 rerun「開始前」就已更新，所以這裡
+# 在腳本最上方讀取，同一次 rerun 內的 CSS 與圖表就能拿到新主題。
+THEMES = {
+    "dark": dict(
+        bg="#0A101C", surface="#101B2C", surface2="#16233A",
+        border="rgba(151,170,199,.16)", divider="rgba(151,170,199,.10)",
+        text="#E7EDF6", text2="#C3CEDD", muted="#8494AB",
+        blue="#5A8DEE", green="#2FBE8F", red="#F25A6B", yellow="#E0A93E",
+        chart_template="plotly_dark", chart_bg="#0C1422",
+        chart_grid="rgba(148,163,184,0.09)", chart_text="#9AA7B8",
+        chart_text_strong="#E6EDF3", chart_line="#E6EDF3", chart_hover_bg="#111A26",
+    ),
+    "light": dict(
+        bg="#F4F6FA", surface="#FFFFFF", surface2="#EDF1F7",
+        border="rgba(23,42,69,.14)", divider="rgba(23,42,69,.08)",
+        text="#1B2940", text2="#3D4E66", muted="#64748B",
+        blue="#2563EB", green="#0E9F6E", red="#DC3D4E", yellow="#B7791F",
+        chart_template="plotly_white", chart_bg="#FFFFFF",
+        chart_grid="rgba(23,42,69,0.08)", chart_text="#5B6B80",
+        chart_text_strong="#1B2940", chart_line="#243A5E", chart_hover_bg="#FFFFFF",
+    ),
+}
+
+def get_ui_theme_name() -> str:
+    """回傳目前主題名稱：頁首開關開啟＝淺色，預設深色。"""
+    return "light" if st.session_state.get("ui_theme_toggle", False) else "dark"
+
+def get_theme_palette(name: str) -> dict:
+    """取出指定主題的調色盤（fail-open：未知名稱退回深色）。"""
+    return THEMES.get(name, THEMES["dark"])
+
+UI_THEME = get_ui_theme_name()
+PAL = get_theme_palette(UI_THEME)
+
+# Plotly 圖表用常數（st.dataframe / iframe 內無法使用 CSS 變數，需用實際色碼）
+CHART_TEMPLATE   = PAL["chart_template"]
+CHART_BG         = PAL["chart_bg"]
+CHART_GRID       = PAL["chart_grid"]
+CHART_TEXT       = PAL["chart_text"]
+CHART_TEXT_STRONG = PAL["chart_text_strong"]
+CHART_LINE       = PAL["chart_line"]
+CHART_HOVER_BG   = PAL["chart_hover_bg"]
+
 def get_tw_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
@@ -1046,7 +1093,7 @@ def calc_financial_health_score(metrics: dict) -> dict:
     if overall >= 75:
         verdict, color = "體質優良", "var(--green)"
     elif overall >= 55:
-        verdict, color = "體質穩健", "#8eb6ff"
+        verdict, color = "體質穩健", "var(--blue)"
     elif overall >= 35:
         verdict, color = "普通", "var(--yellow)"
     else:
@@ -1323,115 +1370,68 @@ def _check_breakout_condition(closes: pd.Series, volumes: pd.Series, i: int, vol
     return ok, vol_ratio
 
 
-def _find_ma_attack_pullback_setup(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float) -> dict:
-    """找出最近一個有效的「帶量攻擊後量縮拉回」波段。
-
-    舊版只取最近區間的單一最高收盤價當攻擊高點；若該高點本身沒有帶量，
-    即使區間內另有有效攻擊波段，也會整檔判定失敗。新版會逐一檢查
-    最近 22 日內、距今天至少 2 日的候選高點，再挑選條件最佳的一組。
-    """
-    if i < 59:
-        return {}
-
-    close_s = pd.to_numeric(closes.iloc[:i + 1], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    volume_s = pd.to_numeric(volumes.iloc[:i + 1], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    if len(close_s) < 60 or close_s.tail(60).isna().any():
-        return {}
-
-    ma30 = float(close_s.tail(30).mean())
-    ma45 = float(close_s.tail(45).mean())
-    ma60 = float(close_s.tail(60).mean())
-    price = float(close_s.iloc[-1])
-    if not all(np.isfinite(v) and v > 0 for v in [ma30, ma45, ma60, price]):
-        return {}
-    if not (ma30 > ma45 > ma60):
-        return {}
-    if price < ma45:
-        return {}
-
-    first_peak_idx = max(24, i - 22)
-    candidates = []
-    for peak_idx in range(i - 2, first_peak_idx - 1, -1):
-        attack_high = float(close_s.iloc[peak_idx])
-        if not np.isfinite(attack_high) or attack_high <= 0:
-            continue
-
-        pullback_pct = (price / attack_high - 1) * 100
-        if not (-15.0 <= pullback_pct <= -0.8):
-            continue
-
-        # 攻擊高點要接近局部高點，避免把一般震盪日誤認為攻擊點。
-        local_left = max(0, peak_idx - 2)
-        local_right = min(i + 1, peak_idx + 3)
-        local_high = float(close_s.iloc[local_left:local_right].max())
-        if attack_high < local_high * 0.995:
-            continue
-
-        attack_start = peak_idx - 4
-        base_start = attack_start - 20
-        if base_start < 0:
-            continue
-
-        attack_prices = close_s.iloc[attack_start:peak_idx + 1]
-        attack_volumes = volume_s.iloc[attack_start:peak_idx + 1]
-        base_volumes = volume_s.iloc[base_start:attack_start]
-        pullback_volumes = volume_s.iloc[peak_idx + 1:i + 1]
-        if (
-            attack_prices.isna().any()
-            or attack_volumes.isna().any()
-            or base_volumes.isna().all()
-            or pullback_volumes.isna().all()
-        ):
-            continue
-
-        pre_attack_price = float(attack_prices.iloc[0])
-        attack_vol_avg = float(attack_volumes.mean())
-        base_vol_avg = float(base_volumes.mean())
-        pullback_vol_avg = float(pullback_volumes.mean())
-        if not all(np.isfinite(v) and v > 0 for v in [pre_attack_price, attack_vol_avg, base_vol_avg, pullback_vol_avg]):
-            continue
-
-        attack_rise_pct = (attack_high / pre_attack_price - 1) * 100
-        attack_vol_ratio = attack_vol_avg / base_vol_avg
-        vol_shrink_ratio = pullback_vol_avg / attack_vol_avg
-
-        # 保留合理容錯，避免單日量能波動把完整的攻擊—拉回結構全部排除。
-        if attack_rise_pct < 2.5:
-            continue
-        if attack_vol_ratio < 1.20:
-            continue
-        if vol_shrink_ratio > shrink_ratio_limit:
-            continue
-
-        quality = (attack_rise_pct * attack_vol_ratio) / max(vol_shrink_ratio, 0.05)
-        candidates.append({
-            "attack_high_idx": peak_idx,
-            "days_since_high": i - peak_idx,
-            "attack_rise_pct": attack_rise_pct,
-            "attack_vol_ratio": attack_vol_ratio,
-            "vol_shrink_ratio": vol_shrink_ratio,
-            "pullback_pct": pullback_pct,
-            "ma30": ma30,
-            "ma45": ma45,
-            "ma60": ma60,
-            "quality": quality,
-        })
-
-    if not candidates:
-        return {}
-    return max(candidates, key=lambda x: x["quality"])
-
-
 def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i: int, shrink_ratio_limit: float):
-    """策略4：均線多頭 + 帶量攻擊 + 量縮拉回。
-
-    維持原本 ``(是否符合, 拉回量縮比)`` 回傳格式，讓即時掃描與回測
-    可繼續共用同一個 checker。
-    """
-    setup = _find_ma_attack_pullback_setup(closes, volumes, i, shrink_ratio_limit)
-    if not setup:
+    """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。在策略1（MA30>MA45>MA60多頭排列）
+    的基礎上，往前找近期一段「攻擊上漲」（帶量走高、漲幅明顯）的高點，再確認目前
+    正處於拉回整理，且拉回期間成交量較攻擊時明顯萎縮（量縮），同時股價尚未跌破
+    45MA支撐——代表這是主力拉回洗浮額，而非趨勢轉弱。"""
+    if i < 79:
         return False, np.nan
-    return True, float(setup["vol_shrink_ratio"])
+    ma30 = closes.iloc[i-29:i+1].mean()
+    ma45 = closes.iloc[i-44:i+1].mean()
+    ma60 = closes.iloc[i-59:i+1].mean()
+    if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
+        return False, np.nan
+    if not (ma30 > ma45 > ma60):
+        return False, np.nan
+
+    price = closes.iloc[i]
+    if pd.isna(price) or price < ma45:
+        return False, np.nan
+
+    lookback = 15
+    window_closes = closes.iloc[i-lookback:i+1]
+    if window_closes.isna().any():
+        return False, np.nan
+    attack_high_pos = int(window_closes.values.argmax())
+    attack_high_idx = i - lookback + attack_high_pos
+    attack_high = float(window_closes.iloc[attack_high_pos])
+
+    days_since_high = i - attack_high_idx
+    if days_since_high < 2:  # 高點必須是「前段」，留出拉回天數
+        return False, np.nan
+
+    # 攻擊段：高點前 5 個交易日視為攻擊上漲區間，量能須明顯高於更早的基準量
+    attack_start = max(0, attack_high_idx - 4)
+    attack_vol_avg = volumes.iloc[attack_start:attack_high_idx+1].mean()
+    base_start = max(0, attack_start - 20)
+    if attack_start <= base_start:
+        return False, np.nan
+    base_vol_avg = volumes.iloc[base_start:attack_start].mean()
+    if pd.isna(base_vol_avg) or base_vol_avg <= 0 or pd.isna(attack_vol_avg):
+        return False, np.nan
+    attack_vol_ratio = attack_vol_avg / base_vol_avg
+
+    pre_attack_price = closes.iloc[attack_start]
+    if pd.isna(pre_attack_price) or pre_attack_price <= 0:
+        return False, np.nan
+    attack_rise_pct = (attack_high / pre_attack_price - 1) * 100
+
+    # 拉回段：高點之後到今天，量能須較攻擊段明顯萎縮
+    pullback_vol_avg = volumes.iloc[attack_high_idx+1:i+1].mean()
+    if pd.isna(pullback_vol_avg) or attack_vol_avg <= 0:
+        return False, np.nan
+    vol_shrink_ratio = pullback_vol_avg / attack_vol_avg
+
+    pullback_pct = (price / attack_high - 1) * 100  # 負值＝拉回幅度
+
+    ok = (
+        attack_vol_ratio >= 1.3 and          # 攻擊段帶量：至少比基準量多30%
+        attack_rise_pct >= 3.0 and           # 攻擊段漲幅至少3%，確認是真的上攻
+        vol_shrink_ratio <= shrink_ratio_limit and  # 拉回量縮到門檻以下
+        -15.0 <= pullback_pct <= -1.0        # 拉回幅度落在合理區間（太淺不算拉回，太深視為破壞）
+    )
+    return ok, vol_shrink_ratio
 
 
 def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
@@ -1540,33 +1540,22 @@ def calc_breakout_signals(history_map, stock_map, vol_mult_threshold, vol_limit)
 def calc_ma_attack_pullback_signals(history_map, stock_map, shrink_ratio_limit, vol_limit):
     """策略4：均線多頭排列 + 攻擊帶量、拉回量縮。"""
     hits = []
-    for stock in stock_map:
-        ticker = stock["ticker"]
-        df = history_map.get(ticker)
-        if df is None or len(df) < 65:
+    for s in stock_map:
+        tk = s["ticker"]
+        df = history_map.get(tk)
+        if df is None or len(df) < 90:
             continue
-
-        closes = pd.to_numeric(df["close"], errors="coerce")
-        volumes = pd.to_numeric(df["volume"], errors="coerce")
-
-        # 這是量縮拉回策略，不能用最近 5 日均量做最低量過濾；
-        # 否則最符合策略的低量拉回股會先被剔除。改用近 20 日平均量。
-        liquidity_avg = float(volumes.tail(20).mean())
-        if not np.isfinite(liquidity_avg) or liquidity_avg < vol_limit:
+        closes = df["close"]
+        volumes = df["volume"]
+        if volumes.tail(5).mean() < vol_limit:
             continue
-
         i = len(closes) - 1
-        setup = _find_ma_attack_pullback_setup(closes, volumes, i, shrink_ratio_limit)
-        if not setup:
-            continue
-
-        row = _build_common_signal_fields(stock, df)
-        row["策略"] = "均線多頭+攻擊量縮拉回"
-        row["訊號說明"] = (
-            f"攻擊段上漲{setup['attack_rise_pct']:.1f}%、量能{setup['attack_vol_ratio']:.1f}倍；"
-            f"拉回{abs(setup['pullback_pct']):.1f}%、量縮至攻擊量的{setup['vol_shrink_ratio']*100:.0f}%，仍站穩45MA"
-        )
-        hits.append(row)
+        ok, vol_shrink_ratio = _check_ma_attack_pullback_condition(closes, volumes, i, shrink_ratio_limit)
+        if ok:
+            row = _build_common_signal_fields(s, df)
+            row["策略"] = "均線多頭+攻擊量縮拉回"
+            row["訊號說明"] = f"近期帶量攻擊上漲後拉回整理，拉回量縮至攻擊量的{vol_shrink_ratio*100:.0f}%，站穩45MA"
+            hits.append(row)
     return hits
 
 
@@ -2624,7 +2613,7 @@ _STRATEGY_CHECKERS = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float, vol_limit: int) -> pd.DataFrame:
-    """對候選清單股票重放近1年歷史資料，找出歷史上符合『目前策略』條件的
+    """對候選清單股票重放近9個月歷史資料，找出歷史上符合『目前策略』條件的
     每一個訊號點，計算進場後 5 / 10 / 20 個交易日的持有報酬。
     同一檔股票 5 個交易日內只取一次訊號（cooldown），避免同一波段訊號重複灌水。
     """
@@ -2634,7 +2623,7 @@ def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float
 
     ticker_str = " ".join(tickers)
     try:
-        raw = yf.download(ticker_str, period="1y", interval="1d", group_by="ticker",
+        raw = yf.download(ticker_str, period="9mo", interval="1d", group_by="ticker",
                           auto_adjust=True, progress=False, threads=True)
     except Exception:
         return pd.DataFrame()
@@ -2750,7 +2739,7 @@ def fmt_num(value, pattern='{:.2f}', na='N/A'):
 def _pct_color_style(val):
     """給 pandas Styler 用：正數綠、負數紅，跟全站漲跌配色（EPS長條圖等）一致。"""
     if pd.isna(val):
-        return "color:#8f9bad;"
+        return "color:var(--muted);"
     color = "#35c48d" if val >= 0 else "#f23645"
     return f"color:{color};font-weight:700;"
 
@@ -2776,7 +2765,7 @@ def render_hot_industries(df: pd.DataFrame):
 
     head_col, clear_col = st.columns([4, 1])
     with head_col:
-        st.markdown('<div class="tv-section" style="margin-bottom:2px;">HOT INDUSTRIES · 熱門族群</div><div class="candidate-row-hint" style="margin-bottom:10px;">卡片下方按「篩選」，候選清單只顯示該產業別；同一產業集中越多高分候選股，代表族群同步在動、訊號可信度越高。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tv-section" style="margin-bottom:2px;">熱門族群</div><details class="section-help" style="margin-bottom:10px;"><summary>ⓘ 說明</summary><div class="sh-body">卡片下方按「篩選」，候選清單只顯示該產業別；同一產業集中越多高分候選股，代表族群同步在動、訊號可信度越高。</div></details>', unsafe_allow_html=True)
     with clear_col:
         if st.session_state.get('industry_filter'):
             if st.button(f"✕ 清除「{st.session_state.industry_filter}」篩選", key="clear_industry_filter_top", use_container_width=True):
@@ -2794,7 +2783,7 @@ def render_hot_industries(df: pd.DataFrame):
             st.markdown(f"""
             <div class="tv-card" style="margin-bottom:6px;{active_style}">
               <div class="tv-label">{r['industry']}</div>
-              <div class="tv-value" style="font-size:22px;color:#8fb2ff;">{r['平均分']:.0f}</div>
+              <div class="tv-value" style="font-size:22px;color:var(--blue);">{r['平均分']:.0f}</div>
               <div class="tv-caption">標的 {int(r['標的數'])} · 量變 {vol_txt} · YoY {yoy_txt}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -3105,7 +3094,7 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
         tick_text = [d.strftime('%Y-%m') for d in tick_rows['date_dt']]
 
     spike_cfg = dict(
-        type='category', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
+        type='category', showgrid=True, gridcolor=CHART_GRID,
         zeroline=False, showspikes=True, spikemode='across', spikesnap='cursor',
         spikecolor='rgba(59,130,246,0.65)', spikethickness=1, spikedash='dot',
         showline=False,
@@ -3113,10 +3102,10 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
 
     fig.update_layout(
         height=610,
-        template='plotly_dark',
-        paper_bgcolor='#0b121b',
-        plot_bgcolor='#0b121b',
-        font=dict(color='#9aa7b8', size=11, family='Inter, Noto Sans TC, sans-serif'),
+        template=CHART_TEMPLATE,
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=CHART_TEXT, size=11, family='Inter, Noto Sans TC, sans-serif'),
         # 右側預留空間，避免價格刻度文字被截斷。
         margin=dict(l=10, r=74, t=18, b=12),
         # 使用 closest + x/y spikelines，讓滑鼠移到圖上時有近似 TradingView 的十字準線。
@@ -3125,8 +3114,8 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
         hoverdistance=80,
         spikedistance=-1,
         hoverlabel=dict(
-            bgcolor='#111a26', bordercolor='rgba(59,130,246,0.45)',
-            font=dict(size=12, color='#e6edf3', family='Roboto Mono, monospace'),
+            bgcolor=CHART_HOVER_BG, bordercolor='rgba(59,130,246,0.45)',
+            font=dict(size=12, color=CHART_TEXT_STRONG, family='Roboto Mono, monospace'),
             namelength=0,
         ),
         legend=dict(
@@ -3138,7 +3127,7 @@ def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted
         bargap=0.18,
         xaxis=dict(**spike_cfg, fixedrange=True, rangeslider=dict(visible=False), tickmode='array', tickvals=tick_vals, ticktext=tick_text, tickangle=0, tickfont=dict(size=11), automargin=True),
         yaxis=dict(
-            fixedrange=True, side='right', showgrid=True, gridcolor='rgba(148,163,184,0.09)',
+            fixedrange=True, side='right', showgrid=True, gridcolor=CHART_GRID,
             zeroline=False, tickfont=dict(size=11, color='#cbd5e1'),
             # 水平準線：滑鼠移到 K 線圖上時，顯示對應價位的水平線。
             showspikes=True, spikemode='across+toaxis', spikesnap='cursor',
@@ -3193,7 +3182,7 @@ def render_kline_chart_with_axis_price(fig, height=640):
     )
 
     html = f"""
-    <div id="{wrap_id}" style="position:relative;width:100%;height:{height}px;background:#0b121b;overflow:hidden;">
+    <div id="{wrap_id}" style="position:relative;width:100%;height:{height}px;background:{CHART_BG};overflow:hidden;">
       {plot_html}
       <div id="{line_id}" style="display:none;position:absolute;height:0;border-top:1px dashed rgba(203,213,225,.88);pointer-events:none;z-index:9998;"></div>
       <div id="{label_id}" style="display:none;position:absolute;min-width:58px;padding:3px 8px;border-radius:4px;background:#2563eb;color:#ffffff;font-family:Roboto Mono,Consolas,monospace;font-size:12px;font-weight:700;text-align:center;line-height:18px;box-shadow:0 0 0 1px rgba(191,219,254,.45),0 6px 18px rgba(0,0,0,.35);pointer-events:none;z-index:9999;"></div>
@@ -3368,7 +3357,7 @@ def get_tw_stock_news(code):
                 if len(title) < 8 or title in seen_titles:
                     continue
                 full_link = href if href.startswith('http') else "https://tw.stock.yahoo.com" + href
-                sentiment, color = "💡 資訊", "#8b949e"
+                sentiment, color = "💡 資訊", "var(--muted)"
                 if any(w in title for w in pos_words):
                     sentiment, color = "📈 利多", "#22ab94"
                 elif any(w in title for w in neg_words):
@@ -3659,212 +3648,264 @@ def build_investment_report(row_data: dict, closes: pd.Series, industry_peers: p
 
 
 # ============================================================
-# 3. 全域 CSS（TradingView 機構終端機風格）
+# 3. 全域 CSS（雙主題設計系統：留白 + 細邊框 + 單一主色）
 # ============================================================
+# [改版] 設計原則：
+#   - 8px 間距階層、5 階字級（12/13.5/15/17/22）、字重只用 400/600/700
+#   - 區塊用「留白＋細分隔線」取代漸層卡片與陰影堆疊，唯一保留陰影的是報價面板
+#   - 唯一主色 var(--blue)，漲跌紅綠只在數字上出現，不再滿版發光
+#   - 各 section 的長說明改為收合式 <details>，預設只顯示「ⓘ 說明」小標
+#   - 所有顏色皆來自 :root CSS 變數 → 深／淺主題切換只要換一組變數
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600;700;800&display=swap');
+_BASE_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Roboto+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600;700&display=swap');
 
-:root{
-  --bg:#070d17;
-  --surface:#0d1624;
-  --surface-2:#111d2d;
-  --surface-3:#162337;
-  --border:rgba(148,163,184,.16);
-  --border-strong:rgba(110,168,254,.38);
-  --text:#e8eef8;
-  --muted:#8796aa;
-  --accent:#6ea8fe;
-  --blue:#6ea8fe;
-  --accent-strong:#3b82f6;
-  --green:#36c99a;
-  --red:#ff6b7a;
-  --yellow:#f8c766;
-  --shadow:0 12px 30px rgba(0,0,0,.18);
-  --radius:16px;
-}
-
+/* ── 隱藏 Streamlit 原生外框 ── */
 [data-testid='stHeader'],[data-testid='stToolbar'],[data-testid='stSidebar'],
 [data-testid='collapsedControl'],[data-testid='stSidebarCollapseButton']{display:none!important;}
 
+/* ── 版心與基礎文字 ── */
 html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
-  background:
-    radial-gradient(circle at 18% -10%,rgba(59,130,246,.12),transparent 30%),
-    radial-gradient(circle at 92% 0%,rgba(54,201,154,.06),transparent 24%),
-    var(--bg)!important;
-  color:var(--text)!important;
-  font-family:'Inter','Noto Sans TC',sans-serif!important;
+ background:var(--bg)!important;color:var(--text)!important;
+ font-family:'Inter','Noto Sans TC',sans-serif!important;
 }
+.block-container{max-width:1440px!important;padding:20px 28px 72px!important;}
+[data-testid='stMarkdownContainer'],[data-testid='stMarkdownContainer'] p{color:var(--text);}
+[data-testid='stCaptionContainer'],[data-testid='stCaptionContainer'] p{color:var(--muted)!important;font-size:12px!important;line-height:1.7;}
+[data-testid='stWidgetLabel'] p{color:var(--text2)!important;font-size:12.5px!important;font-weight:600!important;}
+a{color:var(--blue);}
+hr{border-color:var(--divider)!important;}
 
-.block-container{max-width:1680px!important;padding:22px 30px 72px!important;}
+/* ── 頁首細條（唯一的「招牌」元件：終端條）── */
+.app-bar{display:flex;justify-content:space-between;align-items:center;gap:16px;
+ padding:10px 2px 14px;border-bottom:1px solid var(--divider);margin-bottom:4px;flex-wrap:wrap;}
+.app-bar-left{display:flex;align-items:center;gap:18px;flex-wrap:wrap;}
+.app-name{font-size:17px;font-weight:700;letter-spacing:.3px;color:var(--text);}
+.app-steps{display:inline-flex;gap:6px;flex-wrap:wrap;}
+.step-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+ border:1px solid var(--divider);color:var(--muted);font-size:11.5px;font-weight:600;background:transparent;}
+.step-chip i{font-style:normal;display:inline-flex;width:16px;height:16px;border-radius:50%;
+ align-items:center;justify-content:center;font-size:10px;background:var(--surface2);color:var(--muted);}
+.step-chip.on{border-color:rgba(90,141,238,.45);color:var(--text2);}
+.step-chip.on i{background:rgba(90,141,238,.16);color:var(--blue);}
+.app-meta{display:inline-flex;align-items:center;gap:10px;color:var(--muted);
+ font-family:'Roboto Mono',monospace;font-size:12px;white-space:nowrap;}
+.meta-chip{padding:3px 10px;border-radius:999px;border:1px solid var(--divider);color:var(--text2);}
 
-/* ── 頁首：單一主視覺，不再堆疊厚重卡片 ── */
-.app-hero{
-  display:flex;justify-content:space-between;align-items:center;gap:28px;
-  padding:26px 28px;margin-bottom:12px;
-  background:linear-gradient(115deg,rgba(17,29,45,.98),rgba(10,18,30,.98));
-  border:1px solid var(--border);border-radius:22px;box-shadow:var(--shadow);
-  position:relative;overflow:hidden;
-}
-.app-hero:after{content:'';position:absolute;right:-70px;top:-110px;width:250px;height:250px;border-radius:50%;background:rgba(110,168,254,.09);filter:blur(2px);pointer-events:none;}
-.app-kicker{font-size:11px;font-weight:800;letter-spacing:.16em;color:var(--accent);margin-bottom:8px;}
-.app-title{font-size:31px;font-weight:800;letter-spacing:-.02em;color:#f7faff;line-height:1.2;}
-.app-sub{max-width:820px;font-size:13px;color:var(--muted);margin-top:9px;line-height:1.8;}
-.app-meta{display:grid;grid-template-columns:repeat(2,minmax(112px,1fr));gap:10px;min-width:270px;z-index:1;}
-.meta-item{padding:12px 14px;border:1px solid var(--border);border-radius:13px;background:rgba(255,255,255,.025);}
-.meta-k{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;}
-.meta-v{margin-top:5px;font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;color:#f4f8ff;white-space:nowrap;}
+/* ── 區塊標題與收合式說明 ── */
+.section-head{display:flex;justify-content:space-between;align-items:end;margin:28px 0 12px;}
+.section-title{display:inline;font-size:17px;font-weight:700;color:var(--text);letter-spacing:.2px;}
+details.section-help{display:block;margin-top:4px;}
+details.section-help summary{display:inline-flex;align-items:center;cursor:pointer;list-style:none;
+ font-size:11px;font-weight:600;color:var(--muted);padding:2px 9px;border-radius:999px;
+ border:1px solid var(--divider);user-select:none;transition:color .15s,border-color .15s;}
+details.section-help summary::-webkit-details-marker{display:none;}
+details.section-help summary:hover{color:var(--text2);border-color:var(--border);}
+details.section-help[open] summary{color:var(--blue);border-color:rgba(90,141,238,.4);}
+details.section-help .sh-body{margin-top:6px;max-width:760px;font-size:12px;line-height:1.75;color:var(--muted);}
+.candidate-row-hint{font-size:11.5px;color:var(--muted);margin:2px 0 8px;line-height:1.65;}
 
-/* ── 精簡步驟條 ── */
-.workflow{display:flex;align-items:center;gap:6px;margin:0 0 18px;padding:0 4px;overflow-x:auto;}
-.workflow-step{display:flex;align-items:center;gap:7px;padding:8px 10px;color:#66778e;font-size:11px;font-weight:700;white-space:nowrap;}
-.workflow-step:not(:last-child):after{content:'›';margin-left:7px;color:#35465c;font-size:15px;}
-.workflow-step b{display:inline-flex;width:21px;height:21px;border-radius:50%;align-items:center;justify-content:center;background:#111c2c;border:1px solid var(--border);color:#6f8097;font-size:10px;}
-.workflow-step.active{color:#cdd9e8;}.workflow-step.active b{background:rgba(110,168,254,.14);border-color:var(--border-strong);color:#9fc5ff;}
+/* ── 面板：平面化，surface 底 + 細邊框，不再層層陰影 ── */
+.control-shell,.tv-panel,.tv-card,.side-card{
+ background:var(--surface)!important;border:1px solid var(--border)!important;
+ border-radius:12px!important;box-shadow:none!important;}
+.control-shell{padding:14px 18px 16px;margin-bottom:16px;}
+.control-note{padding:12px 14px;border-radius:10px;background:var(--surface2);
+ border:1px solid var(--divider);color:var(--text2);font-size:12.5px;line-height:1.75;}
+[data-testid='stVerticalBlockBorderWrapper']{border:1px solid var(--border)!important;
+ border-radius:12px!important;background:var(--surface)!important;}
+[data-testid='stVerticalBlockBorderWrapper'] [data-testid='stVerticalBlockBorderWrapper']{
+ border:0!important;background:transparent!important;}
 
-/* ── 頂層導覽 ── */
-[data-baseweb='tab-list']{
-  position:sticky;top:0;z-index:50;
-  gap:4px;background:rgba(9,16,27,.88);backdrop-filter:blur(14px);
-  border:1px solid var(--border);border-radius:15px;padding:5px;margin:0 0 24px;overflow-x:auto;
-}
-[data-baseweb='tab']{height:42px;border-radius:10px;padding:0 17px;color:var(--muted)!important;font-size:13px!important;font-weight:700!important;white-space:nowrap;}
-[data-baseweb='tab']:hover{background:rgba(255,255,255,.035)!important;color:#d9e4f2!important;}
-[data-baseweb='tab'][aria-selected='true']{background:var(--surface-3)!important;color:#fff!important;box-shadow:inset 0 0 0 1px rgba(110,168,254,.28);}
+/* ── 指標卡 ── */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;}
+.tv-card{padding:14px 16px;}
+.tv-label{color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.06em;}
+.tv-value{font-family:'Roboto Mono',monospace;font-size:22px;font-weight:700;margin-top:6px;color:var(--text);}
+.tv-caption{color:var(--muted);font-size:12px;margin-top:5px;line-height:1.6;}
+.tv-section{font-size:15px;font-weight:700;color:var(--text);margin:26px 0 8px;letter-spacing:.02em;}
+
+/* ── 報價面板（唯一保留陰影的視覺重心）── */
+.quote-panel{padding:18px 20px;margin:14px 0 12px;background:var(--surface);
+ border:1px solid var(--border);border-radius:14px;box-shadow:0 10px 30px rgba(8,16,30,.10);}
+.quote-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.quote-title{font-size:20px;font-weight:700;color:var(--text);}
+.quote-tag,.bias-chip{border:1px solid var(--divider);background:var(--surface2);
+ border-radius:999px;padding:4px 10px;color:var(--text2);font-size:11.5px;font-weight:600;}
+.quote-price{font-family:'Roboto Mono',monospace;font-size:32px;font-weight:700;color:var(--green);line-height:1.3;}
+.quote-change{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:600;margin-left:8px;}
+.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(110px,1fr));gap:12px;margin-top:12px;max-width:680px;}
+.metric-k{color:var(--muted);font-size:11px;font-weight:600;}
+.metric-v{font-family:'Roboto Mono',monospace;font-size:14.5px;font-weight:600;margin-top:3px;color:var(--text);}
+
+/* ── 側卡與清單列 ── */
+.side-card{padding:16px;margin-bottom:12px;}
+.side-title{display:flex;justify-content:space-between;gap:8px;font-size:15px;font-weight:700;margin-bottom:10px;color:var(--text);}
+.report-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--divider);
+ padding:8px 0;color:var(--text2);font-size:13px;}
+.radar-check{font-size:13px;line-height:1.9;color:var(--text2);}
+.radar-check b{color:var(--green);margin-right:7px;}
+
+/* ── 頁籤：底線式，取代滿版膠囊 ── */
+[data-baseweb='tab-list']{gap:2px;background:transparent;border:0;border-bottom:1px solid var(--divider);
+ border-radius:0;padding:0;margin:2px 0 20px;overflow-x:auto;}
+[data-baseweb='tab']{height:42px;border-radius:8px 8px 0 0;padding:0 16px;color:var(--muted)!important;
+ font-weight:600!important;font-size:14px!important;white-space:nowrap;background:transparent!important;
+ border-bottom:2px solid transparent!important;transition:color .15s;}
+[data-baseweb='tab']:hover{color:var(--text2)!important;}
+[data-baseweb='tab'][aria-selected='true']{color:var(--blue)!important;
+ border-bottom:2px solid var(--blue)!important;background:transparent!important;box-shadow:none;}
 [data-baseweb='tab-highlight']{display:none!important;}
-[data-baseweb='tab-panel']{padding-top:0;}
+[data-baseweb='tab-panel']{padding-top:2px;}
 
-/* ── 標題與留白 ── */
-.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:30px 0 14px;}
-.section-title{font-size:18px;font-weight:800;letter-spacing:-.01em;color:#f3f7fd;}
-.section-help{font-size:12px;color:var(--muted);line-height:1.65;}
-.tv-section{font-size:15px;font-weight:800;color:#edf3fb;margin:18px 0 10px;}
-.candidate-row-hint{font-size:11.5px;color:var(--muted);margin:3px 0 10px;line-height:1.6;}
-
-/* ── 統一卡片語言：低陰影、細邊框、較大留白 ── */
-.tv-panel,.tv-card,.side-card,.quote-panel,.news-card,[data-testid='stDataFrame']{
-  background:var(--surface)!important;border:1px solid var(--border)!important;border-radius:var(--radius)!important;box-shadow:none!important;
-}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:0 0 20px;}
-.tv-card{padding:17px 18px;min-height:104px;}
-.tv-label{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;}
-.tv-value{font-family:'Roboto Mono',monospace;font-size:27px;font-weight:700;margin-top:9px;color:#f4f8ff;line-height:1.15;}
-.tv-caption{color:var(--muted);font-size:11.5px;margin-top:7px;line-height:1.55;}
-.side-card{padding:18px;margin-bottom:13px;}
-.side-title{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:15px;font-weight:800;margin-bottom:10px;}
-.report-row{display:flex;justify-content:space-between;gap:18px;border-bottom:1px solid rgba(148,163,184,.11);padding:10px 0;color:#cbd6e4;font-size:13px;}
-.report-row:last-child{border-bottom:0;}
-.radar-check{font-size:13px;line-height:1.95;color:#c8d4e3;}.radar-check b{color:var(--green);margin-right:7px;}
-
-/* ── Streamlit 容器與表單 ── */
-[data-testid='stVerticalBlockBorderWrapper']{background:var(--surface)!important;border-color:var(--border)!important;border-radius:var(--radius)!important;box-shadow:none!important;}
-.st-key-scan_control_panel [data-testid='stVerticalBlockBorderWrapper']{padding:8px 4px 2px;}
-.st-key-candidate_sidebar [data-testid='stVerticalBlockBorderWrapper']{position:sticky;top:70px;max-height:calc(100vh - 92px);overflow-y:auto;}
-.control-note{padding:15px 16px;border-radius:13px;background:rgba(110,168,254,.07);border:1px solid rgba(110,168,254,.20);color:#bdcce0;font-size:13px;line-height:1.75;min-height:100%;}
-.strategy-badge{display:inline-block;background:rgba(110,168,254,.11);color:#9fc5ff;border:1px solid rgba(110,168,254,.25);border-radius:999px;padding:3px 9px;font-size:9px;font-weight:800;letter-spacing:.08em;margin-left:7px;}
-
-[data-baseweb='select']>div,[data-testid='stTextInput'] input,[data-testid='stNumberInput'] input{
-  background:#0a1320!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:10px!important;min-height:42px!important;
-}
-[data-baseweb='select']>div:focus-within,[data-testid='stTextInput'] input:focus,[data-testid='stNumberInput'] input:focus{border-color:var(--border-strong)!important;box-shadow:0 0 0 3px rgba(59,130,246,.10)!important;}
-label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!important;font-weight:700!important;}
-.stSlider{padding-top:4px;}
-
+/* ── 按鈕 ── */
 [data-testid='stButton']>button,[data-testid='stDownloadButton']>button{
-  min-height:40px!important;border-radius:10px!important;border:1px solid var(--border)!important;
-  background:#121f31!important;color:#e8eef8!important;font-weight:700!important;font-size:12px!important;transition:.16s ease!important;
-}
-[data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{border-color:rgba(110,168,254,.45)!important;background:#17283f!important;color:#fff!important;box-shadow:none!important;}
-[data-testid='stButton']>button[kind='primary']{background:var(--accent-strong)!important;border-color:#5a96f5!important;color:#fff!important;}
-[data-testid='stButton']>button[kind='primary']:hover{background:#4a8df5!important;}
+ border-radius:9px!important;border:1px solid var(--border)!important;background:var(--surface2)!important;
+ color:var(--text)!important;font-weight:600!important;min-height:38px!important;transition:.15s ease!important;}
+[data-testid='stButton']>button:hover,[data-testid='stDownloadButton']>button:hover{
+ border-color:var(--blue)!important;box-shadow:0 0 0 3px rgba(90,141,238,.14)!important;}
+[data-testid='stButton']>button[kind='primary']{background:var(--blue)!important;
+ border-color:var(--blue)!important;color:#fff!important;}
+[data-testid='stButton']>button:focus-visible,[data-testid='stDownloadButton']>button:focus-visible{
+ outline:2px solid var(--blue)!important;outline-offset:2px;}
 
-[data-testid='stExpander']{background:transparent!important;border:0!important;margin:6px 0 14px;}
-[data-testid='stExpander'] details{background:rgba(13,22,36,.62)!important;border:1px solid var(--border)!important;border-radius:14px!important;overflow:hidden;}
-[data-testid='stExpander'] summary{font-weight:750!important;color:#dce6f3!important;font-size:13px!important;padding:4px 2px!important;}
-[data-testid='stAlert']{border-radius:12px!important;background:rgba(110,168,254,.07)!important;border:1px solid rgba(110,168,254,.20)!important;}
+/* ── 輸入元件 ── */
+[data-testid='stNumberInput'] input,[data-testid='stTextInput'] input{
+ background:var(--surface2)!important;border:1px solid var(--border)!important;
+ color:var(--text)!important;border-radius:9px!important;}
+[data-testid='stNumberInput'] button{background:var(--surface2)!important;color:var(--text2)!important;border-color:var(--border)!important;}
+[data-baseweb='select']>div{background:var(--surface2)!important;border-color:var(--border)!important;
+ color:var(--text)!important;border-radius:9px!important;}
+[data-baseweb='select'] div{color:var(--text)!important;}
+[data-baseweb='select'] svg{fill:var(--muted)!important;}
+[data-baseweb='popover'] [data-baseweb='menu'],[data-baseweb='popover'] ul{
+ background:var(--surface)!important;border:1px solid var(--border)!important;}
+[data-baseweb='popover'] li{color:var(--text)!important;background:var(--surface)!important;}
+[data-baseweb='popover'] li:hover,[data-baseweb='popover'] li[aria-selected='true']{background:var(--surface2)!important;}
+.stSlider{padding-top:2px;}
+.stSlider [data-testid='stTickBar']{color:var(--muted);}
+[data-testid='stExpander']{background:transparent!important;border:1px solid var(--divider)!important;border-radius:10px!important;}
+[data-testid='stExpander'] details{border:0!important;background:transparent!important;}
+[data-testid='stExpander'] summary{font-weight:600!important;color:var(--text)!important;font-size:14px!important;}
+[data-testid='stAlert']{border-radius:10px!important;background:var(--surface2)!important;
+ border:1px solid var(--divider)!important;color:var(--text2)!important;}
+[data-testid='stAlert'] p{color:var(--text2)!important;}
 
-/* ── 乾淨進度條 ── */
-[data-testid='stProgress']{margin:10px 0 5px;}
-[data-testid='stProgress']>div{background:#111d2d!important;border-radius:999px!important;height:12px!important;border:1px solid var(--border)!important;overflow:hidden!important;}
-[data-testid='stProgress']>div>div{background:linear-gradient(90deg,var(--accent-strong),var(--green))!important;border-radius:999px!important;box-shadow:none!important;}
-[data-testid='stProgress'] p{color:#cdd9e8!important;font-weight:700!important;font-size:12px!important;font-family:'Roboto Mono',monospace!important;margin-bottom:5px!important;}
+/* ── 進度條：平面、保留百分比文字與輕微流動 ── */
+[data-testid='stProgress']{margin:6px 0 4px;}
+[data-testid='stProgress']>div{background:var(--surface2)!important;border-radius:999px!important;
+ height:18px!important;border:1px solid var(--divider)!important;box-shadow:none!important;}
+[data-testid='stProgress']>div>div{background:linear-gradient(90deg,var(--blue),#6fa4f5)!important;
+ background-size:200% 100%!important;animation:flow 3s linear infinite!important;
+ border-radius:999px!important;box-shadow:none!important;min-width:18px!important;}
+[data-testid='stProgress'] p{color:var(--text2)!important;font-weight:600!important;font-size:12.5px!important;
+ font-family:'Roboto Mono',monospace!important;margin-bottom:4px!important;}
+@keyframes flow{0%{background-position:0% 0%}100%{background-position:200% 0%}}
+@media (prefers-reduced-motion:reduce){[data-testid='stProgress']>div>div{animation:none!important;}}
 
-/* ── 報價主卡 ── */
-.quote-panel{padding:22px 24px;margin:12px 0 18px;position:relative;overflow:hidden;}
-.quote-panel:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
-.quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
-.quote-title{font-size:23px;font-weight:800;letter-spacing:-.015em;}
-.quote-tag,.bias-chip{border:1px solid var(--border);background:#121e2f;border-radius:999px;padding:4px 9px;color:#aebdd0;font-size:10.5px;font-weight:700;}
-.quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;color:var(--green);line-height:1.2;letter-spacing:-.04em;}
-.quote-change{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-left:9px;}
-.quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-top:15px;max-width:720px;}
-.quote-metrics>div{padding:10px 12px;background:rgba(255,255,255,.022);border:1px solid rgba(148,163,184,.10);border-radius:11px;}
-.metric-k{color:var(--muted);font-size:10px;font-weight:700;}.metric-v{font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;margin-top:4px;}
-.hot-tag{background:rgba(248,145,75,.12)!important;border-color:rgba(248,145,75,.32)!important;color:#ffb17a!important;}.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
-.detail-nav-title{font-size:11px;font-weight:800;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;margin:4px 0 7px;}
-
-/* ── 工作台 ── */
-.workspace-left{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;max-height:900px;overflow-y:auto;}
-.workspace-right{min-height:600px;}
-.workspace-left [data-testid='stDataFrame']{border:0!important;}
-[data-testid='stDataFrame']{overflow:hidden!important;}
+/* ── 資料表格 ── */
+[data-testid='stDataFrame']{background:var(--surface)!important;border:1px solid var(--divider)!important;
+ border-radius:10px!important;box-shadow:none!important;overflow:hidden!important;}
 [data-testid='stDataFrame'] *{font-family:'Roboto Mono','Noto Sans TC',monospace!important;}
-.news-card{padding:16px 18px!important;margin-bottom:11px!important;}.news-title:hover{color:#9fc5ff!important;}
 
-/* 手機候選卡 */
-.st-key-desktop_candidate_list{display:block;}.st-key-mobile_candidate_list{display:none;}
-.mobile-stock-card{background:var(--surface-2);border:1px solid var(--border);border-radius:13px;padding:13px 14px;margin-bottom:9px;}
-.mobile-stock-card .msc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;}
-.mobile-stock-card .msc-name{font-size:14px;font-weight:800;color:#f2f6fc;}.mobile-stock-card .msc-code{color:var(--muted);font-size:11px;margin-left:6px;}
-.mobile-stock-card .msc-score{font-family:'Roboto Mono',monospace;font-weight:700;font-size:16px;color:var(--accent);}
-.mobile-stock-card .msc-metrics{display:flex;gap:13px;font-family:'Roboto Mono',monospace;font-size:12px;color:#c8d4e3;}.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
+/* ── 個股工作台分段切換（安靜膠囊）── */
+[data-testid='stButtonGroup']{display:flex!important;flex-wrap:wrap!important;gap:8px!important;
+ background:transparent!important;border:none!important;padding:0!important;box-shadow:none!important;margin:2px 0 18px!important;}
+[data-testid^='stBaseButton-segmented_control']{font-family:'Inter','Noto Sans TC',sans-serif!important;
+ font-weight:600!important;font-size:13px!important;padding:8px 16px!important;border-radius:999px!important;
+ white-space:nowrap!important;transition:all .15s ease!important;}
+[data-testid='stBaseButton-segmented_control']{background:transparent!important;
+ border:1px solid var(--divider)!important;color:var(--muted)!important;}
+[data-testid='stBaseButton-segmented_control']:hover{border-color:var(--border)!important;color:var(--text2)!important;}
+[data-testid='stBaseButton-segmented_controlActive']{background:rgba(90,141,238,.13)!important;
+ border:1px solid rgba(90,141,238,.5)!important;color:var(--blue)!important;font-weight:700!important;box-shadow:none!important;}
 
-::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#09111d}::-webkit-scrollbar-thumb{background:#26364b;border-radius:999px}::-webkit-scrollbar-thumb:hover{background:#334862}
-
-@media(max-width:1100px){
-  .block-container{padding:18px 18px 52px!important;}
-  .app-hero{align-items:flex-start;}.app-meta{min-width:230px;}
-  .st-key-candidate_sidebar [data-testid='stVerticalBlockBorderWrapper']{position:static;max-height:none;}
+/* ── 桌面／手機候選清單切換 + 桌面左欄 sticky ── */
+.st-key-desktop_candidate_list{display:block;}
+.st-key-mobile_candidate_list{display:none;}
+@media(min-width:1001px){
+  [data-testid='stColumn']:has(.st-key-desktop_candidate_list){position:sticky;top:16px;align-self:flex-start;}
 }
-@media(max-width:850px){
-  .app-hero{display:block;padding:22px;}.app-meta{margin-top:18px;max-width:360px;min-width:0;}
-  .section-help{display:none;}.quote-metrics{grid-template-columns:1fr 1fr;}
+.mobile-stock-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:8px;}
+.mobile-stock-card .msc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+.mobile-stock-card .msc-name{font-size:15px;font-weight:700;color:var(--text);}
+.mobile-stock-card .msc-code{color:var(--muted);font-size:12px;margin-left:6px;}
+.mobile-stock-card .msc-score{font-family:'Roboto Mono',monospace;font-weight:700;font-size:16px;color:var(--blue);}
+.mobile-stock-card .msc-metrics{display:flex;gap:14px;font-family:'Roboto Mono',monospace;font-size:12.5px;color:var(--text2);}
+.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
+
+/* ── 標籤 ── */
+.strategy-badge{display:inline-block;background:rgba(90,141,238,.13);color:var(--blue);
+ border:1px solid rgba(90,141,238,.3);border-radius:999px;padding:2px 10px;font-size:11px;font-weight:600;margin-left:8px;}
+.hot-tag{background:rgba(255,138,61,.14)!important;border-color:rgba(255,138,61,.45)!important;color:#e8823c!important;font-weight:700!important;}
+.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
+.news-card{background:var(--surface)!important;border:1px solid var(--divider)!important;border-radius:12px!important;}
+.news-title:hover{color:var(--blue)!important;}
+
+/* ── 捲軸 ── */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:999px}
+
+/* ── RWD ── */
+@media(max-width:1000px){
+  .block-container{padding:14px 14px 48px!important}
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .app-meta{display:none}
+  [data-testid='stButton']>button,[data-testid='stDownloadButton']>button{min-height:44px!important;}
 }
 @media(max-width:760px){
-  .block-container{padding:14px 12px 40px!important;}.app-title{font-size:25px;}.app-meta{grid-template-columns:1fr 1fr;}
-  .workflow{padding:0;}.workflow-step{font-size:10px;padding:7px 5px;}.workflow-step:not(:last-child):after{margin-left:4px;}
-  .stat-grid,.quote-metrics{grid-template-columns:1fr;}.quote-price{font-size:34px;}.quote-panel{padding:19px 17px;}
-  .st-key-desktop_candidate_list{display:none;}.st-key-mobile_candidate_list{display:block;}
+  .stat-grid,.quote-metrics{grid-template-columns:1fr}
+  .app-name{font-size:16px}
+  .app-steps{display:none}
+  .quote-price{font-size:28px}
+  .st-key-desktop_candidate_list{display:none;}
+  .st-key-mobile_candidate_list{display:block;}
 }
-</style>
-""", unsafe_allow_html=True)
+"""
+
+def build_global_css(pal: dict) -> str:
+    """由調色盤組出完整 <style> 區塊：:root 變數 + 共用樣式。
+    chart_* 開頭的鍵是 Plotly 專用常數，不需要輸出成 CSS 變數。"""
+    root_vars = "".join(
+        f"--{k}:{v};" for k, v in pal.items() if not k.startswith("chart_")
+    )
+    return "<style>:root{" + root_vars + "}" + _BASE_CSS + "</style>"
+
+st.markdown(build_global_css(PAL), unsafe_allow_html=True)
+
 
 # ============================================================
-# 4. 頁首與操作流程
+# 4. 頁首細條（App Bar）
 # ============================================================
+# [改版] 原本的大 Hero 橫幅 + 四格 workflow 步驟條合併成一列細頂欄：
+# 左側 = 標題 + 迷你步驟膠囊（仍會隨掃描進度亮起），右側 = 訊號數、
+# 資料時間與深／淺主題切換。垂直空間從 ~180px 縮到 ~56px，
+# 原本 app-sub 的功能說明移到標題的 title 屬性（滑鼠停留可見）。
 _now_str = get_tw_now().strftime("%Y-%m-%d %H:%M")
 _signal_count = len(st.session_state.scan_results) if isinstance(st.session_state.scan_results, pd.DataFrame) else 0
 _current_step = 3 if _signal_count else (2 if st.session_state.is_scanning else 1)
-st.markdown(f"""
-<div class="app-hero">
-  <div>
-    <div class="app-kicker">TAIWAN EQUITY INTELLIGENCE</div>
-    <div class="app-title">台股決策中心</div>
-    <div class="app-sub">從全市場策略掃描，到個股技術面、基本面、法人籌碼與研究報告，集中在同一個清楚的分析工作台。</div>
-  </div>
-  <div class="app-meta">
-    <div class="meta-item"><div class="meta-k">目前訊號</div><div class="meta-v">{_signal_count} 檔</div></div>
-    <div class="meta-item"><div class="meta-k">資料時間</div><div class="meta-v">{_now_str}</div></div>
-  </div>
-</div>
-<div class="workflow">
-  <div class="workflow-step {'active' if _current_step >= 1 else ''}"><b>1</b>設定策略</div>
-  <div class="workflow-step {'active' if _current_step >= 2 else ''}"><b>2</b>掃描市場</div>
-  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>3</b>挑選標的</div>
-  <div class="workflow-step {'active' if _current_step >= 3 else ''}"><b>4</b>深入研究</div>
-</div>
-""", unsafe_allow_html=True)
+_step_names = ["設定條件", "全市場掃描", "挑選候選股", "圖表與分析"]
+_step_states = [1, 2, 3, 3]  # 各步驟在 _current_step 達到多少時亮起
+_steps_html = "".join(
+    f'<span class="step-chip {"on" if _current_step >= need else ""}"><i>{i}</i>{name}</span>'
+    for i, (name, need) in enumerate(zip(_step_names, _step_states), 1)
+)
+hd_main, hd_theme = st.columns([5.4, 1], vertical_alignment="center")
+with hd_main:
+    st.markdown(f"""
+    <div class="app-bar">
+      <div class="app-bar-left">
+        <span class="app-name" title="依均線多頭排列、乖離率與成交量快速篩選，再整合財務評分、K 線、營收、本益比與個股新聞。">台股智慧選股</span>
+        <span class="app-steps">{_steps_html}</span>
+      </div>
+      <div class="app-meta"><span class="meta-chip">訊號 {_signal_count} 檔</span><span>{_now_str}</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+with hd_theme:
+    # widget 狀態在 rerun 開始前就已更新，因此頁面最上方的 get_ui_theme_name()
+    # 能在同一次 rerun 讀到新值，CSS 與圖表主題同步切換。
+    st.toggle("☀️ 淺色", key="ui_theme_toggle", help="切換深色／淺色主題，圖表配色會一起切換。")
 
 
 # ============================================================
@@ -3878,18 +3919,20 @@ user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
 tab_scan, tab_workspace, tab_watchlist, tab_report = st.tabs([
-    "市場掃描",
-    "個股工作台",
-    "追蹤清單",
-    "研究報告",
+    "🔍 選股掃描",
+    "📊 候選與分析工作台",
+    "⭐ 自選股追蹤",
+    "📑 投資分析報告",
 ])
 
 # ------------------------------------------------------------
 # TAB 1：選股掃描
 # ------------------------------------------------------------
 with tab_scan:
-    st.markdown('<div class="section-head"><div><div class="section-title">設定掃描條件</div><div class="section-help">條件越嚴格，候選股票通常越少；第一次使用可保留預設值。</div></div></div>', unsafe_allow_html=True)
-    with st.container(border=True, key="scan_control_panel"):
+    st.markdown('<div class="section-head"><div><div class="section-title">設定掃描條件</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">條件越嚴格，候選股票通常越少；第一次使用可保留預設值。</div></details></div></div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="control-shell">', unsafe_allow_html=True)
+
         # [新功能] 策略選單：切換策略時，下方參數與說明會跟著換
         strategy_name = st.selectbox(
             "選股策略", list(STRATEGY_REGISTRY.keys()),
@@ -3926,6 +3969,7 @@ with tab_scan:
                 help="排除流動性較低的股票。"
             )
             st.session_state.user_vol = mb_vol
+        st.markdown('</div>', unsafe_allow_html=True)
 
     user_vol = st.session_state.user_vol
     param_value = st.session_state[f"strategy_param__{strategy_name}"]
@@ -4033,18 +4077,19 @@ with tab_scan:
         avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
         st.markdown(f"""
-        <div class="stat-grid" style="margin-top:20px;">
-          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次掃描候選股票</div></div>
-          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">候選標的平均分數</div></div>
-          <div class="tv-card"><div class="tv-label">高分候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
+        <div class="stat-grid" style="margin-top:18px;">
+          <div class="tv-card"><div class="tv-label">最近掃描結果</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">符合條件股票</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">下一步</div><div class="tv-value" style="font-size:18px">候選與分析工作台</div><div class="tv-caption">切換下一個頁籤選股並看圖</div></div>
         </div>
         """, unsafe_allow_html=True)
     elif not st.session_state.is_scanning:
         st.markdown("""
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:18px;">
           <div style="font-size:40px;margin-bottom:12px;">🔎</div>
-          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">尚未產生掃描結果</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「個股工作台」頁籤。</div>
+          <div style="font-size:20px;font-weight:700;color:var(--text);">尚未產生掃描結果</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「候選與分析工作台」頁籤。</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -4079,11 +4124,9 @@ def render_manual_search_box(key_suffix: str, with_border: bool = True):
     抽成函式方便在不同位置重複渲染（例如右欄工作台頂端、或完全沒有候選股票時的
     空狀態），用 key_suffix 讓每個位置的 widget key 不會互相衝突。
     """
-    ctx = (st.expander("快速查詢其他股票", expanded=False)
-           if key_suffix == "panel"
-           else st.container(border=with_border, key=f"manual_search_{key_suffix}"))
+    ctx = st.container(border=with_border)
     with ctx:
-        st.markdown('<div class="candidate-row-hint">輸入上市／上櫃股票代碼，即可直接開啟完整個股分析，不必重新執行全市場掃描。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:6px;">🔍 手動查詢個股</div><div class="candidate-row-hint">輸入上市／上櫃代碼即可直接查看個股工作台，不必等掃描完成。</div>', unsafe_allow_html=True)
         msc1, msc2 = st.columns([3, 1])
         with msc1:
             manual_code_input = st.text_input(
@@ -4121,18 +4164,18 @@ with tab_workspace:
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
         st.markdown(f"""
         <div class="stat-grid">
-          <div class="tv-card"><div class="tv-label">候選股票</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">目前策略掃描結果</div></div>
-          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">候選標的整體品質</div></div>
-          <div class="tv-card"><div class="tv-label">高分候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">符合條件</div><div class="tv-value">{len(scan_df)}</div><div class="tv-caption">本次候選股票</div></div>
+          <div class="tv-card"><div class="tv-label">平均財務評分</div><div class="tv-value">{'N/A' if pd.isna(avg_score) else f'{avg_score:.0f}'}</div><div class="tv-caption">滿分 100 分</div></div>
+          <div class="tv-card"><div class="tv-label">強勢候選</div><div class="tv-value">{strong_count}</div><div class="tv-caption">財務評分 80 分以上</div></div>
+          <div class="tv-card"><div class="tv-label">目前選擇</div><div class="tv-value" style="font-size:18px">{current_stock['code']} {current_stock['name']}</div><div class="tv-caption">K線／AI分析／新聞同步顯示</div></div>
         </div>
         """, unsafe_allow_html=True)
 
-        # ══════════════ 熱門族群：改為收合區，避免一進工作台就被大量卡片占滿 ══════════════
-        with st.expander("🔥 熱門族群與產業集中度", expanded=False):
-            render_hot_industries(scan_df)
+        # ══════════════ 熱門族群：候選股集中度與平均分數，二次確認訊號品質 ══════════════
+        render_hot_industries(scan_df)
 
         # ══════════════ 策略回測比較：驗證目前策略的歷史勝率 ══════════════
-        with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近1年）", expanded=False):
+        with st.expander(f"🧪 策略回測：驗證「{st.session_state.scan_strategy_used}」的歷史勝率（近9個月）", expanded=False):
             st.caption(
                 "針對目前候選清單的股票，重放近9個月歷史資料找出符合『目前策略』條件的歷史訊號點，"
                 "計算進場後 5／10／20 個交易日的持有報酬。切換策略、重新掃描後再跑一次回測，"
@@ -4169,14 +4212,14 @@ with tab_workspace:
                         st.markdown(f'<div class="candidate-row-hint">「{bt_strategy}」各持有期間明細</div>', unsafe_allow_html=True)
                         st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
                 elif current_bt is not None:
-                    st.info(f"「{bt_strategy}」在候選清單範圍內近1年沒有找到符合條件的歷史訊號。")
+                    st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
 
     if has_results or has_manual:
-        left_col, right_col = st.columns([1.2, 2.5], gap="large")
+        left_col, right_col = st.columns([1.5, 2.2], gap="medium")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
         with left_col:
-            with st.container(border=True, key="candidate_sidebar"):
+            with st.container(border=True):
                 st.markdown('<div class="section-title" style="font-size:15px;margin-bottom:8px;">候選股票清單</div><div class="candidate-row-hint">點擊任一列即可切換右側個股工作台。</div>', unsafe_allow_html=True)
 
                 # [新功能] 熱門族群卡片點擊後的產業篩選提示（跟快速篩選是 AND 關係）
@@ -4223,7 +4266,7 @@ with tab_workspace:
 
                     def color_tw_style(val):
                         if pd.isna(val): return ''
-                        color = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
+                        color = '#22ab94' if val > 0 else '#f23645' if val < 0 else PAL['text']
                         return f'color: {color}; font-weight: bold'
 
                     event = st.dataframe(
@@ -4263,7 +4306,7 @@ with tab_workspace:
                 with st.container(key="mobile_candidate_list"):
                     for _, row in view_df.iterrows():
                         chg = row.get('漲跌幅(%)', np.nan)
-                        chg_color = '#22ab94' if pd.notna(chg) and chg > 0 else '#f23645' if pd.notna(chg) and chg < 0 else '#c7d5e6'
+                        chg_color = '#22ab94' if pd.notna(chg) and chg > 0 else '#f23645' if pd.notna(chg) and chg < 0 else 'var(--text2)'
                         chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.1f}%"
                         score_val = row.get('AI評分', np.nan)
                         hot_badge = '<span class="hot-badge-inline">🔥</span>' if bool(row.get('熱門股', False)) else ''
@@ -4288,7 +4331,7 @@ with tab_workspace:
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
         with right_col:
-            nav_star, nav_space, nav1, nav2 = st.columns([1.1, 3.2, 0.9, 0.9])
+            nav_star, nav_space, nav1, nav2 = st.columns([0.9, 2.5, 0.8, 0.8])
             with nav_star:
                 # [新功能] 自選股／追蹤清單：星號切換加入/移除，重新讀檔即時反映目前狀態
                 _wl_now = load_watchlist()
@@ -4309,6 +4352,9 @@ with tab_workspace:
                 if st.button("下一檔 →", use_container_width=True, key="chart_next"):
                     st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                     st.rerun()
+
+            # ══════════════ 手動查詢個股：不必等策略掃描，直接輸入代碼即可查看完整工作台 ══════════════
+            render_manual_search_box(key_suffix="panel")
 
             price = current_stock.get('收盤', np.nan)
             chg = current_stock.get('漲跌幅(%)', np.nan)
@@ -4335,17 +4381,16 @@ with tab_workspace:
             </div>
             """, unsafe_allow_html=True)
 
-            render_manual_search_box(key_suffix="panel")
-
-            # [新版面] 使用單一分析選單，避免九個膠囊按鈕同時擠在畫面上。
+            # [新版面] 分段切換：取代原本 K線圖／AI分析／個股新聞 三個獨立頁籤，
             # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
-            st.markdown('<div class="detail-nav-title">分析內容</div>', unsafe_allow_html=True)
-            view_options = ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"]
-            view_mode = st.selectbox(
-                "分析內容", view_options,
+            view_mode = st.segmented_control(
+                "檢視模式",
+                ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"],
+                default="📈 K線圖",
                 key="detail_view_mode",
                 label_visibility="collapsed",
             )
+            view_mode = view_mode or "📈 K線圖"
 
             # ---------- K 線圖 ----------
             if view_mode == "📈 K線圖":
@@ -4370,14 +4415,14 @@ with tab_workspace:
 
             # ---------- 多空指標：市場常用技術指標的多空綜合判讀 ----------
             elif view_mode == "📐 多空指標":
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} 多空綜合判讀</div><div class="section-help">彙整市場上常用的技術指標各自獨立判斷，非 AI 主觀敘述，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} 多空綜合判讀</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">彙整市場上常用的技術指標各自獨立判斷，非 AI 主觀敘述，僅供參考，非投資建議。</div></details></div></div>', unsafe_allow_html=True)
 
                 k_source_df = get_kline_data(current_stock['code'], "TW" if current_stock['ticker'].endswith(".TW") else "TWO")
                 indicators = calc_bull_bear_indicators(k_source_df)
 
                 if indicators:
                     summary = summarize_bull_bear(indicators)
-                    verdict_color = {'偏多': 'var(--green)', '偏空': 'var(--red)', '多空拉鋸': 'var(--yellow)'}.get(summary['verdict'], '#8f9bad')
+                    verdict_color = {'偏多': 'var(--green)', '偏空': 'var(--red)', '多空拉鋸': 'var(--yellow)'}.get(summary['verdict'], 'var(--muted)')
                     st.markdown(f"""
                     <div class="quote-panel" style="margin:4px 0 16px;">
                       <div class="quote-head"><div class="quote-title" style="color:{verdict_color};">綜合判讀：{summary['verdict']}</div></div>
@@ -4390,16 +4435,16 @@ with tab_workspace:
                     """, unsafe_allow_html=True)
 
                     for ind in indicators:
-                        badge_color = {'多': 'var(--green)', '空': 'var(--red)', '中性': '#8f9bad'}.get(ind['訊號'], '#8f9bad')
+                        badge_color = {'多': 'var(--green)', '空': 'var(--red)', '中性': 'var(--muted)'}.get(ind['訊號'], 'var(--muted)')
                         badge_bg = {'多': 'rgba(34,171,148,0.14)', '空': 'rgba(242,54,69,0.14)', '中性': 'rgba(139,148,158,0.14)'}.get(ind['訊號'], 'rgba(139,148,158,0.14)')
                         st.markdown(f"""
                         <div class="side-card" style="margin-bottom:10px;">
                           <div class="side-title" style="margin-bottom:4px;">
                             <span>{ind['指標']}</span>
-                            <span style="background:{badge_bg};color:{badge_color};border:1px solid {badge_color}40;border-radius:999px;padding:3px 12px;font-size:12px;font-weight:800;">{ind['訊號']}</span>
+                            <span style="background:{badge_bg};color:{badge_color};border:1px solid color-mix(in srgb, {badge_color} 30%, transparent);border-radius:999px;padding:3px 12px;font-size:12px;font-weight:700;">{ind['訊號']}</span>
                           </div>
                           <div class="tv-caption" style="font-family:'Roboto Mono',monospace;margin-bottom:4px;">{ind['數值']}</div>
-                          <div style="color:#c7d5e6;font-size:13px;">{ind['說明']}</div>
+                          <div style="color:var(--text2);font-size:13px;">{ind['說明']}</div>
                         </div>
                         """, unsafe_allow_html=True)
 
@@ -4414,9 +4459,9 @@ with tab_workspace:
                 is_etf = (str(current_stock.get('industry', '')) == 'ETF') or bool(re.match(r'^00\d', str(current_stock['code'])))
                 profile = get_company_profile(current_stock['code'], market_suffix)
 
-                st.markdown('<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">公司簡介</div><div class="section-help">資料來源：公開資訊觀測站（TWSE OpenAPI）。</div></div></div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">公司簡介</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：公開資訊觀測站（TWSE OpenAPI）。</div></details></div></div>', unsafe_allow_html=True)
                 if profile:
-                    website_html = f'<a href="{profile["網址"]}" target="_blank" style="color:#8eb6ff;">{profile["網址"]}</a>' if profile.get("網址") else "N/A"
+                    website_html = f'<a href="{profile["網址"]}" target="_blank" style="color:var(--blue);">{profile["網址"]}</a>' if profile.get("網址") else "N/A"
                     st.markdown(f"""
                     <div class="side-card">
                       <div class="report-row"><span>公司全名</span><span>{profile['公司名稱']}</span></div>
@@ -4438,7 +4483,7 @@ with tab_workspace:
 
                 if is_etf:
                     # [新功能] ETF 成分股與占比：取代一般個股才適用的 EPS 區塊
-                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">ETF 成分股與占比</div><div class="section-help">資料來源：Yahoo 股市 ETF 持股分析頁面，僅公開揭露前十大持股，非完整成分股清單。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">ETF 成分股與占比</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Yahoo 股市 ETF 持股分析頁面，僅公開揭露前十大持股，非完整成分股清單。</div></details></div></div>', unsafe_allow_html=True)
                     etf_data = get_etf_holdings(current_stock['code'], market_suffix)
                     holdings = etf_data.get('holdings', [])
                     if holdings:
@@ -4452,11 +4497,11 @@ with tab_workspace:
                             hovertemplate='%{y}<br>占比 %{x:.2f}%<extra></extra>',
                         ))
                         fig.update_layout(
-                            height=320, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            height=320, template=CHART_TEMPLATE,
+                            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                             margin=dict(l=10, r=20, t=10, b=20),
-                            xaxis=dict(title='占比 (%)', gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
+                            xaxis=dict(title='占比 (%)', gridcolor=CHART_GRID),
+                            yaxis=dict(gridcolor=CHART_GRID),
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -4475,7 +4520,7 @@ with tab_workspace:
                     else:
                         st.info("目前無法取得這檔 ETF 的成分股資料，可能是新掛牌 ETF 或資料來源暫時無回應，請稍後再試。")
                 else:
-                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></details></div></div>', unsafe_allow_html=True)
                     eps_rows = fetch_quarterly_eps(current_stock['code'], market_suffix)
                     if eps_rows:
                         eps_df = pd.DataFrame(eps_rows)
@@ -4495,11 +4540,11 @@ with tab_workspace:
                             hovertemplate='%{x}<br>EPS %{y:.2f}<extra></extra>',
                         ))
                         fig.update_layout(
-                            height=280, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            height=280, template=CHART_TEMPLATE,
+                            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                             margin=dict(l=20, r=20, t=10, b=20),
-                            xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis=dict(title='EPS (元)', gridcolor='rgba(148,163,184,0.09)'),
+                            xaxis=dict(gridcolor=CHART_GRID),
+                            yaxis=dict(title='EPS (元)', gridcolor=CHART_GRID),
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -4523,7 +4568,7 @@ with tab_workspace:
                     # （純外部連結、開新分頁，不爬取／不截圖對方內容，避免反爬蟲與版權疑慮）。
                     river_head_col, river_link_col = st.columns([4, 1.3])
                     with river_head_col:
-                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">本益比河流圖</div><div class="section-help">用近四季 EPS 滾動加總（TTM）× 自身歷史本益比分位數還原評價區間；估算版本，非官方資料，僅供參考、非投資建議。</div></div></div>', unsafe_allow_html=True)
+                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">本益比河流圖</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">用近四季 EPS 滾動加總（TTM）× 自身歷史本益比分位數還原評價區間；估算版本，非官方資料，僅供參考、非投資建議。</div></details></div></div>', unsafe_allow_html=True)
                     with river_link_col:
                         st.link_button(
                             "🔗 Goodinfo 官方河流圖",
@@ -4557,16 +4602,16 @@ with tab_workspace:
                             ))
                         fig.add_trace(go.Scatter(
                             x=river_df['date'], y=river_df['close'], mode='lines', name='實際股價',
-                            line=dict(width=2.4, color='#e6edf3'),
+                            line=dict(width=2.4, color=CHART_LINE),
                             hovertemplate='%{x|%Y-%m-%d}<br>股價 %{y:.2f}<extra></extra>',
                         ))
                         fig.update_layout(
-                            height=380, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            height=380, template=CHART_TEMPLATE,
+                            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                             margin=dict(l=20, r=20, t=10, b=20),
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=10)),
-                            xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis=dict(title='股價 (元)', gridcolor='rgba(148,163,184,0.09)'),
+                            xaxis=dict(gridcolor=CHART_GRID),
+                            yaxis=dict(title='股價 (元)', gridcolor=CHART_GRID),
                             hovermode='x unified',
                         )
                         st.plotly_chart(fig, use_container_width=True)
@@ -4576,7 +4621,7 @@ with tab_workspace:
 
                     # [新功能] 產業別同儕比較：本益比放在同產業裡看相對位置，
                     # 全部用已經批次快取的資料算（股票清單＋官方本益比表），不逐股即時抓取。
-                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">同產業比較</div><div class="section-help">用官方本益比批次資料（跟本益比河流圖同一份資料）比較同產業所有股票的本益比分布；只跟同業比較估值高低，不是買賣建議，成長股本益比偏高不一定代表偏貴。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">同產業比較</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">用官方本益比批次資料（跟本益比河流圖同一份資料）比較同產業所有股票的本益比分布；只跟同業比較估值高低，不是買賣建議，成長股本益比偏高不一定代表偏貴。</div></details></div></div>', unsafe_allow_html=True)
                     peer_stats = build_industry_peer_stats(current_stock['code'], current_stock.get('industry', ''))
                     if peer_stats:
                         cheap_pct = peer_stats['cheaper_than_pct']
@@ -4603,15 +4648,15 @@ with tab_workspace:
                             fig.add_trace(go.Scatter(
                                 x=[peer_stats['my_pe']], y=['同業本益比分布'], mode='markers',
                                 name=current_stock['name'],
-                                marker=dict(color='#facc15', size=15, symbol='diamond', line=dict(color='#0b121b', width=1.5)),
+                                marker=dict(color='#facc15', size=15, symbol='diamond', line=dict(color=CHART_BG, width=1.5)),
                                 hovertemplate=f"{current_stock['name']} 本益比 " + '%{x:.1f}<extra></extra>',
                             ))
                         fig.update_layout(
-                            height=190, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            height=190, template=CHART_TEMPLATE,
+                            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                             margin=dict(l=20, r=20, t=10, b=30),
                             showlegend=False,
-                            xaxis=dict(title='本益比（倍）', gridcolor='rgba(148,163,184,0.09)'),
+                            xaxis=dict(title='本益比（倍）', gridcolor=CHART_GRID),
                             yaxis=dict(showticklabels=False),
                         )
                         st.plotly_chart(fig, use_container_width=True)
@@ -4624,7 +4669,7 @@ with tab_workspace:
                     # 搭配官方「產業價值鏈資訊平台」連結作為完整/權威資料的保底。
                     chain_head_col, chain_link_col = st.columns([4, 1.3])
                     with chain_head_col:
-                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">供應鏈上下游</div><div class="section-help">內建常見熱門產業鏈對照表，整理自公開產業知識、非官方即時資料，只列代表性股票、不是完整清單，可能有過時或疏漏；一家公司也可能同時橫跨多條產業鏈。完整/最新資料請點右側官方平台連結，輸入代碼查詢。</div></div></div>', unsafe_allow_html=True)
+                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">供應鏈上下游</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">內建常見熱門產業鏈對照表，整理自公開產業知識、非官方即時資料，只列代表性股票、不是完整清單，可能有過時或疏漏；一家公司也可能同時橫跨多條產業鏈。完整/最新資料請點右側官方平台連結，輸入代碼查詢。</div></details></div></div>', unsafe_allow_html=True)
                     with chain_link_col:
                         st.link_button(
                             "🔗 產業價值鏈資訊平台",
@@ -4645,7 +4690,7 @@ with tab_workspace:
 
             # ---------- 財務體質評分 ----------
             elif view_mode == "🩺 財務體質":
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 財務體質評分</div><div class="section-help">資料來源：Anue鉅亨網「年度財務比率」頁面，整合負債比率、流動比率、獲利能力等指標估算；不同產業合理區間本就不同，僅供快速篩選參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 財務體質評分</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Anue鉅亨網「年度財務比率」頁面，整合負債比率、流動比率、獲利能力等指標估算；不同產業合理區間本就不同，僅供快速篩選參考，非投資建議。</div></details></div></div>', unsafe_allow_html=True)
 
                 fin_data = fetch_financial_ratios(current_stock['code'])
                 fin_metrics = fin_data.get("metrics", {})
@@ -4672,7 +4717,7 @@ with tab_workspace:
                         <div class="side-card" style="margin-bottom:10px;">
                           <div class="side-title" style="margin-bottom:4px;">
                             <span>{it['指標']}（{it['分類']}）</span>
-                            <span style="background:{badge_color}22;color:{badge_color};border:1px solid {badge_color}40;border-radius:999px;padding:3px 12px;font-size:12px;font-weight:800;">{it['分數']:.0f} 分</span>
+                            <span style="background:color-mix(in srgb, {badge_color} 14%, transparent);color:{badge_color};border:1px solid color-mix(in srgb, {badge_color} 30%, transparent);border-radius:999px;padding:3px 12px;font-size:12px;font-weight:700;">{it['分數']:.0f} 分</span>
                           </div>
                           <div class="tv-caption" style="font-family:'Roboto Mono',monospace;">原始數值：{it['原始值']:.2f}</div>
                         </div>
@@ -4685,7 +4730,7 @@ with tab_workspace:
             # ---------- 股利政策／殖利率／除權息 ----------
             elif view_mode == "💵 股利政策":
                 market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><div class="section-help">資料來源：Yahoo 股市個股「股利」頁面，彙整歷年現金股利／股票股利／除息日，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Yahoo 股市個股「股利」頁面，彙整歷年現金股利／股票股利／除息日，僅供參考，非投資建議。</div></details></div></div>', unsafe_allow_html=True)
 
                 div_data = fetch_dividend_history(current_stock['code'], market_suffix)
                 div_rows = div_data.get("rows", [])
@@ -4732,12 +4777,12 @@ with tab_workspace:
                             hovertemplate='%{x}年度<br>現金股利 %{y:.2f}<extra></extra>',
                         ))
                         fig.update_layout(
-                            height=320, template='plotly_dark',
-                            paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                            height=320, template=CHART_TEMPLATE,
+                            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                             margin=dict(l=20, r=20, t=10, b=20),
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                            xaxis=dict(title='所屬年度', gridcolor='rgba(148,163,184,0.09)'),
-                            yaxis=dict(title='現金股利 (元)', gridcolor='rgba(148,163,184,0.09)'),
+                            xaxis=dict(title='所屬年度', gridcolor=CHART_GRID),
+                            yaxis=dict(title='現金股利 (元)', gridcolor=CHART_GRID),
                             hovermode='x unified',
                         )
                         st.plotly_chart(fig, use_container_width=True)
@@ -4759,7 +4804,7 @@ with tab_workspace:
             # ---------- 三大法人買賣情況 ----------
             elif view_mode == "💰 三大法人":
                 market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 三大法人買賣情況</div><div class="section-help">資料來源：Yahoo 股市個股「法人買賣」頁面，彙整外資、投信、自營商逐日買賣超，僅供參考，非官方逐筆對帳資料。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 三大法人買賣情況</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Yahoo 股市個股「法人買賣」頁面，彙整外資、投信、自營商逐日買賣超，僅供參考，非官方逐筆對帳資料。</div></details></div></div>', unsafe_allow_html=True)
 
                 inst_rows = fetch_institutional_trading(current_stock['code'], market_suffix)
                 if inst_rows:
@@ -4800,12 +4845,12 @@ with tab_workspace:
                     fig.add_trace(go.Bar(x=chart_df['日期'], y=chart_df['投信'], name='投信', marker_color='#f2a900'))
                     fig.add_trace(go.Bar(x=chart_df['日期'], y=chart_df['自營商'], name='自營商', marker_color='#a855f7'))
                     fig.update_layout(
-                        barmode='relative', height=320, template='plotly_dark',
-                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        barmode='relative', height=320, template=CHART_TEMPLATE,
+                        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                         margin=dict(l=20, r=20, t=10, b=20),
                         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                        yaxis=dict(title='買賣超（張）', gridcolor='rgba(148,163,184,0.09)'),
+                        xaxis=dict(gridcolor=CHART_GRID),
+                        yaxis=dict(title='買賣超（張）', gridcolor=CHART_GRID),
                         hovermode='x unified',
                     )
                     st.plotly_chart(fig, use_container_width=True)
@@ -4830,7 +4875,7 @@ with tab_workspace:
             # ---------- 資券變化 ----------
             elif view_mode == "📊 資券變化":
                 market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 融資融券／資券變化</div><div class="section-help">資料來源：Yahoo 股市個股「資券變化」頁面，彙整融資融券逐日增減與餘額，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 融資融券／資券變化</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Yahoo 股市個股「資券變化」頁面，彙整融資融券逐日增減與餘額，僅供參考，非投資建議。</div></details></div></div>', unsafe_allow_html=True)
 
                 margin_rows = fetch_margin_trading(current_stock['code'], market_suffix)
                 if margin_rows:
@@ -4869,12 +4914,12 @@ with tab_workspace:
                         hovertemplate='%{x}<br>融券餘額 %{y:,.0f} 張<extra></extra>',
                     ))
                     fig.update_layout(
-                        height=340, template='plotly_dark',
-                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        height=340, template=CHART_TEMPLATE,
+                        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                         margin=dict(l=20, r=40, t=10, b=20),
                         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                        yaxis=dict(title='融資餘額（張）', gridcolor='rgba(148,163,184,0.09)'),
+                        xaxis=dict(gridcolor=CHART_GRID),
+                        yaxis=dict(title='融資餘額（張）', gridcolor=CHART_GRID),
                         yaxis2=dict(title='融券餘額（張）', overlaying='y', side='right', showgrid=False),
                         hovermode='x unified',
                     )
@@ -4901,7 +4946,7 @@ with tab_workspace:
 
             # ---------- 法人目標價 ----------
             elif view_mode == "🎯 法人目標價":
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 法人目標價</div><div class="section-help">資料來源：Anue鉅亨網「外資評等」頁面，彙整外資／券商調整目標價與投資評等的歷史紀錄，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 法人目標價</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">資料來源：Anue鉅亨網「外資評等」頁面，彙整外資／券商調整目標價與投資評等的歷史紀錄，僅供參考，非投資建議。</div></details></div></div>', unsafe_allow_html=True)
 
                 target_rows = fetch_analyst_target_price(current_stock['code'])
                 if target_rows:
@@ -4930,15 +4975,15 @@ with tab_workspace:
                     ))
                     if pd.notna(current_price):
                         fig.add_hline(
-                            y=current_price, line=dict(color='#e6edf3', width=1.4, dash='dot'),
+                            y=current_price, line=dict(color=CHART_LINE, width=1.4, dash='dot'),
                             annotation_text=f'目前股價 {current_price:.2f}', annotation_position='bottom right',
                         )
                     fig.update_layout(
-                        height=320, template='plotly_dark',
-                        paper_bgcolor='#0b121b', plot_bgcolor='#0b121b',
+                        height=320, template=CHART_TEMPLATE,
+                        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
                         margin=dict(l=20, r=20, t=10, b=20),
-                        xaxis=dict(gridcolor='rgba(148,163,184,0.09)'),
-                        yaxis=dict(title='目標價 (元)', gridcolor='rgba(148,163,184,0.09)'),
+                        xaxis=dict(gridcolor=CHART_GRID),
+                        yaxis=dict(title='目標價 (元)', gridcolor=CHART_GRID),
                         hovermode='x unified',
                     )
                     st.plotly_chart(fig, use_container_width=True)
@@ -4970,7 +5015,7 @@ with tab_workspace:
 
             # ---------- 個股新聞 ----------
             elif view_mode == "📰 個股新聞":
-                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 最新新聞</div><div class="section-help">依標題關鍵字初步標記利多、利空或一般資訊。</div></div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 最新新聞</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">依標題關鍵字初步標記利多、利空或一般資訊。</div></details></div></div>', unsafe_allow_html=True)
                 news_list = get_tw_stock_news(current_stock['code'])
                 if news_list:
                     for n in news_list:
@@ -4979,15 +5024,15 @@ with tab_workspace:
                         <div class="news-card" style="border:1px solid rgba(40,80,100,0.2);border-left:2px solid {n['color']};padding:14px 16px;margin-bottom:10px;">
                           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
                             <span style="background:{badge_bg};color:{n['color']};border:1px solid {n['color']}40;padding:2px 10px;border-radius:999px;font-size:11px;">{n['sentiment']}</span>
-                            <span style="color:#8b949e;font-size:11px;">{n['publisher']}</span>
+                            <span style="color:var(--muted);font-size:11px;">{n['publisher']}</span>
                           </div>
-                          <a class="news-title" href="{n['link']}" target="_blank" style="text-decoration:none;color:#e6edf3;font-size:14px;line-height:1.65;">{n['title']}</a>
+                          <a class="news-title" href="{n['link']}" target="_blank" style="text-decoration:none;color:var(--text);font-size:14px;line-height:1.65;">{n['title']}</a>
                         </div>
                         """, unsafe_allow_html=True)
                 else:
                     st.warning("目前無法取得即時新聞，稍後重新整理即可再試。")
     else:
-        st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「市場掃描」頁籤執行全市場掃描。")
+        st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「選股掃描」頁籤執行全市場掃描。")
         render_manual_search_box(key_suffix="empty")
 
 # ------------------------------------------------------------
@@ -4997,15 +5042,15 @@ with tab_workspace:
 # 不用每次都全市場重新掃描才看得到它們。清單存在本機 JSON 檔案
 # （watchlist_v1.json），跟 get_stock_market_list() 用同一套持久化寫法。
 with tab_watchlist:
-    st.markdown('<div class="section-head"><div><div class="section-title">自選股／追蹤清單</div><div class="section-help">在「個股工作台」右上角點 ☆ 加入追蹤，這裡會持續記錄，不受重新掃描影響。</div></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div><div class="section-title">自選股／追蹤清單</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">在「候選與分析工作台」右上角點 ☆ 加入追蹤，這裡會持續記錄，不受重新掃描影響。</div></details></div></div>', unsafe_allow_html=True)
 
     watchlist = load_watchlist()
     if not watchlist:
         st.markdown("""
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:8px;">
           <div style="font-size:40px;margin-bottom:12px;">⭐</div>
-          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">追蹤清單目前是空的</div>
-          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">掃描完成後，在「個股工作台」右上角點「☆ 加入追蹤」，<br>就能把還沒達標、但值得持續觀察的股票留在這裡。</div>
+          <div style="font-size:20px;font-weight:700;color:var(--text);">追蹤清單目前是空的</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">掃描完成後，在「候選與分析工作台」右上角點「☆ 加入追蹤」，<br>就能把還沒達標、但值得持續觀察的股票留在這裡。</div>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -5026,7 +5071,7 @@ with tab_watchlist:
         else:
             for _, row in quotes_df.iterrows():
                 ret = row.get('累計報酬(%)', np.nan)
-                ret_color = 'var(--green)' if pd.notna(ret) and ret >= 0 else 'var(--red)' if pd.notna(ret) else '#8f9bad'
+                ret_color = 'var(--green)' if pd.notna(ret) and ret >= 0 else 'var(--red)' if pd.notna(ret) else 'var(--muted)'
                 ret_txt = 'N/A' if pd.isna(ret) else f"{ret:+.2f}%"
                 warn_bits = []
                 if row.get('跌破MA30'):
@@ -5045,7 +5090,7 @@ with tab_watchlist:
                         added_p = row.get('added_price')
                         st.markdown(f"加入價 {fmt_num(added_p, '{:.2f}') if added_p else 'N/A'} → 現價 **{fmt_num(row.get('現價', np.nan), '{:.2f}')}**")
                     with ret_col:
-                        st.markdown(f"<span style='color:{ret_color};font-weight:800;font-family:Roboto Mono,monospace;'>{ret_txt}</span>{warn_txt}", unsafe_allow_html=True)
+                        st.markdown(f"<span style='color:{ret_color};font-weight:700;font-family:Roboto Mono,monospace;'>{ret_txt}</span>{warn_txt}", unsafe_allow_html=True)
                     with btn_col1:
                         if st.button("📈 K線", key=f"wl_chart_{row['code']}", use_container_width=True):
                             st.session_state.watchlist_chart_target = (row['ticker'], row['name'])
@@ -5071,7 +5116,7 @@ with tab_watchlist:
 # TAB 4：投資分析報告（純量化規則版，不需要 API 金鑰）
 # ------------------------------------------------------------
 with tab_report:
-    st.markdown('<div class="section-head"><div><div class="section-title">個股投資分析報告</div><div class="section-help">輸入股票代碼，自動整合量化指標、新聞分類、同業比較與波動率情境價格區間，全部由規則產生，不需要 API 金鑰。</div></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div><div class="section-title">個股投資分析報告</div><details class="section-help"><summary>ⓘ 說明</summary><div class="sh-body">輸入股票代碼，自動整合量化指標、新聞分類、同業比較與波動率情境價格區間，全部由規則產生，不需要 API 金鑰。</div></details></div></div>', unsafe_allow_html=True)
 
     rc1, rc2 = st.columns([3, 1])
     with rc1:
@@ -5090,7 +5135,7 @@ with tab_report:
         st.markdown("""
         <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:8px;">
           <div style="font-size:40px;margin-bottom:12px;">📑</div>
-          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">還沒有產生過報告</div>
+          <div style="font-size:20px;font-weight:700;color:var(--text);">還沒有產生過報告</div>
           <div class="tv-caption" style="margin-top:9px;line-height:1.8;">在上方輸入股票代碼並按「產生報告」，<br>就能看到重點觀察、催化因素、同業比較與情境價格區間的完整分析。</div>
         </div>
         """, unsafe_allow_html=True)
@@ -5129,8 +5174,8 @@ with tab_report:
             # ---------- 報告頭卡：名稱、報價、估值旗標 ----------
             badge_color = {
                 "偏低估／具吸引力": "var(--green)", "合理偏多": "var(--blue)",
-                "中性": "var(--yellow)", "偏弱／宜觀察": "var(--red)", "資料不足": "#8f9bad",
-            }.get(rd.get("估值判斷旗標"), "#8f9bad")
+                "中性": "var(--yellow)", "偏弱／宜觀察": "var(--red)", "資料不足": "var(--muted)",
+            }.get(rd.get("估值判斷旗標"), "var(--muted)")
             chg = rd.get("漲跌幅(%)", np.nan)
             chg_color = "var(--green)" if pd.notna(chg) and chg >= 0 else "var(--red)"
 
@@ -5138,16 +5183,16 @@ with tab_report:
             <div class="tv-panel" style="padding:20px 22px;margin-top:6px;">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
                 <div>
-                  <div style="font-size:22px;font-weight:800;">{rd.get('name','')} ({rd.get('code','')})</div>
+                  <div style="font-size:22px;font-weight:700;">{rd.get('name','')} ({rd.get('code','')})</div>
                   <div class="tv-caption">{rd.get('industry','')}</div>
                 </div>
                 <div style="text-align:right;">
-                  <div style="font-size:26px;font-weight:800;font-family:'Roboto Mono',monospace;">{fmt_num(rd.get('收盤'))}</div>
+                  <div style="font-size:26px;font-weight:700;font-family:'Roboto Mono',monospace;">{fmt_num(rd.get('收盤'))}</div>
                   <div style="color:{chg_color};font-weight:700;">{fmt_num(chg, '{:+.2f}%')}</div>
                 </div>
               </div>
               <div style="margin-top:14px;">
-                <span style="background:{badge_color};color:#04121f;font-weight:800;padding:4px 12px;border-radius:20px;font-size:13px;">{rd.get('估值判斷旗標','')}</span>
+                <span style="background:{badge_color};color:#04121f;font-weight:700;padding:4px 12px;border-radius:20px;font-size:13px;">{rd.get('估值判斷旗標','')}</span>
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -5180,7 +5225,7 @@ with tab_report:
                     titles = cat.get("titles", [])
                     titles_html = "".join(f"<div style='font-size:13px;color:var(--muted);padding:2px 0;'>· {t}</div>" for t in titles)
                     st.markdown(
-                        f'<div style="border-left:3px solid {color};padding:10px 14px;background:rgba(13,26,43,0.7);border-radius:6px;margin-bottom:8px;">'
+                        f'<div style="border-left:3px solid {color};padding:10px 14px;background:var(--surface2);border-radius:6px;margin-bottom:8px;">'
                         f'<b style="color:{color};">{label}</b>{titles_html}</div>',
                         unsafe_allow_html=True
                     )
