@@ -73,6 +73,7 @@ for key, default in [
     ('report_target_code', None),     # 目前報告頁籤鎖定要看的股票代碼
     ('report_cache',       {}),       # {代碼: 報告dict}，避免每次重跑都重新呼叫AI（成本較高）
     ('manual_anthropic_key', ''),     # 使用者手動輸入的API金鑰，只存在當前瀏覽器工作階段，不落地儲存
+    ('report_use_web_search', True),  # 投資分析報告的AI敘事是否允許使用 Claude API 內建 web_search
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -3467,23 +3468,59 @@ def build_investment_report(row_data: dict, closes: pd.Series, industry_peers: p
     }
 
 
-def generate_ai_investment_narrative(context: dict, api_key: str) -> dict:
-    """呼叫 Claude API，依提供的量化資料摘要與新聞標題生成敘事段落。嚴格
-    要求模型只能根據提供的資料回答，不可以杜撰未提供的具體數字或事件；
-    呼叫失敗（金鑰錯誤、逾時、額度用盡等）一律回傳空字典，由呼叫端顯示
-    提示訊息，不影響報告其他量化區塊（fail-open）。"""
+def generate_ai_investment_narrative(context: dict, api_key: str, use_web_search: bool = True) -> dict:
+    """呼叫 Claude API，依提供的量化資料摘要生成敘事段落。預設會開啟 Claude API
+    內建的 web_search 工具，讓模型自己搜尋、彙整多個來源的新聞（取代我們自己
+    土法煉鋼爬各家財經網站，同時避開版權與反爬蟲問題）；也可以關閉，退回成
+    只用我們提供的資料摘要（含Yahoo新聞標題）作答，不連網。
+    嚴格要求模型不可以杜撰未提供／查不到的具體數字或事件、不可以逐字大量
+    複製來源文字；呼叫失敗（金鑰錯誤、逾時、額度用盡等）一律回傳空字典，
+    由呼叫端顯示提示訊息，不影響報告其他量化區塊（fail-open）。"""
     if not api_key:
         return {}
-    system_prompt = (
-        "你是台股產業分析助理，只能根據使用者提供的「資料摘要」與「新聞標題」撰寫繁體中文投資分析。"
-        "嚴格規則：(1) 不可以編造使用者未提供的具體數字、金額、事件或資料來源；"
-        "(2) 新聞標題只是標題、沒有內文細節，只能做標題層級的推論，不能假裝知道細節；"
-        "(3) 資訊不足以支撐某個論點時，要明確寫「資訊不足，需進一步查證」，不要硬湊內容；"
-        "(4) 只能輸出JSON本身，不要有任何JSON以外的文字、不要加markdown code fence。"
-        "JSON格式：{\"重點觀察\": string, \"催化因素\": [string,...], "
-        "\"市場忽略但關鍵\": string, \"估值判斷\": string, \"分析總結\": string}"
+
+    json_schema = (
+        "JSON格式（只能輸出這個JSON本身，不要有任何JSON以外的文字、不要加markdown code fence）："
+        "{\"重點觀察\": string, \"催化因素\": [string,...], "
+        "\"市場忽略但關鍵\": string, \"估值判斷\": string, \"分析總結\": string, "
+        "\"參考來源\": [{\"title\": string, \"url\": string}, ...]}"
     )
+
+    if use_web_search:
+        system_prompt = (
+            "你是台股產業分析助理，任務是幫使用者提供的股票撰寫繁體中文投資分析。"
+            "你可以使用 web_search 工具搜尋這檔股票近期的新聞（用股票名稱與代號查詢），"
+            "彙整多個來源後再下筆，「重點觀察」段落尤其要以你實際搜尋到的近期新聞為主。"
+            "嚴格規則："
+            "(1) 只能根據使用者提供的「資料摘要」與你實際搜尋到的新聞內容作答，不可以編造查不到的具體數字、金額、事件；"
+            "(2) 引用來源內容時一律用自己的話改寫、paraphrase，不可以逐字複製超過15個字的原文片段，也不可以連續引用同一來源兩次以上；"
+            "(3) 如果搜尋不到足夠支撐某個論點的資訊，要明確寫「資訊不足，需進一步查證」，不要硬湊內容；"
+            "(4) 完成搜尋與思考後，你的最後一則回覆只能是JSON本身，不要有任何前言或說明文字；"
+            "(5) 「參考來源」欄位列出你實際搜尋到、且有實際用到內容的3~6則新聞（標題與網址），沒有就給空陣列。"
+            + json_schema
+        )
+    else:
+        system_prompt = (
+            "你是台股產業分析助理，只能根據使用者提供的「資料摘要」與「新聞標題」撰寫繁體中文投資分析（不能連網搜尋）。"
+            "嚴格規則：(1) 不可以編造使用者未提供的具體數字、金額、事件或資料來源；"
+            "(2) 新聞標題只是標題、沒有內文細節，只能做標題層級的推論，不能假裝知道細節；"
+            "(3) 資訊不足以支撐某個論點時，要明確寫「資訊不足，需進一步查證」，不要硬湊內容；"
+            "(4) 只能輸出JSON本身，不要有任何JSON以外的文字、不要加markdown code fence；"
+            "(5) 「參考來源」欄位固定給空陣列（因為沒有連網，沒有實際新聞來源可列）。"
+            + json_schema
+        )
+
     user_prompt = "資料摘要：\n" + json.dumps(context, ensure_ascii=False, indent=2)
+
+    request_body = {
+        "model": ANTHROPIC_REPORT_MODEL,
+        "max_tokens": 2000,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    if use_web_search:
+        request_body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -3492,23 +3529,22 @@ def generate_ai_investment_narrative(context: dict, api_key: str) -> dict:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": ANTHROPIC_REPORT_MODEL,
-                "max_tokens": 1200,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
-            },
-            timeout=30,
+            json=request_body,
+            timeout=60,  # 有網路搜尋時，模型可能要跑好幾輪查詢，逾時拉長一點
         )
         resp.raise_for_status()
         data = resp.json()
         text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-        raw_text = "\n".join(text_blocks).strip()
+        if not text_blocks:
+            return {}
+        # 有工具使用時，前面可能夾雜搜尋過程的文字，JSON本體固定要求放在最後一段
+        raw_text = text_blocks[-1].strip()
         raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text).strip()
         parsed = json.loads(raw_text)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
 
 
 # ============================================================
@@ -4867,12 +4903,18 @@ with tab_report:
 
     with st.expander("🔑 AI 敘事設定（選用）", expanded=False):
         st.caption(
-            "「催化因素」「市場忽略但關鍵」「估值判斷」「分析總結」這幾段敘事文字由 Claude API 生成，"
+            "「重點觀察」「催化因素」「市場忽略但關鍵」「估值判斷」「分析總結」這幾段敘事文字由 Claude API 生成，"
             "需要你自己的 Anthropic API 金鑰，會產生額外費用。建議部署到 Streamlit Cloud 時，"
             "在 App 的 Secrets 設定 `ANTHROPIC_API_KEY`；這裡輸入的金鑰只存在本次瀏覽器工作階段，不會被儲存或上傳。"
             "沒有金鑰時，報告的財務、同業比較、情境價格區間等量化區塊仍會正常顯示，只是不會有 AI 敘事段落。"
         )
         st.text_input("Anthropic API 金鑰", type="password", key="manual_anthropic_key", placeholder="sk-ant-...")
+        st.toggle(
+            "🔍 允許 AI 搜尋網路新聞（Claude API 內建 web_search，會再增加一些費用）",
+            key="report_use_web_search",
+            help="開啟後「重點觀察」會以AI實際搜尋到的近期新聞為主，取代單純用我們抓到的 Yahoo 新聞標題推論；"
+                 "關閉則完全不連網，只用本頁面上方顯示的量化資料與新聞標題作答。",
+        )
 
     rc1, rc2 = st.columns([3, 1])
     with rc1:
@@ -4919,9 +4961,11 @@ with tab_report:
                 report = build_investment_report(row_data, closes, peers_df, news_list)
 
                 api_key = _get_anthropic_api_key()
+                use_web_search = st.session_state.get("report_use_web_search", True)
                 if api_key:
-                    with st.spinner("正在請 AI 撰寫催化因素與市場觀點段落…"):
-                        narrative = generate_ai_investment_narrative(report, api_key)
+                    spinner_txt = "正在請 AI 搜尋新聞並撰寫敘事段落…" if use_web_search else "正在請 AI 撰寫敘事段落…"
+                    with st.spinner(spinner_txt):
+                        narrative = generate_ai_investment_narrative(report, api_key, use_web_search=use_web_search)
                 else:
                     narrative = {}
                 report["narrative"] = narrative
@@ -5039,11 +5083,24 @@ with tab_report:
                 st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📝 分析總結</div>', unsafe_allow_html=True)
                 st.markdown(summary_text)
 
-            # ---------- 參考新聞標題 ----------
+            # ---------- 參考新聞標題（我們自己抓的 Yahoo 標題）----------
             news_items = rd.get("新聞標題", [])
             if news_items:
-                st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📰 參考新聞標題</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📰 參考新聞標題（Yahoo股市）</div>', unsafe_allow_html=True)
                 for n in news_items:
                     st.caption(f"{n.get('sentiment','')} {n.get('title','')}")
+
+            # ---------- AI 搜尋到的參考來源 ----------
+            ai_sources = narrative.get("參考來源", [])
+            if ai_sources:
+                st.markdown('<div class="section-title" style="margin-top:18px;font-size:16px;">🔎 AI搜尋參考來源</div>', unsafe_allow_html=True)
+                for src in ai_sources:
+                    title = src.get("title", "").strip()
+                    url = src.get("url", "").strip()
+                    if url:
+                        st.caption(f"[{title or url}]({url})")
+                    elif title:
+                        st.caption(title)
+                st.caption("以上為 AI 透過 Claude API 內建網路搜尋找到、且實際用於撰寫敘事段落的來源，僅供參考、非投資建議。")
 
             st.markdown('<div class="tv-caption" style="margin-top:24px;">本報告由系統自動整理公開資料與統計方法產生，AI敘事段落可能有誤或不完整，僅供研究參考，不構成投資建議，投資請自行判斷並留意風險。</div>', unsafe_allow_html=True)
