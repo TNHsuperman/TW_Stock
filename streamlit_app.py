@@ -3738,11 +3738,40 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 [data-testid='stExpander'] summary{font-weight:750!important;color:#dce6f3!important;font-size:13px!important;padding:4px 2px!important;}
 [data-testid='stAlert']{border-radius:12px!important;background:rgba(110,168,254,.07)!important;border:1px solid rgba(110,168,254,.20)!important;}
 
-/* ── 乾淨進度條 ── */
-[data-testid='stProgress']{margin:10px 0 5px;}
-[data-testid='stProgress']>div{background:#111d2d!important;border-radius:999px!important;height:12px!important;border:1px solid var(--border)!important;overflow:hidden!important;}
-[data-testid='stProgress']>div>div{background:linear-gradient(90deg,var(--accent-strong),var(--green))!important;border-radius:999px!important;box-shadow:none!important;}
-[data-testid='stProgress'] p{color:#cdd9e8!important;font-weight:700!important;font-size:12px!important;font-family:'Roboto Mono',monospace!important;margin-bottom:5px!important;}
+/* ── 乾淨進度條 ──
+   注意：不能用 [data-testid='stProgress']>div 來畫軌道。那個直接子層只是中介容器，
+   把它塗成漸層會多長出一條假的滿版進度條，真正的條在下面，百分比文字還會被壓住。
+   真正穩定的定位點是 role='progressbar'（軌道），它的子 div 才是填色條。 */
+[data-testid='stProgress']{margin:16px 0 10px;}
+
+/* 中介容器一律清乾淨，只留 progressbar 本身有樣式 */
+[data-testid='stProgress'] > div:not([role='progressbar']){
+  background:transparent!important;border:0!important;height:auto!important;
+  border-radius:0!important;overflow:visible!important;box-shadow:none!important;
+}
+
+/* 百分比文字：獨立一行放在軌道上方，右對齊像儀表板讀數 */
+[data-testid='stProgress'] [data-testid='stMarkdownContainer'] p,
+[data-testid='stProgress'] p{
+  color:#9fb2c9!important;font-weight:600!important;font-size:11.5px!important;
+  font-family:'Roboto Mono',monospace!important;letter-spacing:.06em;
+  margin:0 0 7px!important;line-height:1.4!important;text-align:right!important;
+}
+
+/* 軌道：細一點、內縮的膠囊 */
+[data-testid='stProgress'] [role='progressbar']{
+  background:#0f1a29!important;border:1px solid var(--border)!important;
+  border-radius:999px!important;height:7px!important;overflow:hidden!important;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.35)!important;
+}
+
+/* 填色條：藍→綠漸層，帶一點光暈與平滑推進 */
+[data-testid='stProgress'] [role='progressbar'] > div{
+  background:linear-gradient(90deg,var(--accent-strong),var(--green))!important;
+  border-radius:999px!important;
+  box-shadow:0 0 10px rgba(54,201,154,.28)!important;
+  transition:width .28s cubic-bezier(.4,0,.2,1)!important;
+}
 
 /* ── 報價主卡 ── */
 .quote-panel{padding:22px 24px;margin:12px 0 18px;position:relative;overflow:hidden;}
