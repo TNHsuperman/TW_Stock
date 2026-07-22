@@ -17,6 +17,7 @@ import streamlit.components.v1 as components
 import uuid
 import os
 import json
+import base64
 import threading
 
 # ============================================================
@@ -80,6 +81,8 @@ for key, default in [
     ('portfolio_quotes', pd.DataFrame()),
     ('portfolio_last_check', None),
     ('portfolio_alert_result', []),
+    ('github_portfolio_loaded', False),
+    ('github_sync_status', None),
     # report tab session state keys are initialized inline above
 ]:
     if key not in st.session_state:
@@ -193,13 +196,158 @@ def load_positions() -> list:
     return []
 
 
-def save_positions(positions: list) -> bool:
+def save_positions(positions: list, sync_cloud: bool = False) -> bool:
+    """儲存本機持倉；結構性異動時可同步 GitHub 雲端監控檔。"""
     try:
         with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
             json.dump(positions, f, ensure_ascii=False, indent=2)
-        return True
     except Exception:
         return False
+
+    if sync_cloud:
+        try:
+            cfg = get_github_sync_config()
+            if cfg.get('enabled'):
+                ok, message = sync_positions_to_github(positions, cfg)
+                st.session_state.github_sync_status = {
+                    'ok': ok, 'message': message,
+                    'time': get_tw_now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+        except Exception as exc:
+            try:
+                st.session_state.github_sync_status = {
+                    'ok': False, 'message': f'GitHub 同步失敗：{exc}',
+                    'time': get_tw_now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+            except Exception:
+                pass
+    return True
+
+
+def _secret_or_env(name: str, default: str = '') -> str:
+    value = os.getenv(name, '').strip()
+    if value:
+        return value
+    try:
+        value = str(st.secrets[name]).strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def get_github_sync_config() -> dict:
+    """讀取 Streamlit Secrets／環境變數中的 GitHub 持倉同步設定。"""
+    repo = _secret_or_env('GITHUB_REPO')
+    token = _secret_or_env('GITHUB_SYNC_TOKEN')
+    branch = _secret_or_env('GITHUB_BRANCH', 'main') or 'main'
+    path = _secret_or_env('GITHUB_PORTFOLIO_PATH', 'portfolio_actions.json') or 'portfolio_actions.json'
+    return {
+        'repo': repo, 'token': token, 'branch': branch, 'path': path,
+        'enabled': bool(repo and token),
+    }
+
+
+def build_actions_portfolio_payload(positions=None) -> dict:
+    """建立 GitHub Actions 監控使用的精簡持倉 JSON。"""
+    positions = load_positions() if positions is None else positions
+    allowed = [
+        'id', 'code', 'name', 'ticker', 'industry', '市場別', 'entry_date',
+        'entry_price', 'shares', 'stop_price', 'target1', 'target2',
+        'strategy', 'note', 'telegram_alert', 'status', 'created_at', 'updated_at',
+        'exit_price', 'exit_date', 'exit_note', 'realized_pnl', 'realized_return_pct',
+    ]
+    cloud_positions = []
+    for item in positions:
+        clean = {key: item.get(key) for key in allowed if key in item}
+        clean.setdefault('status', 'open')
+        clean.setdefault('telegram_alert', True)
+        cloud_positions.append(clean)
+    return {
+        'schema_version': 1,
+        'updated_at': get_tw_now().isoformat(timespec='seconds'),
+        'positions': cloud_positions,
+    }
+
+
+def _github_headers(token: str) -> dict:
+    return {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': f'Bearer {token}',
+        'X-GitHub-Api-Version': '2026-03-10',
+        'User-Agent': 'ManStock-Portfolio-Sync',
+    }
+
+
+def sync_positions_to_github(positions=None, config=None) -> tuple[bool, str]:
+    """透過 GitHub Contents API 建立或更新 portfolio_actions.json。"""
+    config = get_github_sync_config() if config is None else config
+    repo = str(config.get('repo', '')).strip()
+    token = str(config.get('token', '')).strip()
+    branch = str(config.get('branch', 'main')).strip() or 'main'
+    remote_path = str(config.get('path', 'portfolio_actions.json')).strip().lstrip('/')
+    if not repo or '/' not in repo or not token:
+        return False, '尚未設定 GITHUB_REPO 或 GITHUB_SYNC_TOKEN'
+
+    api_url = f'https://api.github.com/repos/{repo}/contents/{remote_path}'
+    headers = _github_headers(token)
+    sha = None
+    try:
+        current = requests.get(api_url, headers=headers, params={'ref': branch}, timeout=15)
+        if current.status_code == 200:
+            sha = current.json().get('sha')
+        elif current.status_code != 404:
+            detail = current.json().get('message', current.text) if current.text else current.status_code
+            return False, f'讀取 GitHub 檔案失敗：{detail}'
+
+        payload = build_actions_portfolio_payload(positions)
+        content = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+        body = {
+            'message': f'chore: sync portfolio {get_tw_now().strftime("%Y-%m-%d %H:%M:%S")} [skip ci]',
+            'content': base64.b64encode(content).decode('ascii'),
+            'branch': branch,
+        }
+        if sha:
+            body['sha'] = sha
+        result = requests.put(api_url, headers=headers, json=body, timeout=20)
+        if result.status_code in (200, 201):
+            return True, f'已同步 {len(payload["positions"])} 筆持倉紀錄到 {repo}/{remote_path}'
+        detail = result.json().get('message', result.text) if result.text else result.status_code
+        return False, f'更新 GitHub 檔案失敗：{detail}'
+    except Exception as exc:
+        return False, f'GitHub 同步連線失敗：{exc}'
+
+
+def pull_positions_from_github(config=None) -> tuple[bool, str, list]:
+    """從 GitHub 監控檔拉回持倉，供 Streamlit 重啟或重新部署後復原。"""
+    config = get_github_sync_config() if config is None else config
+    repo = str(config.get('repo', '')).strip()
+    token = str(config.get('token', '')).strip()
+    branch = str(config.get('branch', 'main')).strip() or 'main'
+    remote_path = str(config.get('path', 'portfolio_actions.json')).strip().lstrip('/')
+    if not repo or '/' not in repo or not token:
+        return False, '尚未設定 GitHub 同步資訊', []
+    try:
+        url = f'https://api.github.com/repos/{repo}/contents/{remote_path}'
+        result = requests.get(url, headers=_github_headers(token), params={'ref': branch}, timeout=15)
+        if result.status_code == 404:
+            return False, 'GitHub 尚未建立持倉監控檔', []
+        if result.status_code != 200:
+            detail = result.json().get('message', result.text) if result.text else result.status_code
+            return False, f'讀取 GitHub 持倉失敗：{detail}', []
+        encoded = result.json().get('content', '')
+        payload = json.loads(base64.b64decode(encoded).decode('utf-8'))
+        positions = payload.get('positions', payload) if isinstance(payload, dict) else payload
+        if not isinstance(positions, list):
+            return False, 'GitHub 持倉檔格式不正確', []
+        for item in positions:
+            item.setdefault('status', 'open')
+            item.setdefault('stop_alert_active', False)
+            item.setdefault('last_stop_alert_at', '')
+        return True, f'已從 GitHub 拉回 {len(positions)} 筆持倉', positions
+    except Exception as exc:
+        return False, f'GitHub 持倉拉回失敗：{exc}', []
 
 
 def find_open_position(code: str, positions=None):
@@ -237,7 +385,7 @@ def upsert_position(position: dict) -> tuple[bool, str]:
     if not replaced:
         positions.append(position)
 
-    ok = save_positions(positions)
+    ok = save_positions(positions, sync_cloud=True)
     return ok, ('已更新既有持倉' if replaced else '已建立持倉') if ok else '持倉檔案寫入失敗'
 
 
@@ -250,7 +398,7 @@ def update_position(position_id: str, changes: dict) -> bool:
             p['updated_at'] = get_tw_now().isoformat(timespec='seconds')
             changed = True
             break
-    return save_positions(positions) if changed else False
+    return save_positions(positions, sync_cloud=True) if changed else False
 
 
 def close_position(position_id: str, exit_price: float, exit_date: str, exit_note: str = '') -> bool:
@@ -270,13 +418,13 @@ def close_position(position_id: str, exit_price: float, exit_date: str, exit_not
                 p['realized_return_pct'] = round((float(exit_price) / entry - 1) * 100, 2) if entry > 0 else np.nan
             changed = True
             break
-    return save_positions(positions) if changed else False
+    return save_positions(positions, sync_cloud=True) if changed else False
 
 
 def delete_position(position_id: str) -> bool:
     positions = load_positions()
     kept = [p for p in positions if p.get('id') != position_id]
-    return save_positions(kept) if len(kept) != len(positions) else False
+    return save_positions(kept, sync_cloud=True) if len(kept) != len(positions) else False
 
 
 def _load_local_telegram_config() -> dict:
@@ -1481,25 +1629,56 @@ def build_pe_river_data(code: str, market_suffix: str, ticker: str) -> dict:
 
 
 def _extract_ohlcv(frame) -> pd.DataFrame:
-    """[新功能] 從 yfinance 回傳的單檔資料表萃取出掃描要用的欄位。
+    """從 yfinance 單檔資料同時保留「還原價」與「交易所原始收盤價」。
 
-    以前只留 Close/Volume，導致算不出 ATR（真實波幅需要當日高低點）。
-    yfinance 本來就把 High/Low 一起抓下來了，保留它們不會多花任何網路成本。
+    策略、均線、型態與 ATR 使用除權息還原後的 close/high/low，避免除息缺口
+    破壞技術訊號；報價卡的現價、昨收、漲跌價與漲跌幅則使用 raw_close，才能
+    符合台股實際成交價格與跳動單位，不再由四捨五入後的百分比反推漲跌金額。
 
-    fail-open：某些個股（新上市、長期停牌）可能缺 High/Low，這時退回只取
-    Close/Volume，ATR 會改用收盤價振幅近似，而不是整檔資料被丟掉。
+    download_batch_history() 使用 auto_adjust=False，因此 frame 通常同時包含
+    Close 與 Adj Close。若缺少 Adj Close，則安全退回原始價格。
     """
     if frame is None:
         return None
     try:
-        df = frame[["Close", "High", "Low", "Volume"]].dropna()
-        df.columns = ["close", "high", "low", "volume"]
+        work = frame.copy()
+        # yfinance 新版即使只下載一檔，也可能回傳 MultiIndex 欄位。
+        # 單檔資料只保留包含 OHLCV 欄位的那一層，避免 work["Close"] 變成 DataFrame。
+        if isinstance(work.columns, pd.MultiIndex):
+            level0 = {str(x) for x in work.columns.get_level_values(0)}
+            level1 = {str(x) for x in work.columns.get_level_values(1)} if work.columns.nlevels > 1 else set()
+            price_fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+            if "Close" in level0:
+                work.columns = work.columns.get_level_values(0)
+            elif "Close" in level1:
+                work.columns = work.columns.get_level_values(1)
+            else:
+                return None
+            # 單檔理論上不會重複；若來源仍留下重複欄位，只保留第一欄。
+            work = work.loc[:, ~work.columns.duplicated()]
+
+        raw_close = pd.to_numeric(work["Close"], errors="coerce")
+        if "Adj Close" in work.columns:
+            adj_close = pd.to_numeric(work["Adj Close"], errors="coerce")
+        else:
+            adj_close = raw_close.copy()
+
+        # 調整因子套用到 O/H/L，讓技術面仍使用同一套還原價格序列。
+        factor = (adj_close / raw_close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        data = {
+            "close": adj_close,
+            "raw_close": raw_close,
+            "volume": pd.to_numeric(work["Volume"], errors="coerce"),
+        }
+        for source, target in (("High", "high"), ("Low", "low")):
+            if source in work.columns:
+                data[target] = pd.to_numeric(work[source], errors="coerce") * factor
+        df = pd.DataFrame(data, index=work.index)
+        required = ["close", "raw_close", "volume"]
+        df = df.dropna(subset=required)
     except Exception:
-        try:
-            df = frame[["Close", "Volume"]].dropna()
-            df.columns = ["close", "volume"]
-        except Exception:
-            return None
+        return None
+
     if df.empty:
         return None
     try:
@@ -1542,8 +1721,11 @@ def download_batch_history(tickers: tuple) -> dict:
         # [修正] 4mo 只有約 79~84 根 K 棒，剛好卡在策略4（需要 80 根、MA60+攻擊/拉回區間）
         # 的邊緣，遇到農曆年那種長假就會不足而整批掃不出東西。改成 6mo（約 122~127 根）
         # 留出餘裕；其餘策略最多只需要 65 根，不受影響。
+        # auto_adjust=False 同時取得 Close（交易所原始價）與 Adj Close（還原價）。
+        # 技術策略用還原價，畫面漲跌則用原始價，避免高價股出現 -9.88 這類
+        # 不符合台股跳動單位的數字。
         raw = yf.download(ticker_str, period="6mo", interval="1d",
-                          group_by="ticker", auto_adjust=True, progress=False, threads=True)
+                          group_by="ticker", auto_adjust=False, progress=False, threads=True)
     except Exception:
         return {}
 
@@ -1698,31 +1880,89 @@ def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i
     return ok, vol_shrink_ratio
 
 
+def tw_stock_tick_size(price: float) -> float:
+    """台股一般股票價格跳動單位。
+
+    未滿10元：0.01；10~未滿50：0.05；50~未滿100：0.1；
+    100~未滿500：0.5；500~未滿1000：1；1000元以上：5。
+    """
+    try:
+        p = abs(float(price))
+    except (TypeError, ValueError):
+        return np.nan
+    if not np.isfinite(p):
+        return np.nan
+    if p < 10:
+        return 0.01
+    if p < 50:
+        return 0.05
+    if p < 100:
+        return 0.1
+    if p < 500:
+        return 0.5
+    if p < 1000:
+        return 1.0
+    return 5.0
+
+
+def round_to_tw_stock_tick(price: float) -> float:
+    """把外部行情可能出現的浮點誤差校正到最接近的台股合法價格檔位。"""
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return np.nan
+    tick = tw_stock_tick_size(value)
+    if not np.isfinite(value) or not np.isfinite(tick) or tick <= 0:
+        return np.nan
+    rounded = round(value / tick) * tick
+    decimals = 2 if tick < 0.1 else 1 if tick < 1 else 0
+    return round(rounded, decimals)
+
+
+def format_tw_price_change(value: float, reference_price: float) -> str:
+    """依價格級距格式化台股漲跌金額；千元股顯示整數，例如 -10。"""
+    if pd.isna(value):
+        return "N/A"
+    tick = tw_stock_tick_size(reference_price)
+    decimals = 2 if pd.notna(tick) and tick < 0.1 else 1 if pd.notna(tick) and tick < 1 else 0
+    return f"{float(value):+,.{decimals}f}"
+
+
 def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
-    """三種策略共用的延伸欄位（漲跌、量比、主力成本、RSI、MACD…），
-    確保切換策略不影響既有的 AI 評分／K線／AI分析／公司資訊等下游功能。"""
+    """建立策略共用欄位，技術價與畫面報價分流。
+
+    close 使用還原價供均線、型態與 ATR 計算；raw_close（若存在）使用交易所
+    原始成交價供現價、昨收與當日漲跌顯示。
+    """
     closes = df["close"]
+    quote_closes = df["raw_close"] if "raw_close" in df.columns else closes
     volumes = df["volume"]
-    curr_price = float(closes.iloc[-1])
+
+    signal_price = float(closes.iloc[-1])
+    curr_price = round_to_tw_stock_tick(float(quote_closes.iloc[-1]))
+    prev_close = round_to_tw_stock_tick(float(quote_closes.iloc[-2])) if len(quote_closes) >= 2 else np.nan
+    change_amount = curr_price - prev_close if pd.notna(curr_price) and pd.notna(prev_close) else np.nan
+    price_change = (change_amount / prev_close * 100) if pd.notna(change_amount) and pd.notna(prev_close) and prev_close > 0 else np.nan
+
     vol_today = int(volumes.iloc[-1])
     vol_yesterday = float(volumes.iloc[-2]) if len(volumes) >= 2 else np.nan
     avg_vol20 = float(volumes.tail(20).mean())
     ma30 = closes.rolling(30).mean().iloc[-1]
     main_cost = calc_main_cost(df, 20)
-    cost_gap = ((curr_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
+    cost_gap = ((signal_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
     high20 = float(closes.tail(20).max())
     high60 = float(closes.tail(60).max())
-    prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else np.nan
-    price_change = ((curr_price - prev_close) / prev_close * 100) if pd.notna(prev_close) and prev_close > 0 else np.nan
     vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if pd.notna(vol_yesterday) and vol_yesterday > 0 else 0
-    bias_30 = ((curr_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 > 0 else np.nan
-    # [新功能] 只存 ATR 原始值：停損價與建議張數跟使用者的風險設定有關，
+    bias_30 = ((signal_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 > 0 else np.nan
+    # 只存 ATR 原始值：停損價與建議張數跟使用者的風險設定有關，
     # 留到顯示時再算，調參數就不必重跑整輪掃描。
     atr20 = calc_atr(df, 20)
     return {**s,
         "ATR20":      round(atr20, 2) if pd.notna(atr20) else np.nan,
-        "ATR比例(%)":  round(atr20 / curr_price * 100, 2) if pd.notna(atr20) and curr_price > 0 else np.nan,
-        "收盤":       round(curr_price, 2),
+        "ATR比例(%)":  round(atr20 / signal_price * 100, 2) if pd.notna(atr20) and signal_price > 0 else np.nan,
+        "收盤":       curr_price,
+        "昨收":       prev_close,
+        "漲跌價":     round(change_amount, 2) if pd.notna(change_amount) else np.nan,
         "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
         "乖離30MA(%)": round(bias_30, 2) if pd.notna(bias_30) else np.nan,
         "成交量(張)":  vol_today,
@@ -1732,8 +1972,8 @@ def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
         "主力成本乖離(%)": round(cost_gap, 2) if pd.notna(cost_gap) else np.nan,
         "RSI14":      round(calc_rsi(closes), 1),
         "MACD柱":     round(calc_macd_hist(closes), 3),
-        "突破20日高":  curr_price >= high20,
-        "接近60日高":  curr_price >= high60 * 0.97,
+        "突破20日高":  signal_price >= high20,
+        "接近60日高":  signal_price >= high60 * 0.97,
     }
 
 
@@ -4453,7 +4693,8 @@ with tab_scan:
                         "ticker": base["ticker"], "code": base["code"], "name": base["name"],
                         "industry": base["industry"],
                         "市場別": base.get("市場別", "上市" if str(base.get("ticker", "")).endswith(".TW") else "上櫃" if str(base.get("ticker", "")).endswith(".TWO") else "興櫃"),
-                        "收盤": base["收盤"], "漲跌幅(%)": base.get("漲跌幅(%)", np.nan),
+                        "收盤": base["收盤"], "昨收": base.get("昨收", np.nan),
+                        "漲跌價": base.get("漲跌價", np.nan), "漲跌幅(%)": base.get("漲跌幅(%)", np.nan),
                         "乖離30MA(%)": base["乖離30MA(%)"], "成交量(張)": base["成交量(張)"],
                         "量變動(%)": base["量變動(%)"], "量比20日": base.get("量比20日", np.nan),
                         "主力成本": base.get("主力成本", np.nan),
@@ -4825,9 +5066,15 @@ with tab_workspace:
             chg = current_stock.get('漲跌幅(%)', np.nan)
             chg_color = 'var(--green)' if pd.notna(chg) and chg >= 0 else 'var(--red)'
             chg_txt = 'N/A' if pd.isna(chg) else f"{chg:+.2f}%"
-            prev_est = np.nan if pd.isna(price) or pd.isna(chg) or chg == -100 else price / (1 + chg / 100)
-            chg_amt = np.nan if pd.isna(prev_est) else price - prev_est
-            chg_amt_txt = 'N/A' if pd.isna(chg_amt) else f"{chg_amt:+.2f}"
+            # 漲跌價優先使用資料層直接保存的「今日原始收盤－昨收」，不再由已
+            # 四捨五入的漲跌幅反推。舊快取沒有漲跌價時才使用跳動單位校正後的備援。
+            chg_amt = current_stock.get('漲跌價', np.nan)
+            if pd.isna(chg_amt):
+                prev_est = np.nan if pd.isna(price) or pd.isna(chg) or chg == -100 else price / (1 + chg / 100)
+                prev_tick_price = round_to_tw_stock_tick(prev_est) if pd.notna(prev_est) else np.nan
+                current_tick_price = round_to_tw_stock_tick(price) if pd.notna(price) else np.nan
+                chg_amt = current_tick_price - prev_tick_price if pd.notna(current_tick_price) and pd.notna(prev_tick_price) else np.nan
+            chg_amt_txt = format_tw_price_change(chg_amt, price)
             score_val = current_stock.get('AI評分', np.nan)
             score_txt = 'N/A' if pd.isna(score_val) else f"{int(score_val)} / 100"
             vol_ratio_txt = fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')
@@ -5640,6 +5887,77 @@ with tab_workspace:
 # ------------------------------------------------------------
 with tab_portfolio:
     st.markdown('<div class="section-head"><div><div class="section-title">持倉管理中心</div><div class="section-help">管理進場成本、股數、停損與目標價，統一追蹤損益、R 倍數與 Telegram 停損警示。</div></div></div>', unsafe_allow_html=True)
+
+    # GitHub 設定完成後，首次進入持倉頁會從雲端拉回資料，避免重新部署後持倉消失。
+    _gh_cfg = get_github_sync_config()
+    if _gh_cfg.get('enabled') and not st.session_state.get('github_portfolio_loaded'):
+        _local_positions_before_pull = load_positions()
+        if not _local_positions_before_pull:
+            _pull_ok, _pull_msg, _cloud_positions = pull_positions_from_github(_gh_cfg)
+            if _pull_ok:
+                save_positions(_cloud_positions, sync_cloud=False)
+            st.session_state.github_sync_status = {
+                'ok': _pull_ok, 'message': _pull_msg,
+                'time': get_tw_now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+        else:
+            st.session_state.github_sync_status = {
+                'ok': True, 'message': f'本機已有 {len(_local_positions_before_pull)} 筆紀錄，保留本機資料；需要時可手動從 GitHub 拉回。',
+                'time': get_tw_now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+        st.session_state.github_portfolio_loaded = True
+
+    with st.expander("☁️ GitHub Actions 全天候監控", expanded=False):
+        st.markdown(
+            "GitHub Actions 會讀取 `portfolio_actions.json`，在台股交易時段定期檢查停損與目標價；"
+            "Streamlit 新增、修改、平倉或刪除持倉時會自動同步。"
+        )
+        gh1, gh2, gh3 = st.columns([1.6, 1, 1.4])
+        with gh1:
+            st.text_input("GitHub Repository", value=_gh_cfg.get('repo', ''), disabled=True, help="格式：owner/repository；請放在 Streamlit Secrets 的 GITHUB_REPO。")
+        with gh2:
+            st.text_input("Branch", value=_gh_cfg.get('branch', 'main'), disabled=True)
+        with gh3:
+            st.text_input("監控檔路徑", value=_gh_cfg.get('path', 'portfolio_actions.json'), disabled=True)
+
+        gb1, gb2, gb3 = st.columns(3)
+        with gb1:
+            if st.button("☁️ 立即同步到 GitHub", use_container_width=True, key="sync_portfolio_github", disabled=not _gh_cfg.get('enabled')):
+                ok, message = sync_positions_to_github(load_positions(), _gh_cfg)
+                st.session_state.github_sync_status = {'ok': ok, 'message': message, 'time': get_tw_now().strftime('%Y-%m-%d %H:%M:%S')}
+                (st.success if ok else st.error)(message)
+        with gb2:
+            if st.button("⬇️ 從 GitHub 拉回", use_container_width=True, key="pull_portfolio_github", disabled=not _gh_cfg.get('enabled')):
+                ok, message, cloud_positions = pull_positions_from_github(_gh_cfg)
+                if ok:
+                    save_positions(cloud_positions, sync_cloud=False)
+                    st.session_state.portfolio_quotes = pd.DataFrame()
+                    st.session_state.github_portfolio_loaded = True
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+        with gb3:
+            cloud_payload = json.dumps(build_actions_portfolio_payload(load_positions()), ensure_ascii=False, indent=2)
+            st.download_button(
+                "📥 下載監控持倉 JSON", data=cloud_payload, file_name="portfolio_actions.json",
+                mime="application/json", use_container_width=True, key="download_actions_portfolio",
+            )
+
+        _sync_status = st.session_state.get('github_sync_status')
+        if _sync_status:
+            status_text = f"{_sync_status.get('time', '')}｜{_sync_status.get('message', '')}"
+            (st.success if _sync_status.get('ok') else st.warning)(status_text)
+        if not _gh_cfg.get('enabled'):
+            st.info("尚未啟用自動同步。請在 Streamlit Secrets 設定 GITHUB_REPO、GITHUB_SYNC_TOKEN、GITHUB_BRANCH 與 GITHUB_PORTFOLIO_PATH。")
+        st.code(
+            'GITHUB_REPO = "你的帳號/你的Repository"\n'
+            'GITHUB_SYNC_TOKEN = "GitHub Fine-grained Token"\n'
+            'GITHUB_BRANCH = "main"\n'
+            'GITHUB_PORTFOLIO_PATH = "portfolio_actions.json"',
+            language='toml',
+        )
+        st.caption("Token 至少需要目標 Repository 的 Contents: Read and write 權限；不要把 Token 寫進公開程式碼或 GitHub 檔案。")
 
     # Telegram 設定
     with st.expander("✈️ Telegram 停損警示設定", expanded=False):
