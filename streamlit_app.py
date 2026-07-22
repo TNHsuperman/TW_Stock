@@ -1224,7 +1224,10 @@ def download_batch_history(tickers: tuple) -> dict:
         return {}
     ticker_str = " ".join(tickers)
     try:
-        raw = yf.download(ticker_str, period="4mo", interval="1d",
+        # [修正] 4mo 只有約 79~84 根 K 棒，剛好卡在策略4（需要 80 根、MA60+攻擊/拉回區間）
+        # 的邊緣，遇到農曆年那種長假就會不足而整批掃不出東西。改成 6mo（約 122~127 根）
+        # 留出餘裕；其餘策略最多只需要 65 根，不受影響。
+        raw = yf.download(ticker_str, period="6mo", interval="1d",
                           group_by="ticker", auto_adjust=True, progress=False, threads=True)
     except Exception:
         return {}
@@ -1496,7 +1499,9 @@ def calc_ma_attack_pullback_signals(history_map, stock_map, shrink_ratio_limit, 
     for s in stock_map:
         tk = s["ticker"]
         df = history_map.get(tk)
-        if df is None or len(df) < 90:
+        # 條件函式要求 i >= 79，也就是至少 80 根 K 棒；原本寫 90 是比實際需求還嚴的
+        # 保守值，配上當時 4mo 的下載視窗就變成「永遠不成立」，掃描必定 0 檔。
+        if df is None or len(df) < 80:
             continue
         closes = df["close"]
         volumes = df["volume"]
@@ -2592,7 +2597,9 @@ def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float
                 sub = raw[tk][["Close", "Volume"]].dropna()
         except Exception:
             continue
-        if len(sub) < 65:
+        # 策略4 的條件函式在 i < 79 一律回 False，資料太短等於整檔沒訊號，先擋掉
+        min_bars = 80 if strategy_name == "均線多頭+攻擊量縮拉回" else 65
+        if len(sub) < min_bars:
             continue
 
         closes = sub["Close"].astype(float).reset_index(drop=True)
