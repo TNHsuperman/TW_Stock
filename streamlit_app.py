@@ -3659,35 +3659,76 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .meta-v{margin-top:5px;font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;color:#f4f8ff;white-space:nowrap;}
 
 /* ── 精簡步驟條 ── */
-.workflow{display:flex;align-items:center;gap:6px;margin:0 0 18px;padding:0 4px;overflow-x:auto;}
+.workflow{display:flex;align-items:center;gap:6px;margin:0 0 26px;padding:0 4px;overflow-x:auto;}
 .workflow-step{display:flex;align-items:center;gap:7px;padding:8px 10px;color:#66778e;font-size:11px;font-weight:700;white-space:nowrap;}
 .workflow-step:not(:last-child):after{content:'›';margin-left:7px;color:#35465c;font-size:15px;}
 .workflow-step b{display:inline-flex;width:21px;height:21px;border-radius:50%;align-items:center;justify-content:center;background:#111c2c;border:1px solid var(--border);color:#6f8097;font-size:10px;}
 .workflow-step.active{color:#cdd9e8;}.workflow-step.active b{background:rgba(110,168,254,.14);border-color:var(--border-strong);color:#9fc5ff;}
 
 /* ── 頂層導覽 ──
-   同時掛 baseweb 屬性選擇器與 ARIA role 選擇器：新版 Streamlit 改過 DOM，
-   只寫 [data-baseweb='tab'] 會整組失效，頁籤就會退回原生樣式（在深色底上看不見）。
-   另外 Streamlit 把頁籤文字包在 <p> 裡，<p> 有自己的顏色，必須明確 inherit。 */
-[data-baseweb='tab-list'],[data-testid='stTabs'] [role='tablist']{
+   Streamlit 各版本的頁籤 DOM 不一致（.stTabs / [data-testid='stTabs'] /
+   [data-baseweb='tab-list'] / role='tablist' 都出現過），只押一種寫法很容易整組落空，
+   落空就會退回原生樣式：字擠在一起、底下還帶一條 primaryColor 的紅線。
+   所以這裡把幾種寫法全部並列，並且直接選 button 而不是 button[role='tab']。 */
+.stTabs [data-baseweb='tab-list'],
+[data-testid='stTabs'] [data-baseweb='tab-list'],
+[data-testid='stTabs'] [role='tablist'],
+[data-baseweb='tab-list']{
   position:sticky;top:0;z-index:50;
-  gap:4px;background:rgba(9,16,27,.88)!important;backdrop-filter:blur(14px);
-  border:1px solid var(--border)!important;border-radius:15px;padding:5px!important;margin:0 0 24px;overflow-x:auto;
+  display:flex!important;flex-wrap:wrap!important;align-items:center!important;
+  gap:8px!important;
+  background:rgba(9,16,27,.92)!important;backdrop-filter:blur(14px);
+  border:1px solid var(--border)!important;border-bottom:1px solid var(--border)!important;
+  border-radius:15px!important;padding:7px!important;margin:0 0 28px!important;
 }
-[data-baseweb='tab'],[data-testid='stTabs'] button[role='tab']{
-  height:42px;border-radius:10px;padding:0 17px!important;border:0!important;background:transparent!important;
-  color:var(--muted)!important;font-size:13px!important;font-weight:700!important;white-space:nowrap;
+
+/* 單顆頁籤：給足左右內距，別再讓四個標題黏成一行 */
+.stTabs [data-baseweb='tab-list'] button,
+[data-testid='stTabs'] [role='tablist'] button,
+[data-baseweb='tab-list'] button,
+[data-baseweb='tab']{
+  flex:0 0 auto!important;
+  height:auto!important;min-height:40px!important;
+  padding:10px 20px!important;margin:0!important;
+  border:0!important;border-bottom:0!important;border-radius:10px!important;
+  background:transparent!important;color:#8796aa!important;
+  font-size:13px!important;font-weight:700!important;white-space:nowrap!important;
+  transition:background .15s ease,color .15s ease!important;
 }
-[data-baseweb='tab'] p,[data-testid='stTabs'] button[role='tab'] p{
-  color:inherit!important;font-size:13px!important;font-weight:700!important;margin:0!important;
+
+/* Streamlit 把標題包在 <p> 裡，<p> 自帶顏色與行距，必須明確覆蓋 */
+.stTabs [data-baseweb='tab-list'] button p,
+[data-testid='stTabs'] [role='tablist'] button p,
+[data-baseweb='tab-list'] button p,
+[data-baseweb='tab'] p{
+  color:inherit!important;font-size:13px!important;font-weight:700!important;
+  margin:0!important;line-height:1.2!important;letter-spacing:.01em!important;
 }
-[data-baseweb='tab']:hover,[data-testid='stTabs'] button[role='tab']:hover{background:rgba(255,255,255,.05)!important;color:#d9e4f2!important;}
-[data-baseweb='tab'][aria-selected='true'],[data-testid='stTabs'] button[role='tab'][aria-selected='true']{
-  background:var(--surface-3)!important;color:#ffffff!important;box-shadow:inset 0 0 0 1px rgba(110,168,254,.28);
+
+.stTabs [data-baseweb='tab-list'] button:hover,
+[data-testid='stTabs'] [role='tablist'] button:hover,
+[data-baseweb='tab-list'] button:hover,
+[data-baseweb='tab']:hover{background:rgba(255,255,255,.055)!important;color:#d9e4f2!important;}
+
+.stTabs [data-baseweb='tab-list'] button[aria-selected='true'],
+[data-testid='stTabs'] [role='tablist'] button[aria-selected='true'],
+[data-baseweb='tab-list'] button[aria-selected='true'],
+[data-baseweb='tab'][aria-selected='true']{
+  background:var(--surface-3)!important;color:#ffffff!important;
+  box-shadow:inset 0 0 0 1px rgba(110,168,254,.30)!important;
 }
-[data-baseweb='tab-highlight'],[data-testid='stTabs'] [data-baseweb='tab-highlight']{display:none!important;}
-[data-baseweb='tab-border'],[data-testid='stTabs'] [data-baseweb='tab-border']{display:none!important;}
-[data-baseweb='tab-panel'],[data-testid='stTabs'] [role='tabpanel']{padding-top:0;}
+
+/* 原生的滑動底線／分隔線：紅線就是從這裡來的，一律關掉 */
+.stTabs [data-baseweb='tab-highlight'],
+[data-testid='stTabs'] [data-baseweb='tab-highlight'],
+[data-baseweb='tab-highlight'],
+.stTabs [data-baseweb='tab-border'],
+[data-testid='stTabs'] [data-baseweb='tab-border'],
+[data-baseweb='tab-border']{
+  display:none!important;background:transparent!important;height:0!important;border:0!important;
+}
+
+[data-baseweb='tab-panel'],[data-testid='stTabs'] [role='tabpanel']{padding-top:0!important;}
 
 /* ── 標題與留白 ── */
 .section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:30px 0 14px;}
