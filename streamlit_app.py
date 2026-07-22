@@ -72,6 +72,10 @@ for key, default in [
     # [新功能] 個股投資分析報告：量化資料 + 同業比較 + 波動率情境價 + AI敘事
     ('report_target_code', None),     # 目前報告頁籤鎖定要看的股票代碼
     ('report_cache',       {}),       # {代碼: 報告dict}，避免每次重跑都重新呼叫AI（成本較高）
+    # [新功能] 風險控管與部位計算：ATR 停損倍數、單筆可承受風險金額
+    ('risk_budget',        30000),   # 單筆交易可承受的最大虧損金額（元）
+    ('atr_stop_mult',      2.0),     # 停損價 = 現價 − N × ATR20，N 即這個倍數
+    ('show_position_cols', True),    # 是否在候選清單表格顯示停損／張數兩欄
     # report tab session state keys are initialized inline above
 ]:
     if key not in st.session_state:
@@ -1195,6 +1199,36 @@ def build_pe_river_data(code: str, market_suffix: str, ticker: str) -> dict:
     }
 
 
+def _extract_ohlcv(frame) -> pd.DataFrame:
+    """[新功能] 從 yfinance 回傳的單檔資料表萃取出掃描要用的欄位。
+
+    以前只留 Close/Volume，導致算不出 ATR（真實波幅需要當日高低點）。
+    yfinance 本來就把 High/Low 一起抓下來了，保留它們不會多花任何網路成本。
+
+    fail-open：某些個股（新上市、長期停牌）可能缺 High/Low，這時退回只取
+    Close/Volume，ATR 會改用收盤價振幅近似，而不是整檔資料被丟掉。
+    """
+    if frame is None:
+        return None
+    try:
+        df = frame[["Close", "High", "Low", "Volume"]].dropna()
+        df.columns = ["close", "high", "low", "volume"]
+    except Exception:
+        try:
+            df = frame[["Close", "Volume"]].dropna()
+            df.columns = ["close", "volume"]
+        except Exception:
+            return None
+    if df.empty:
+        return None
+    try:
+        df["volume"] = (df["volume"] / 1000).astype(int)
+        df = _trim_stale_trailing_days(df)
+        return df.reset_index(drop=True)
+    except Exception:
+        return None
+
+
 def _trim_stale_trailing_days(df: pd.DataFrame) -> pd.DataFrame:
     """[修正] 移除資料尾端「非交易日佔位列」。
 
@@ -1239,24 +1273,17 @@ def download_batch_history(tickers: tuple) -> dict:
     result = {}
     if len(tickers) == 1:
         tk = tickers[0]
-        try:
-            df = raw[["Close", "Volume"]].dropna()
-            df.columns = ["close", "volume"]
-            df["volume"] = (df["volume"] / 1000).astype(int)
-            df = _trim_stale_trailing_days(df)
-            result[tk] = df.reset_index(drop=True)
-        except:
-            pass
+        df = _extract_ohlcv(raw)
+        if df is not None:
+            result[tk] = df
     else:
         for tk in tickers:
             try:
-                df = raw[tk][["Close", "Volume"]].dropna()
-                df.columns = ["close", "volume"]
-                df["volume"] = (df["volume"] / 1000).astype(int)
-                df = _trim_stale_trailing_days(df)
-                result[tk] = df.reset_index(drop=True)
-            except:
-                pass
+                df = _extract_ohlcv(raw[tk])
+            except Exception:
+                continue
+            if df is not None:
+                result[tk] = df
     return result
 
 # ============================================================
@@ -1408,7 +1435,12 @@ def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
     price_change = ((curr_price - prev_close) / prev_close * 100) if pd.notna(prev_close) and prev_close > 0 else np.nan
     vol_change = ((vol_today - vol_yesterday) / vol_yesterday * 100) if pd.notna(vol_yesterday) and vol_yesterday > 0 else 0
     bias_30 = ((curr_price - ma30) / ma30 * 100) if pd.notna(ma30) and ma30 > 0 else np.nan
+    # [新功能] 只存 ATR 原始值：停損價與建議張數跟使用者的風險設定有關，
+    # 留到顯示時再算，調參數就不必重跑整輪掃描。
+    atr20 = calc_atr(df, 20)
     return {**s,
+        "ATR20":      round(atr20, 2) if pd.notna(atr20) else np.nan,
+        "ATR比例(%)":  round(atr20 / curr_price * 100, 2) if pd.notna(atr20) and curr_price > 0 else np.nan,
         "收盤":       round(curr_price, 2),
         "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
         "乖離30MA(%)": round(bias_30, 2) if pd.notna(bias_30) else np.nan,
@@ -2272,6 +2304,85 @@ def calc_macd_hist(close: pd.Series) -> float:
         return float(hist.iloc[-1]) if pd.notna(hist.iloc[-1]) else np.nan
     except Exception:
         return np.nan
+
+
+def calc_atr(df: pd.DataFrame, period: int = 20) -> float:
+    """[新功能] 平均真實區間 ATR（Wilder 平滑），用來衡量個股「日常會震多少」。
+
+    真實區間 TR = max(當日高 − 當日低, |當日高 − 昨收|, |當日低 − 昨收|)，
+    取 |高−昨收| 與 |低−昨收| 是為了把跳空缺口算進波動裡；只看高低差會低估。
+    平滑用 Wilder 的 RMA（alpha = 1/period），跟看盤軟體的 ATR 定義一致，
+    不是單純的算術平均。
+
+    若資料缺 high/low（少數個股），退回用收盤價的日變動絕對值近似，
+    這個近似值會略為低估波動（沒有把盤中振幅與跳空算進去）。
+    """
+    try:
+        if df is None or df.empty or len(df) < period + 1:
+            return np.nan
+        close = df["close"].astype(float)
+        if "high" in df.columns and "low" in df.columns:
+            high = df["high"].astype(float)
+            low = df["low"].astype(float)
+            prev_close = close.shift(1)
+            tr = pd.concat([
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ], axis=1).max(axis=1)
+        else:
+            tr = close.diff().abs()
+        tr = tr.dropna()
+        if len(tr) < period:
+            return np.nan
+        atr = tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
+        return float(atr) if pd.notna(atr) and atr > 0 else np.nan
+    except Exception:
+        return np.nan
+
+
+def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=1000) -> dict:
+    """[新功能] 由 ATR 推出停損價，再由「單筆可承受虧損」反推該買幾張。
+
+    邏輯是部位大小服從風險，而不是服從資金：
+        停損價   = 現價 − atr_mult × ATR
+        每張風險 = (現價 − 停損價) × 1000 股
+        建議張數 = 單筆可承受虧損 ÷ 每張風險（無條件捨去）
+
+    這樣不論標的波動大小，一次做錯的損失都被壓在同一個數字上——
+    波動大的股票自動買少一點，波動小的可以買多一點。固定百分比停損
+    做不到這件事（同樣 8%，對台積電太寬、對投機小型股太緊）。
+    """
+    empty = {"停損價": np.nan, "停損幅度(%)": np.nan, "每張風險": np.nan,
+             "建議張數": np.nan, "建議股數": np.nan, "投入金額": np.nan, "實際風險": np.nan}
+    try:
+        price = float(price)
+        atr = float(atr)
+        if not np.isfinite(price) or not np.isfinite(atr) or price <= 0 or atr <= 0:
+            return empty
+        stop = price - atr_mult * atr
+        if stop <= 0:
+            return empty
+        risk_per_share = price - stop
+        risk_per_lot = risk_per_share * lot_size
+        if risk_per_lot <= 0:
+            return empty
+        lots = int(max(0, np.floor(float(risk_budget) / risk_per_lot)))
+        # [新功能] 高價股（例如千元以上）常常一張的風險就超過預算，整股會算出 0 張。
+        # 台股零股交易已經很普及，這時改給「建議股數」，功能才不會對高價股失效。
+        shares = int(max(0, np.floor(float(risk_budget) / risk_per_share)))
+        unit_lots = lots if lots > 0 else shares / lot_size
+        return {
+            "停損價": round(stop, 2),
+            "停損幅度(%)": round(risk_per_share / price * 100, 2),
+            "每張風險": round(risk_per_lot, 0),
+            "建議張數": lots,
+            "建議股數": shares,
+            "投入金額": round(unit_lots * price * lot_size, 0),
+            "實際風險": round(unit_lots * risk_per_lot, 0),
+        }
+    except Exception:
+        return empty
 
 
 def calc_main_cost(df: pd.DataFrame, window: int = 20) -> float:
@@ -4040,6 +4151,7 @@ with tab_scan:
                         "主力成本": base.get("主力成本", np.nan),
                         "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
                         "RSI14": base.get("RSI14", np.nan), "MACD柱": base.get("MACD柱", np.nan),
+                        "ATR20": base.get("ATR20", np.nan), "ATR比例(%)": base.get("ATR比例(%)", np.nan),
                         "突破20日高": base.get("突破20日高", False), "接近60日高": base.get("接近60日高", False),
                         "策略": base.get("策略", active_strategy), "訊號說明": base.get("訊號說明", ""),
                         "熱門股": base["code"] in hot_codes,
@@ -4203,6 +4315,40 @@ with tab_workspace:
                     st.info(f"「{bt_strategy}」在候選清單範圍內近9個月沒有找到符合條件的歷史訊號。")
 
     if has_results or has_manual:
+        # [新功能] 風險與部位設定：這兩個參數不影響選股條件，只影響「停損價」與
+        # 「建議張數」怎麼算，所以放在掃描之外，改動後即時反映、不需要重新掃描。
+        with st.expander("⚙️ 風險與部位設定（停損價與建議張數的計算基礎）", expanded=False):
+            rc1, rc2, rc3 = st.columns([1, 1, 1.3], gap="large")
+            with rc1:
+                st.session_state.risk_budget = st.number_input(
+                    "單筆可承受風險 (元)", min_value=1000, max_value=1000000,
+                    value=int(st.session_state.get("risk_budget", 30000)), step=1000,
+                    key="input_risk_budget",
+                    help="這一筆交易若走到停損，你願意賠掉多少錢。建議抓總資金的 1~2%。",
+                )
+            with rc2:
+                st.session_state.atr_stop_mult = st.number_input(
+                    "ATR 停損倍數", min_value=0.5, max_value=5.0,
+                    value=float(st.session_state.get("atr_stop_mult", 2.0)), step=0.5,
+                    key="input_atr_mult",
+                    help="停損價 = 現價 − 倍數 × ATR20。倍數越大停損越寬、越不容易被洗掉，但單張風險也越高。常用 2~3 倍。",
+                )
+            with rc3:
+                st.session_state.show_position_cols = st.checkbox(
+                    "在候選清單顯示「停損／張數」兩欄", 
+                    value=bool(st.session_state.get("show_position_cols", True)),
+                    key="input_show_pos_cols",
+                    help="表格欄位較多時可以關掉，右側報價卡仍會顯示。",
+                )
+                st.caption(
+                    f"目前設定：單筆最多賠 {int(st.session_state.risk_budget):,} 元，"
+                    f"停損放在 {st.session_state.atr_stop_mult:g} 倍 ATR 之外。"
+                )
+            st.caption(
+                "張數是由風險反推的：波動大的股票會自動建議買少一點，讓每一筆做錯時的損失都控制在同一個數字。"
+                "ATR 用 20 日 Wilder 平滑，已把跳空缺口計入。"
+            )
+
         left_col, right_col = st.columns([1.2, 2.5], gap="large")
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
@@ -4236,6 +4382,19 @@ with tab_workspace:
                 if st.session_state.get('industry_filter'):
                     view_df = view_df[view_df['industry'] == st.session_state.industry_filter]
 
+                # [新功能] 依目前風險設定即時算出每一檔的停損價與建議張數。
+                # 掃描結果只存 ATR20，所以調整設定不必重掃，這裡重算就好。
+                _mult = float(st.session_state.get("atr_stop_mult", 2.0))
+                _budget = float(st.session_state.get("risk_budget", 30000))
+                _plans = [
+                    calc_position_plan(r.get("收盤", np.nan), r.get("ATR20", np.nan), _mult, _budget)
+                    for _, r in view_df.iterrows()
+                ]
+                view_df = view_df.copy()
+                view_df["停損價"] = [pl["停損價"] for pl in _plans]
+                view_df["停損幅度(%)"] = [pl["停損幅度(%)"] for pl in _plans]
+                view_df["建議張數"] = [pl["建議張數"] for pl in _plans]
+
                 csv = view_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button("下載目前清單 CSV", csv, f'tw_stock_scan_{get_tw_now().strftime("%Y%m%d")}.csv', 'text/csv', use_container_width=True)
 
@@ -4243,6 +4402,8 @@ with tab_workspace:
                 # 切換顯示／隱藏（st-key-desktop_candidate_list），手機版改顯示下方卡片清單。
                 with st.container(key="desktop_candidate_list"):
                     show_cols = ["code", "name", "AI評分", "收盤", "漲跌幅(%)", "量比20日"]
+                    if st.session_state.get("show_position_cols", True):
+                        show_cols += ["停損價", "建議張數"]
                     available_cols = [c for c in show_cols if c in view_df.columns]
                     df_display = view_df[available_cols].rename(columns={"code": "代碼", "name": "名稱"})
                     if "熱門股" in view_df.columns:
@@ -4266,11 +4427,18 @@ with tab_workspace:
                             # [修正] 名稱欄加寬（80→118px），台股名稱常見4~6個中文字，
                             # 加上熱門股🔥前綴後原本寬度會被截斷；其餘欄位微調挪出空間。
                             "代碼": st.column_config.TextColumn("代碼", width=56),
-                            "名稱": st.column_config.TextColumn("名稱", width=118),
-                            "AI評分": st.column_config.ProgressColumn("財務評分", width=80, format="%d", min_value=0, max_value=100),
-                            "收盤": st.column_config.NumberColumn("價格", width=60, format="%.2f"),
-                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=58, format="%.1f%%"),
-                            "量比20日": st.column_config.NumberColumn("量比", width=54, format="%.2fx"),
+                            "名稱": st.column_config.TextColumn("名稱", width=110),
+                            "AI評分": st.column_config.ProgressColumn("財務評分", width=72, format="%d", min_value=0, max_value=100),
+                            "收盤": st.column_config.NumberColumn("價格", width=58, format="%.2f"),
+                            "漲跌幅(%)": st.column_config.NumberColumn("漲跌", width=56, format="%.1f%%"),
+                            "量比20日": st.column_config.NumberColumn("量比", width=52, format="%.2fx"),
+                            # [新功能] ATR 停損價與由風險反推的建議張數
+                            "停損價": st.column_config.NumberColumn(
+                                "停損", width=58, format="%.2f",
+                                help="現價 − 倍數 × ATR20。跌破代表這次判斷已經錯了，不要凹。"),
+                            "建議張數": st.column_config.NumberColumn(
+                                "張數", width=52, format="%d",
+                                help="以「單筆可承受風險 ÷ 每張到停損的虧損」反推。0 張代表這檔波動太大，用目前的風險預算買不下去。"),
                         }
                     )
                     if event and "selection" in event and event["selection"]["rows"]:
@@ -4308,6 +4476,10 @@ with tab_workspace:
                             <div><span>價</span>{fmt_num(row.get('收盤', np.nan), '{:.2f}')}</div>
                             <div><span>漲跌</span><span style="color:{chg_color};">{chg_txt}</span></div>
                             <div><span>量比</span>{fmt_num(row.get('量比20日', np.nan), '{:.2f}x')}</div>
+                          </div>
+                          <div class="msc-metrics" style="margin-top:6px;">
+                            <div><span>停損</span>{fmt_num(row.get('停損價', np.nan), '{:.2f}')}</div>
+                            <div><span>張數</span>{fmt_num(row.get('建議張數', np.nan), '{:.0f}')}</div>
                           </div>
                         </div>
                         """, unsafe_allow_html=True)
@@ -4354,6 +4526,34 @@ with tab_workspace:
             is_hot = bool(current_stock.get('熱門股', False))
             hot_tag_html = '<div class="quote-tag hot-tag">🔥 熱門股</div>' if is_hot else ''
 
+            # [新功能] ATR 停損與建議張數：把「這檔該買幾張、錯了在哪裡認輸」
+            # 直接放進報價卡，不用另外拿計算機。
+            _plan = calc_position_plan(
+                price, current_stock.get('ATR20', np.nan),
+                float(st.session_state.get('atr_stop_mult', 2.0)),
+                float(st.session_state.get('risk_budget', 30000)),
+            )
+            _atr_txt = fmt_num(current_stock.get('ATR20', np.nan), '{:.2f}')
+            _stop_txt = fmt_num(_plan['停損價'], '{:.2f}')
+            _stop_pct_txt = fmt_num(_plan['停損幅度(%)'], '-{:.1f}%')
+            _lots = _plan['建議張數']
+            _shares = _plan.get('建議股數', np.nan)
+            _cost_txt = fmt_num(_plan['投入金額'], '{:,.0f}')
+            _risk_txt = fmt_num(_plan['實際風險'], '{:,.0f}')
+            if pd.isna(_lots):
+                _lots_txt, _lots_color = 'N/A', 'var(--text)'
+                _lots_note = '缺 ATR 資料，無法計算'
+            elif _lots > 0:
+                _lots_txt, _lots_color = f"{int(_lots):,} 張", 'var(--text)'
+                _lots_note = f"預估投入 {_cost_txt} 元／到停損虧 {_risk_txt} 元"
+            elif pd.notna(_shares) and _shares > 0:
+                # 一張的風險就超過預算 → 改用零股，功能對高價股才不會失效
+                _lots_txt, _lots_color = f"{int(_shares):,} 股", 'var(--yellow)'
+                _lots_note = f"零股買法／預估投入 {_cost_txt} 元／到停損虧 {_risk_txt} 元"
+            else:
+                _lots_txt, _lots_color = '0', 'var(--red)'
+                _lots_note = '波動過大，用目前風險預算連零股都買不下去'
+
             st.markdown(f"""
             <div class="quote-panel" style="margin-top:8px;">
               <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{hot_tag_html}</div>
@@ -4362,6 +4562,11 @@ with tab_workspace:
                 <div><div class="metric-k">財務評分</div><div class="metric-v">{score_txt}</div></div>
                 <div><div class="metric-k">成交量</div><div class="metric-v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
                 <div><div class="metric-k">量比20日</div><div class="metric-v">{vol_ratio_txt}</div></div>
+              </div>
+              <div class="quote-metrics" style="margin-top:10px;">
+                <div><div class="metric-k">ATR20 停損價</div><div class="metric-v" style="color:var(--red);">{_stop_txt}</div><div class="metric-k" style="margin-top:3px;font-weight:600;">距現價 {_stop_pct_txt}／ATR {_atr_txt}</div></div>
+                <div><div class="metric-k">建議張數</div><div class="metric-v" style="color:{_lots_color};">{_lots_txt}</div><div class="metric-k" style="margin-top:3px;font-weight:600;">{_lots_note}</div></div>
+                <div><div class="metric-k">風險設定</div><div class="metric-v">{int(st.session_state.get('risk_budget', 30000)):,}</div><div class="metric-k" style="margin-top:3px;font-weight:600;">單筆上限／{st.session_state.get('atr_stop_mult', 2.0):g}× ATR</div></div>
               </div>
             </div>
             """, unsafe_allow_html=True)
