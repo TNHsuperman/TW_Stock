@@ -76,6 +76,10 @@ for key, default in [
     ('risk_budget',        30000),   # 單筆交易可承受的最大虧損金額（元）
     ('atr_stop_mult',      2.0),     # 停損價 = 現價 − N × ATR20，N 即這個倍數
     ('show_position_cols', True),    # 是否在候選清單表格顯示停損／張數兩欄
+    # [新功能] 持倉中心／Telegram 停損警示
+    ('portfolio_quotes', pd.DataFrame()),
+    ('portfolio_last_check', None),
+    ('portfolio_alert_result', []),
     # report tab session state keys are initialized inline above
 ]:
     if key not in st.session_state:
@@ -154,6 +158,283 @@ def remove_from_watchlist(code: str) -> list:
     watchlist = [item for item in watchlist if str(item.get('code')) != str(code)]
     save_watchlist(watchlist)
     return watchlist
+
+
+# ============================================================
+# [新功能] 持倉管理／交易計畫／Telegram 停損警示
+# ============================================================
+# 持倉與 Telegram 設定採輕量 JSON 持久化，使用方式與追蹤清單一致。
+# Streamlit Cloud 重新部署時容器檔案可能被重建；正式長期使用建議改接資料庫，
+# Telegram Token 則優先放在 .streamlit/secrets.toml 或環境變數。
+
+APP_DATA_DIR = os.path.dirname(__file__) if '__file__' in globals() else '.'
+PORTFOLIO_FILE = os.path.join(APP_DATA_DIR, 'portfolio_v1.json')
+TELEGRAM_CONFIG_FILE = os.path.join(APP_DATA_DIR, 'telegram_alert_config_v1.json')
+
+
+def _safe_number(value, default=np.nan):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else default
+    except Exception:
+        return default
+
+
+def load_positions() -> list:
+    """讀取持倉紀錄；損毀或不存在時回傳空清單。"""
+    try:
+        if os.path.exists(PORTFOLIO_FILE):
+            with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def save_positions(positions: list) -> bool:
+    try:
+        with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
+            json.dump(positions, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def find_open_position(code: str, positions=None):
+    positions = load_positions() if positions is None else positions
+    return next((p for p in positions
+                 if str(p.get('code')) == str(code) and p.get('status', 'open') == 'open'), None)
+
+
+def upsert_position(position: dict) -> tuple[bool, str]:
+    """同一股票只保留一筆未平倉部位；再次儲存時更新原紀錄。"""
+    positions = load_positions()
+    code = str(position.get('code', '')).strip()
+    if not code:
+        return False, '股票代碼不可空白'
+
+    now_text = get_tw_now().isoformat(timespec='seconds')
+    position = dict(position)
+    position.setdefault('id', uuid.uuid4().hex)
+    position.setdefault('created_at', now_text)
+    position['updated_at'] = now_text
+    position['status'] = 'open'
+    position.setdefault('stop_alert_active', False)
+    position.setdefault('last_stop_alert_at', '')
+
+    replaced = False
+    for i, old in enumerate(positions):
+        if str(old.get('code')) == code and old.get('status', 'open') == 'open':
+            position['id'] = old.get('id', position['id'])
+            position['created_at'] = old.get('created_at', position['created_at'])
+            position['stop_alert_active'] = old.get('stop_alert_active', False)
+            position['last_stop_alert_at'] = old.get('last_stop_alert_at', '')
+            positions[i] = position
+            replaced = True
+            break
+    if not replaced:
+        positions.append(position)
+
+    ok = save_positions(positions)
+    return ok, ('已更新既有持倉' if replaced else '已建立持倉') if ok else '持倉檔案寫入失敗'
+
+
+def update_position(position_id: str, changes: dict) -> bool:
+    positions = load_positions()
+    changed = False
+    for p in positions:
+        if p.get('id') == position_id:
+            p.update(changes)
+            p['updated_at'] = get_tw_now().isoformat(timespec='seconds')
+            changed = True
+            break
+    return save_positions(positions) if changed else False
+
+
+def close_position(position_id: str, exit_price: float, exit_date: str, exit_note: str = '') -> bool:
+    positions = load_positions()
+    changed = False
+    for p in positions:
+        if p.get('id') == position_id and p.get('status', 'open') == 'open':
+            p['status'] = 'closed'
+            p['exit_price'] = round(float(exit_price), 2)
+            p['exit_date'] = exit_date
+            p['exit_note'] = exit_note
+            p['updated_at'] = get_tw_now().isoformat(timespec='seconds')
+            entry = _safe_number(p.get('entry_price'))
+            shares = _safe_number(p.get('shares'), 0)
+            if pd.notna(entry):
+                p['realized_pnl'] = round((float(exit_price) - entry) * shares, 0)
+                p['realized_return_pct'] = round((float(exit_price) / entry - 1) * 100, 2) if entry > 0 else np.nan
+            changed = True
+            break
+    return save_positions(positions) if changed else False
+
+
+def delete_position(position_id: str) -> bool:
+    positions = load_positions()
+    kept = [p for p in positions if p.get('id') != position_id]
+    return save_positions(kept) if len(kept) != len(positions) else False
+
+
+def _load_local_telegram_config() -> dict:
+    try:
+        if os.path.exists(TELEGRAM_CONFIG_FILE):
+            with open(TELEGRAM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def get_telegram_config() -> dict:
+    """Secrets／環境變數優先，本機 JSON 作為方便測試的備援。"""
+    local = _load_local_telegram_config()
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+    chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+    try:
+        token = token or str(st.secrets['TELEGRAM_BOT_TOKEN']).strip()
+    except Exception:
+        pass
+    try:
+        chat_id = chat_id or str(st.secrets['TELEGRAM_CHAT_ID']).strip()
+    except Exception:
+        pass
+    return {
+        'bot_token': token or str(local.get('bot_token', '')).strip(),
+        'chat_id': chat_id or str(local.get('chat_id', '')).strip(),
+        'auto_check': bool(local.get('auto_check', False)),
+        'interval_minutes': int(local.get('interval_minutes', 5) or 5),
+    }
+
+
+def save_telegram_config(bot_token: str, chat_id: str, auto_check: bool, interval_minutes: int) -> bool:
+    payload = {
+        'bot_token': str(bot_token).strip(),
+        'chat_id': str(chat_id).strip(),
+        'auto_check': bool(auto_check),
+        'interval_minutes': int(interval_minutes),
+    }
+    try:
+        with open(TELEGRAM_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def send_telegram_message(message: str, config=None):
+    config = get_telegram_config() if config is None else config
+    token = str(config.get('bot_token', '')).strip()
+    chat_id = str(config.get('chat_id', '')).strip()
+    if not token or not chat_id:
+        return False, '尚未設定 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID'
+    try:
+        r = requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            data={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': True},
+            timeout=12,
+        )
+        payload = r.json() if r.text else {}
+        if r.status_code == 200 and payload.get('ok'):
+            return True, 'Telegram 訊息已送出'
+        description = payload.get('description') if isinstance(payload, dict) else r.text
+        return False, f'Telegram 回覆錯誤：{description or r.status_code}'
+    except Exception as exc:
+        return False, f'Telegram 連線失敗：{exc}'
+
+
+def refresh_portfolio_positions(send_alerts: bool = False) -> tuple[pd.DataFrame, list]:
+    """更新未平倉部位的最新價格、損益、R 倍數，必要時發出停損通知。"""
+    positions = load_positions()
+    open_positions = [p for p in positions if p.get('status', 'open') == 'open']
+    if not open_positions:
+        return pd.DataFrame(), []
+
+    tickers = tuple(dict.fromkeys(p.get('ticker', '') for p in open_positions if p.get('ticker')))
+    history_map = download_batch_history(tickers) if tickers else {}
+    telegram_config = get_telegram_config()
+    alert_results = []
+    file_changed = False
+    rows = []
+
+    for p in open_positions:
+        tk = p.get('ticker', '')
+        history = history_map.get(tk)
+        current = np.nan
+        quote_date = ''
+        if history is not None and not history.empty:
+            current = _safe_number(history['close'].iloc[-1])
+            try:
+                quote_date = pd.Timestamp(history.index[-1]).strftime('%Y-%m-%d')
+            except Exception:
+                quote_date = get_tw_now().strftime('%Y-%m-%d')
+
+        entry = _safe_number(p.get('entry_price'))
+        stop = _safe_number(p.get('stop_price'))
+        target1 = _safe_number(p.get('target1'))
+        target2 = _safe_number(p.get('target2'))
+        shares = _safe_number(p.get('shares'), 0)
+        pnl = (current - entry) * shares if pd.notna(current) and pd.notna(entry) else np.nan
+        ret = (current / entry - 1) * 100 if pd.notna(current) and pd.notna(entry) and entry > 0 else np.nan
+        original_risk = (entry - stop) * shares if pd.notna(entry) and pd.notna(stop) and entry > stop else np.nan
+        r_multiple = pnl / original_risk if pd.notna(pnl) and pd.notna(original_risk) and original_risk > 0 else np.nan
+        stop_triggered = bool(pd.notna(current) and pd.notna(stop) and current <= stop)
+
+        if stop_triggered:
+            state = '🔴 跌破停損'
+        elif pd.notna(target2) and pd.notna(current) and current >= target2:
+            state = '🏆 達第二目標'
+        elif pd.notna(target1) and pd.notna(current) and current >= target1:
+            state = '🟢 達第一目標'
+        else:
+            state = '持有中'
+
+        # 僅在「第一次跌破」時通知；單純更新報價不會提前消耗通知狀態。
+        # 價格重新站回停損後，下一次再跌破才重新通知。
+        was_active = bool(p.get('stop_alert_active', False))
+        if stop_triggered and not was_active and send_alerts and bool(p.get('telegram_alert', True)):
+            message = (
+                f"【停損警示】{p.get('name', '')} ({p.get('code', '')})\n\n"
+                f"最新價格：{current:.2f}\n"
+                f"停損價格：{stop:.2f}\n"
+                f"進場成本：{entry:.2f}\n"
+                f"持有股數：{shares:,.0f} 股\n"
+                f"未實現損益：{pnl:+,.0f} 元 ({ret:+.2f}%)\n"
+                f"目前 R 倍數：{r_multiple:+.2f}R\n"
+                f"策略：{p.get('strategy', '未填寫')}\n"
+                f"檢查時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "價格已觸及或跌破原定停損，請依交易計畫處理，不要任意放寬停損。"
+            )
+            ok, msg = send_telegram_message(message, telegram_config)
+            alert_results.append({'code': p.get('code'), 'ok': ok, 'message': msg})
+            if ok:
+                p['stop_alert_active'] = True
+                p['last_stop_alert_at'] = get_tw_now().isoformat(timespec='seconds')
+                file_changed = True
+        elif not stop_triggered and was_active:
+            p['stop_alert_active'] = False
+            file_changed = True
+
+        p['last_price'] = round(current, 2) if pd.notna(current) else None
+        p['last_quote_date'] = quote_date
+        file_changed = True
+        rows.append({
+            '代碼': p.get('code', ''), '名稱': p.get('name', ''),
+            '進場日': p.get('entry_date', ''), '成本': entry, '股數': shares,
+            '現價': current, '損益(元)': pnl, '報酬率(%)': ret,
+            'R倍數': r_multiple, '停損': stop, '目標1': target1, '目標2': target2,
+            '風險至停損(元)': max((current - stop) * shares, 0) if pd.notna(current) and pd.notna(stop) else np.nan,
+            '狀態': state, '策略': p.get('strategy', ''), '報價日': quote_date,
+            '_id': p.get('id'),
+        })
+
+    if file_changed:
+        save_positions(positions)
+    return pd.DataFrame(rows), alert_results
 
 
 def refresh_watchlist_quotes(watchlist: list) -> pd.DataFrame:
@@ -2385,6 +2666,32 @@ def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=100
         return empty
 
 
+def build_trade_plan(stock: dict, risk_budget: float, atr_mult: float) -> dict:
+    """把 ATR 部位計算延伸為可直接建立持倉的交易計畫。"""
+    price = _safe_number(stock.get('收盤'))
+    atr = _safe_number(stock.get('ATR20'))
+    base = calc_position_plan(price, atr, atr_mult, risk_budget)
+    stop = _safe_number(base.get('停損價'))
+    if pd.isna(price) or pd.isna(stop) or price <= stop:
+        return {
+            'entry_low': np.nan, 'entry_high': np.nan, 'chase_limit': np.nan,
+            'stop': stop, 'target1': np.nan, 'target2': np.nan,
+            'rr1': np.nan, 'rr2': np.nan, **base,
+        }
+    risk_per_share = price - stop
+    entry_low = max(0.01, price - (0.30 * atr if pd.notna(atr) else 0))
+    entry_high = price + (0.20 * atr if pd.notna(atr) else 0)
+    chase_limit = price + (0.50 * atr if pd.notna(atr) else 0)
+    target1 = price + 1.5 * risk_per_share
+    target2 = price + 3.0 * risk_per_share
+    return {
+        'entry_low': round(entry_low, 2), 'entry_high': round(entry_high, 2),
+        'chase_limit': round(chase_limit, 2), 'stop': round(stop, 2),
+        'target1': round(target1, 2), 'target2': round(target2, 2),
+        'rr1': 1.5, 'rr2': 3.0, **base,
+    }
+
+
 def calc_main_cost(df: pd.DataFrame, window: int = 20) -> float:
     """近 N 日量價加權平均成本，作為主力成本估算。"""
     try:
@@ -4019,9 +4326,10 @@ st.markdown(f"""
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
-tab_scan, tab_workspace, tab_watchlist, tab_report = st.tabs([
+tab_scan, tab_workspace, tab_portfolio, tab_watchlist, tab_report = st.tabs([
     "市場掃描",
     "個股工作台",
+    "持倉中心",
     "追蹤清單",
     "研究報告",
 ])
@@ -4570,6 +4878,107 @@ with tab_workspace:
               </div>
             </div>
             """, unsafe_allow_html=True)
+
+            # [新功能] 交易計畫：沿用上方 ATR 停損與風險預算，可直接建立／更新持倉。
+            with st.expander("🧭 交易計畫／建立持倉", expanded=False):
+                _trade_plan = build_trade_plan(
+                    current_stock.to_dict(),
+                    float(st.session_state.get('risk_budget', 30000)),
+                    float(st.session_state.get('atr_stop_mult', 2.0)),
+                )
+                tp1, tp2, tp3, tp4 = st.columns(4)
+                with tp1:
+                    st.metric("理想進場區", f"{fmt_num(_trade_plan.get('entry_low'))}～{fmt_num(_trade_plan.get('entry_high'))}")
+                with tp2:
+                    st.metric("追價上限", fmt_num(_trade_plan.get('chase_limit')))
+                with tp3:
+                    st.metric("第一目標", fmt_num(_trade_plan.get('target1')), "1.5R")
+                with tp4:
+                    st.metric("第二目標", fmt_num(_trade_plan.get('target2')), "3.0R")
+
+                _default_shares = _trade_plan.get('建議股數', 1)
+                if pd.isna(_default_shares) or _default_shares < 1:
+                    _default_shares = 1
+                _existing_position = find_open_position(current_stock['code'])
+                _fallback_stop = _safe_number(_trade_plan.get('stop'), price * 0.95)
+                _fallback_target1 = _safe_number(_trade_plan.get('target1'), price + (price - _fallback_stop) * 1.5)
+                _fallback_target2 = _safe_number(_trade_plan.get('target2'), price + (price - _fallback_stop) * 3.0)
+                if _existing_position:
+                    st.info("這檔股票已有未平倉紀錄；儲存後會更新原持倉，不會建立重複部位。")
+
+                with st.form(key=f"trade_plan_form_{current_stock['code']}"):
+                    f1, f2, f3 = st.columns(3)
+                    with f1:
+                        entry_price_input = st.number_input(
+                            "實際／預計進場價", min_value=0.01,
+                            value=float(_existing_position.get('entry_price', price) if _existing_position else price),
+                            step=0.1, format="%.2f",
+                        )
+                        shares_input = st.number_input(
+                            "持有股數", min_value=1,
+                            value=int(_existing_position.get('shares', _default_shares) if _existing_position else _default_shares),
+                            step=1,
+                        )
+                    with f2:
+                        stop_input = st.number_input(
+                            "停損價", min_value=0.01,
+                            value=float(_safe_number(_existing_position.get('stop_price'), _fallback_stop) if _existing_position else _fallback_stop),
+                            step=0.1, format="%.2f",
+                        )
+                        target1_input = st.number_input(
+                            "第一目標價", min_value=0.01,
+                            value=float(_safe_number(_existing_position.get('target1'), _fallback_target1) if _existing_position else _fallback_target1),
+                            step=0.1, format="%.2f",
+                        )
+                    with f3:
+                        target2_input = st.number_input(
+                            "第二目標價", min_value=0.01,
+                            value=float(_safe_number(_existing_position.get('target2'), _fallback_target2) if _existing_position else _fallback_target2),
+                            step=0.1, format="%.2f",
+                        )
+                        entry_date_input = st.date_input(
+                            "進場日期",
+                            value=pd.to_datetime(_existing_position.get('entry_date')).date() if _existing_position and _existing_position.get('entry_date') else get_tw_now().date(),
+                        )
+                    strategy_input = st.text_input(
+                        "交易策略",
+                        value=str(_existing_position.get('strategy', current_stock.get('策略', st.session_state.get('scan_strategy_used', '手動交易'))) if _existing_position else current_stock.get('策略', st.session_state.get('scan_strategy_used', '手動交易'))),
+                    )
+                    note_input = st.text_area(
+                        "進場理由／失效條件",
+                        value=str(_existing_position.get('note', current_stock.get('訊號說明', '')) if _existing_position else current_stock.get('訊號說明', '')),
+                        placeholder="例如：守住 MA20 與前波突破點；跌破停損不凹單。",
+                    )
+                    telegram_alert_input = st.checkbox(
+                        "跌破停損時發送 Telegram",
+                        value=bool(_existing_position.get('telegram_alert', True) if _existing_position else True),
+                    )
+                    save_trade_clicked = st.form_submit_button(
+                        "💼 建立／更新持倉", type="primary", use_container_width=True
+                    )
+                    if save_trade_clicked:
+                        if stop_input >= entry_price_input:
+                            st.error("停損價必須低於進場價。")
+                        elif target1_input <= entry_price_input or target2_input <= target1_input:
+                            st.error("第一目標必須高於進場價，第二目標必須高於第一目標。")
+                        else:
+                            position_payload = {
+                                'code': str(current_stock['code']), 'name': current_stock['name'],
+                                'ticker': current_stock['ticker'], 'industry': current_stock.get('industry', '未分類'),
+                                '市場別': current_stock.get('市場別', ''),
+                                'entry_date': entry_date_input.strftime('%Y-%m-%d'),
+                                'entry_price': round(float(entry_price_input), 2), 'shares': int(shares_input),
+                                'stop_price': round(float(stop_input), 2),
+                                'target1': round(float(target1_input), 2), 'target2': round(float(target2_input), 2),
+                                'strategy': strategy_input.strip(), 'note': note_input.strip(),
+                                'telegram_alert': bool(telegram_alert_input),
+                            }
+                            ok, message = upsert_position(position_payload)
+                            if ok:
+                                st.session_state.portfolio_quotes = pd.DataFrame()
+                                st.success(f"{message}：{current_stock['name']} ({current_stock['code']})")
+                            else:
+                                st.error(message)
 
             render_manual_search_box(key_suffix="panel")
 
@@ -5227,7 +5636,219 @@ with tab_workspace:
         render_manual_search_box(key_suffix="empty")
 
 # ------------------------------------------------------------
-# TAB 3：自選股／追蹤清單
+# TAB 3：持倉管理中心／Telegram 停損警示
+# ------------------------------------------------------------
+with tab_portfolio:
+    st.markdown('<div class="section-head"><div><div class="section-title">持倉管理中心</div><div class="section-help">管理進場成本、股數、停損與目標價，統一追蹤損益、R 倍數與 Telegram 停損警示。</div></div></div>', unsafe_allow_html=True)
+
+    # Telegram 設定
+    with st.expander("✈️ Telegram 停損警示設定", expanded=False):
+        _tg_cfg = get_telegram_config()
+        tg1, tg2 = st.columns(2)
+        with tg1:
+            tg_token = st.text_input(
+                "Bot Token", value=_tg_cfg.get('bot_token', ''), type="password",
+                help="建議正式部署時放在 .streamlit/secrets.toml 的 TELEGRAM_BOT_TOKEN。",
+            )
+        with tg2:
+            tg_chat_id = st.text_input(
+                "Chat ID", value=_tg_cfg.get('chat_id', ''),
+                help="可填個人 Chat ID 或群組 Chat ID。",
+            )
+        tg3, tg4 = st.columns(2)
+        with tg3:
+            tg_auto = st.checkbox(
+                "頁面開啟時自動定時檢查", value=bool(_tg_cfg.get('auto_check', False)),
+                help="瀏覽器頁面必須保持開啟；頁面關閉後 Streamlit 不會在背景持續執行。",
+            )
+        with tg4:
+            tg_interval = st.number_input(
+                "檢查間隔（分鐘）", min_value=1, max_value=120,
+                value=max(1, int(_tg_cfg.get('interval_minutes', 5))), step=1,
+            )
+        tgb1, tgb2 = st.columns(2)
+        with tgb1:
+            if st.button("💾 儲存 Telegram 設定", use_container_width=True, key="save_tg_config"):
+                if save_telegram_config(tg_token, tg_chat_id, tg_auto, int(tg_interval)):
+                    st.success("Telegram 設定已儲存。")
+                else:
+                    st.error("Telegram 設定檔寫入失敗。")
+        with tgb2:
+            if st.button("🧪 發送測試訊息", use_container_width=True, key="test_tg_message"):
+                test_cfg = {'bot_token': tg_token, 'chat_id': tg_chat_id}
+                ok, message = send_telegram_message(
+                    f"【台股決策中心】Telegram 測試成功\n時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    test_cfg,
+                )
+                st.success(message) if ok else st.error(message)
+        st.caption("若直接在畫面儲存，Token 會寫入本機 JSON；公開或多人部署請改用 Streamlit Secrets，避免憑證外洩。")
+
+    positions_all = load_positions()
+    open_positions = [p for p in positions_all if p.get('status', 'open') == 'open']
+    closed_positions = [p for p in positions_all if p.get('status') == 'closed']
+
+    # 自動檢查：Streamlit 所有頁籤都會執行，因此只要頁面保持開啟即可定時刷新。
+    _cfg_runtime = get_telegram_config()
+    if _cfg_runtime.get('auto_check') and open_positions:
+        _interval_seconds = max(60, int(_cfg_runtime.get('interval_minutes', 5)) * 60)
+        _last_check = st.session_state.get('portfolio_last_check')
+        _now_ts = time.time()
+        if not _last_check or (_now_ts - float(_last_check)) >= _interval_seconds:
+            _auto_df, _auto_alerts = refresh_portfolio_positions(send_alerts=True)
+            st.session_state.portfolio_quotes = _auto_df
+            st.session_state.portfolio_alert_result = _auto_alerts
+            st.session_state.portfolio_last_check = _now_ts
+        # 用瀏覽器重新整理觸發下一輪；頁面關閉後不會執行。
+        components.html(
+            f"<script>setTimeout(function(){{window.parent.location.reload();}}, {_interval_seconds * 1000});</script>",
+            height=0,
+        )
+
+    ctl1, ctl2, ctl3 = st.columns([1.2, 1.2, 3])
+    with ctl1:
+        if st.button("🔄 更新持倉報價", use_container_width=True, type="primary", key="refresh_portfolio"):
+            with st.spinner(f"正在更新 {len(open_positions)} 筆持倉..."):
+                quote_df, alert_results = refresh_portfolio_positions(send_alerts=False)
+            st.session_state.portfolio_quotes = quote_df
+            st.session_state.portfolio_alert_result = alert_results
+            st.session_state.portfolio_last_check = time.time()
+    with ctl2:
+        if st.button("🚨 檢查並推播停損", use_container_width=True, key="check_portfolio_alerts"):
+            with st.spinner("正在檢查停損條件並傳送 Telegram..."):
+                quote_df, alert_results = refresh_portfolio_positions(send_alerts=True)
+            st.session_state.portfolio_quotes = quote_df
+            st.session_state.portfolio_alert_result = alert_results
+            st.session_state.portfolio_last_check = time.time()
+            if not alert_results:
+                st.success("本次沒有新的停損觸發。")
+            else:
+                for result in alert_results:
+                    (st.success if result.get('ok') else st.error)(f"{result.get('code')}：{result.get('message')}")
+    with ctl3:
+        last_check = st.session_state.get('portfolio_last_check')
+        check_txt = datetime.fromtimestamp(last_check, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S') if last_check else '尚未檢查'
+        st.caption(f"未平倉 {len(open_positions)} 筆｜上次報價／警示檢查：{check_txt}。最新價格來自目前可取得的日線資料，不是券商逐筆即時成交價。")
+
+    if not open_positions:
+        st.markdown("""
+        <div class="tv-panel" style="text-align:center;padding:42px 22px;margin-top:12px;">
+          <div style="font-size:40px;margin-bottom:12px;">💼</div>
+          <div style="font-size:20px;font-weight:800;color:#f4f8ff;">目前沒有未平倉部位</div>
+          <div class="tv-caption" style="margin-top:9px;line-height:1.8;">到「個股工作台」展開「交易計畫／建立持倉」，<br>即可把股票加入持倉中心並設定 Telegram 停損警示。</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        quote_df = st.session_state.get('portfolio_quotes', pd.DataFrame())
+        valid_quote_df = isinstance(quote_df, pd.DataFrame) and not quote_df.empty
+        if valid_quote_df:
+            total_value = float((quote_df['現價'] * quote_df['股數']).sum(skipna=True))
+            total_pnl = float(quote_df['損益(元)'].sum(skipna=True))
+            total_risk = float(quote_df['風險至停損(元)'].sum(skipna=True))
+            stop_count = int(quote_df['狀態'].astype(str).str.contains('跌破停損').sum())
+            s1, s2, s3, s4 = st.columns(4)
+            with s1: st.metric("持倉市值", f"{total_value:,.0f} 元")
+            with s2: st.metric("未實現損益", f"{total_pnl:+,.0f} 元")
+            with s3: st.metric("目前至停損風險", f"{total_risk:,.0f} 元")
+            with s4: st.metric("跌破停損", f"{stop_count} 筆")
+
+            display_cols = ['代碼', '名稱', '進場日', '成本', '股數', '現價', '損益(元)', '報酬率(%)', 'R倍數', '停損', '目標1', '目標2', '狀態', '策略', '報價日']
+            st.dataframe(
+                quote_df[[c for c in display_cols if c in quote_df.columns]],
+                hide_index=True, use_container_width=True,
+                column_config={
+                    '成本': st.column_config.NumberColumn(format='%.2f'),
+                    '現價': st.column_config.NumberColumn(format='%.2f'),
+                    '股數': st.column_config.NumberColumn(format='%,.0f'),
+                    '損益(元)': st.column_config.NumberColumn(format='%+,.0f'),
+                    '報酬率(%)': st.column_config.NumberColumn(format='%+.2f%%'),
+                    'R倍數': st.column_config.NumberColumn(format='%+.2fR'),
+                    '停損': st.column_config.NumberColumn(format='%.2f'),
+                    '目標1': st.column_config.NumberColumn(format='%.2f'),
+                    '目標2': st.column_config.NumberColumn(format='%.2f'),
+                },
+            )
+        else:
+            basic_rows = [{
+                '代碼': p.get('code'), '名稱': p.get('name'), '進場日': p.get('entry_date'),
+                '成本': p.get('entry_price'), '股數': p.get('shares'), '停損': p.get('stop_price'),
+                '目標1': p.get('target1'), '目標2': p.get('target2'), '策略': p.get('strategy'),
+            } for p in open_positions]
+            st.dataframe(pd.DataFrame(basic_rows), hide_index=True, use_container_width=True)
+            st.info("請按「更新持倉報價」載入現價、損益與 R 倍數。")
+
+        st.markdown('<div class="section-title" style="margin-top:24px;font-size:16px;">✏️ 編輯／平倉持倉</div>', unsafe_allow_html=True)
+        position_map = {f"{p.get('name')} ({p.get('code')})": p for p in open_positions}
+        selected_label = st.selectbox("選擇持倉", list(position_map.keys()), key="manage_position_select")
+        selected_position = position_map[selected_label]
+
+        with st.form("edit_position_form"):
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                edit_entry = st.number_input("進場成本", min_value=0.01, value=float(selected_position.get('entry_price', 0.01)), step=0.1, format='%.2f')
+                edit_shares = st.number_input("持有股數", min_value=1, value=int(selected_position.get('shares', 1)), step=1)
+            with e2:
+                edit_stop = st.number_input("停損價", min_value=0.01, value=float(selected_position.get('stop_price', 0.01)), step=0.1, format='%.2f')
+                edit_target1 = st.number_input("第一目標", min_value=0.01, value=float(selected_position.get('target1', 0.01)), step=0.1, format='%.2f')
+            with e3:
+                edit_target2 = st.number_input("第二目標", min_value=0.01, value=float(selected_position.get('target2', 0.01)), step=0.1, format='%.2f')
+                edit_tg = st.checkbox("啟用 Telegram 停損警示", value=bool(selected_position.get('telegram_alert', True)))
+            edit_strategy = st.text_input("策略", value=str(selected_position.get('strategy', '')))
+            edit_note = st.text_area("交易筆記", value=str(selected_position.get('note', '')))
+            if st.form_submit_button("儲存持倉修改", type="primary", use_container_width=True):
+                if edit_stop >= edit_entry:
+                    st.error("停損價必須低於進場成本。")
+                elif edit_target1 <= edit_entry or edit_target2 <= edit_target1:
+                    st.error("目標價設定不正確。")
+                else:
+                    ok = update_position(selected_position['id'], {
+                        'entry_price': round(float(edit_entry), 2), 'shares': int(edit_shares),
+                        'stop_price': round(float(edit_stop), 2),
+                        'target1': round(float(edit_target1), 2), 'target2': round(float(edit_target2), 2),
+                        'strategy': edit_strategy.strip(), 'note': edit_note.strip(),
+                        'telegram_alert': bool(edit_tg), 'stop_alert_active': False,
+                    })
+                    if ok:
+                        st.session_state.portfolio_quotes = pd.DataFrame()
+                        st.success("持倉已更新。")
+                        st.rerun()
+                    else:
+                        st.error("持倉更新失敗。")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            with st.form("close_position_form"):
+                close_price_input = st.number_input("平倉價", min_value=0.01, value=float(_safe_number(selected_position.get('last_price'), _safe_number(selected_position.get('entry_price'), 0.01))), step=0.1, format='%.2f')
+                close_date_input = st.date_input("平倉日期", value=get_tw_now().date())
+                close_note_input = st.text_input("平倉原因", placeholder="停損、達標、趨勢轉弱、分批停利…")
+                if st.form_submit_button("✅ 確認平倉", use_container_width=True):
+                    if close_position(selected_position['id'], close_price_input, close_date_input.strftime('%Y-%m-%d'), close_note_input):
+                        st.session_state.portfolio_quotes = pd.DataFrame()
+                        st.success("已完成平倉並保留績效紀錄。")
+                        st.rerun()
+                    else:
+                        st.error("平倉失敗。")
+        with c2:
+            st.warning("刪除會直接移除紀錄；正常出場請使用左側「確認平倉」，才能保留績效。")
+            confirm_delete = st.checkbox("我確認要永久刪除這筆持倉", key="confirm_delete_position")
+            if st.button("🗑 永久刪除", disabled=not confirm_delete, use_container_width=True, key="delete_position_btn"):
+                if delete_position(selected_position['id']):
+                    st.session_state.portfolio_quotes = pd.DataFrame()
+                    st.success("持倉已刪除。")
+                    st.rerun()
+
+    if closed_positions:
+        with st.expander(f"📚 已平倉紀錄（{len(closed_positions)} 筆）", expanded=False):
+            closed_rows = [{
+                '代碼': p.get('code'), '名稱': p.get('name'), '進場日': p.get('entry_date'),
+                '平倉日': p.get('exit_date'), '進場價': p.get('entry_price'), '平倉價': p.get('exit_price'),
+                '股數': p.get('shares'), '已實現損益': p.get('realized_pnl'),
+                '報酬率(%)': p.get('realized_return_pct'), '策略': p.get('strategy'), '平倉原因': p.get('exit_note'),
+            } for p in reversed(closed_positions)]
+            st.dataframe(pd.DataFrame(closed_rows), hide_index=True, use_container_width=True)
+
+
+# ------------------------------------------------------------
+# TAB 4：自選股／追蹤清單
 # ------------------------------------------------------------
 # [新功能] 讓還沒符合策略條件、但你想持續觀察的股票也能被記錄下來，
 # 不用每次都全市場重新掃描才看得到它們。清單存在本機 JSON 檔案
@@ -5304,7 +5925,7 @@ with tab_watchlist:
                     st.warning("⚠️ 無法載入 K 線資料，請稍後再試。")
 
 # ------------------------------------------------------------
-# TAB 4：投資分析報告（純量化規則版，不需要 API 金鑰）
+# TAB 5：投資分析報告（純量化規則版，不需要 API 金鑰）
 # ------------------------------------------------------------
 with tab_report:
     st.markdown('<div class="section-head"><div><div class="section-title">個股投資分析報告</div><div class="section-help">輸入股票代碼，自動整合量化指標、新聞分類、同業比較與波動率情境價格區間，全部由規則產生，不需要 API 金鑰。</div></div></div>', unsafe_allow_html=True)
