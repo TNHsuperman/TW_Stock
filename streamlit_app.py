@@ -5309,14 +5309,25 @@ with tab_watchlist:
 with tab_report:
     st.markdown('<div class="section-head"><div><div class="section-title">個股投資分析報告</div><div class="section-help">輸入股票代碼，自動整合量化指標、新聞分類、同業比較與波動率情境價格區間，全部由規則產生，不需要 API 金鑰。</div></div></div>', unsafe_allow_html=True)
 
-    rc1, rc2 = st.columns([3, 1])
+    # [版面] 代碼輸入、產生、重新產生三顆放同一列。原本「重新產生」是用一個
+    # st.columns([5,1]) 的空白左欄把它擠到右邊、自己獨占一行，既浪費一整列高度，
+    # 視覺上也像是漂在按鈕下方的孤兒元件。
+    _has_report = bool(st.session_state.get("report_target_code"))
+    rc1, rc2, rc3 = st.columns([2.6, 1, 1], gap="medium")
     with rc1:
         report_code_input = st.text_input("股票代碼", key="report_code_input", placeholder="例如 2330、8033", label_visibility="collapsed")
     with rc2:
         gen_clicked = st.button("📑 產生報告", use_container_width=True, type="primary", key="btn_gen_report")
+    with rc3:
+        regen_clicked = st.button("🔄 重新產生", use_container_width=True, key="btn_regenerate_report",
+                                  disabled=not _has_report, help="略過快取，重新抓一次財務、同業與新聞資料。")
 
     if gen_clicked and report_code_input.strip():
         st.session_state.report_target_code = report_code_input.strip().upper()
+        st.session_state.report_force_refresh = True
+        st.rerun()
+
+    if regen_clicked and _has_report:
         st.session_state.report_force_refresh = True
         st.rerun()
 
@@ -5356,12 +5367,6 @@ with tab_report:
         if target_code and target_code in cache:
             rd = cache[target_code]
 
-            top_l, top_r = st.columns([5, 1])
-            with top_r:
-                if st.button("🔄 重新產生", use_container_width=True, key="btn_regenerate_report"):
-                    st.session_state.report_force_refresh = True
-                    st.rerun()
-
             # ---------- 報告頭卡：名稱、報價、估值旗標 ----------
             badge_color = {
                 "偏低估／具吸引力": "var(--green)", "合理偏多": "var(--blue)",
@@ -5370,39 +5375,48 @@ with tab_report:
             chg = rd.get("漲跌幅(%)", np.nan)
             chg_color = "var(--green)" if pd.notna(chg) and chg >= 0 else "var(--red)"
 
+            # [版面] 估值旗標原本自己佔一行（margin-top:14px），把卡片撐高又顯得零散。
+            # 改成跟產業別同一行的 chip，卡片少一列、左右兩塊的視覺重量也比較平衡。
             st.markdown(f"""
-            <div class="tv-panel" style="padding:20px 22px;margin-top:6px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
-                <div>
-                  <div style="font-size:22px;font-weight:800;">{rd.get('name','')} ({rd.get('code','')})</div>
-                  <div class="tv-caption">{rd.get('industry','')}</div>
+            <div class="tv-panel" style="padding:24px 26px;margin:16px 0 4px;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:20px;">
+                <div style="min-width:250px;">
+                  <div style="font-size:23px;font-weight:800;line-height:1.35;">{rd.get('name','')} ({rd.get('code','')})</div>
+                  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:11px;">
+                    <span class="tv-caption" style="margin:0;">{rd.get('industry','')}</span>
+                    <span style="background:{badge_color};color:#04121f;font-weight:800;padding:4px 12px;border-radius:20px;font-size:12.5px;white-space:nowrap;">{rd.get('估值判斷旗標','')}</span>
+                  </div>
                 </div>
-                <div style="text-align:right;">
-                  <div style="font-size:26px;font-weight:800;font-family:'Roboto Mono',monospace;">{fmt_num(rd.get('收盤'))}</div>
-                  <div style="color:{chg_color};font-weight:700;">{fmt_num(chg, '{:+.2f}%')}</div>
+                <div style="text-align:right;min-width:140px;">
+                  <div style="font-size:28px;font-weight:800;font-family:'Roboto Mono',monospace;line-height:1.2;">{fmt_num(rd.get('收盤'))}</div>
+                  <div style="color:{chg_color};font-weight:700;font-family:'Roboto Mono',monospace;margin-top:6px;">{fmt_num(chg, '{:+.2f}%')}</div>
                 </div>
-              </div>
-              <div style="margin-top:14px;">
-                <span style="background:{badge_color};color:#04121f;font-weight:800;padding:4px 12px;border-radius:20px;font-size:13px;">{rd.get('估值判斷旗標','')}</span>
               </div>
             </div>
             """, unsafe_allow_html=True)
 
             # ---------- 量化指標卡 ----------
-            m1, m2, m3, m4 = st.columns(4)
-            for col, label, val, fmt in [
-                (m1, "本益比", rd.get("本益比"), "{:.1f}"),
-                (m2, "財務評分", rd.get("財務評分"), "{:.0f}"),
-                (m3, "營收年增(%)", rd.get("營收年增"), "{:+.1f}"),
-                (m4, "RSI14", rd.get("RSI14"), "{:.1f}"),
+            # [版面] .tv-card 的 min-height 是 104px，只放「標籤＋數字」會留下一塊空白，
+            # 四張並排時看起來特別空。補一行判讀說明，順便讓數字有解讀基準。
+            m1, m2, m3, m4 = st.columns(4, gap="medium")
+            for col, label, val, fmt, note in [
+                (m1, "本益比", rd.get("本益比"), "{:.1f}", "須與同業對照才有意義"),
+                (m2, "財務評分", rd.get("財務評分"), "{:.0f}", "0–100，越高體質越穩"),
+                (m3, "營收年增(%)", rd.get("營收年增"), "{:+.1f}", "與去年同月比較"),
+                (m4, "RSI14", rd.get("RSI14"), "{:.1f}", "＞70 過熱／＜30 超賣"),
             ]:
                 with col:
-                    st.markdown(f'<div class="tv-card"><div class="tv-label">{label}</div><div class="tv-value">{fmt_num(val, fmt)}</div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="tv-card" style="margin-top:12px;">'
+                        f'<div class="tv-label">{label}</div>'
+                        f'<div class="tv-value">{fmt_num(val, fmt)}</div>'
+                        f'<div class="tv-caption">{note}</div></div>',
+                        unsafe_allow_html=True)
 
             # ---------- 重點觀察 ----------
             obs_list = rd.get("重點觀察", [])
             if obs_list:
-                st.markdown('<div class="section-title" style="margin-top:22px;font-size:16px;">📌 重點觀察</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title" style="margin-top:30px;font-size:16px;">📌 重點觀察</div>', unsafe_allow_html=True)
                 obs_html = "".join(f"<div style='padding:5px 0;border-bottom:1px solid rgba(35,58,85,0.5);font-size:14px;'>{o}</div>" for o in obs_list)
                 st.markdown(f'<div class="tv-panel" style="padding:12px 18px;">{obs_html}</div>', unsafe_allow_html=True)
 
