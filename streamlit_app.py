@@ -1928,6 +1928,18 @@ def format_tw_price_change(value: float, reference_price: float) -> str:
     return f"{float(value):+,.{decimals}f}"
 
 
+def format_tw_stock_price(value: float, na: str = "N/A") -> str:
+    """依台股合法跳動單位校正並格式化價格，避免高價股顯示無效小數。"""
+    if pd.isna(value):
+        return na
+    rounded = round_to_tw_stock_tick(value)
+    if pd.isna(rounded):
+        return na
+    tick = tw_stock_tick_size(rounded)
+    decimals = 2 if pd.notna(tick) and tick < 0.1 else 1 if pd.notna(tick) and tick < 1 else 0
+    return f"{float(rounded):,.{decimals}f}"
+
+
 def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
     """建立策略共用欄位，技術價與畫面報價分流。
 
@@ -2881,8 +2893,8 @@ def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=100
         atr = float(atr)
         if not np.isfinite(price) or not np.isfinite(atr) or price <= 0 or atr <= 0:
             return empty
-        stop = price - atr_mult * atr
-        if stop <= 0:
+        stop = round_to_tw_stock_tick(price - atr_mult * atr)
+        if pd.isna(stop) or stop <= 0:
             return empty
         risk_per_share = price - stop
         risk_per_lot = risk_per_share * lot_size
@@ -2925,9 +2937,13 @@ def build_trade_plan(stock: dict, risk_budget: float, atr_mult: float) -> dict:
     target1 = price + 1.5 * risk_per_share
     target2 = price + 3.0 * risk_per_share
     return {
-        'entry_low': round(entry_low, 2), 'entry_high': round(entry_high, 2),
-        'chase_limit': round(chase_limit, 2), 'stop': round(stop, 2),
-        'target1': round(target1, 2), 'target2': round(target2, 2),
+        # 交易計畫價位一律校正到台股合法跳動單位；高價股不再出現 2764.47 這類不可成交價。
+        'entry_low': round_to_tw_stock_tick(entry_low),
+        'entry_high': round_to_tw_stock_tick(entry_high),
+        'chase_limit': round_to_tw_stock_tick(chase_limit),
+        'stop': round_to_tw_stock_tick(stop),
+        'target1': round_to_tw_stock_tick(target1),
+        'target2': round_to_tw_stock_tick(target2),
         'rr1': 1.5, 'rr2': 3.0, **base,
     }
 
@@ -4323,6 +4339,66 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
 .meta-k{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;}
 .meta-v{margin-top:5px;font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;color:#f4f8ff;white-space:nowrap;}
 
+
+/* ── 交易計畫摘要卡：避免 Streamlit st.metric 在窄欄位用省略號截斷價格 ── */
+.trade-plan-grid{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:12px;
+  margin:4px 0 18px;
+}
+.trade-plan-card{
+  min-width:0;
+  padding:13px 16px 12px;
+  border:1px solid var(--border);
+  border-radius:13px;
+  background:rgba(255,255,255,.018);
+  overflow:visible;
+}
+.trade-plan-label{
+  color:#8eb6ff;
+  font-size:12px;
+  font-weight:650;
+  margin-bottom:8px;
+  white-space:nowrap;
+}
+.trade-plan-value{
+  color:#f4f8ff;
+  font-family:'Roboto Mono',monospace;
+  font-size:clamp(22px,2.15vw,34px);
+  font-weight:500;
+  line-height:1.15;
+  letter-spacing:-.035em;
+  white-space:nowrap;
+  overflow:visible;
+  text-overflow:clip;
+}
+.trade-plan-value.range{
+  font-size:clamp(18px,1.72vw,27px);
+  letter-spacing:-.045em;
+}
+.trade-plan-badge{
+  display:inline-flex;
+  margin-top:7px;
+  padding:2px 8px;
+  border-radius:999px;
+  background:rgba(54,201,154,.18);
+  color:#40e2a7;
+  font-family:'Roboto Mono',monospace;
+  font-size:12px;
+  font-weight:700;
+  white-space:nowrap;
+}
+@media (max-width:1000px){
+  .trade-plan-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .trade-plan-value{font-size:30px;}
+  .trade-plan-value.range{font-size:24px;}
+}
+@media (max-width:560px){
+  .trade-plan-grid{grid-template-columns:1fr;}
+  .trade-plan-value,.trade-plan-value.range{font-size:28px;}
+}
+
 /* ── 精簡步驟條 ── */
 .workflow{display:flex;align-items:center;gap:6px;margin:0 0 26px;padding:0 4px;overflow-x:auto;}
 .workflow-step{display:flex;align-items:center;gap:7px;padding:8px 10px;color:#66778e;font-size:11px;font-weight:700;white-space:nowrap;}
@@ -5133,15 +5209,34 @@ with tab_workspace:
                     float(st.session_state.get('risk_budget', 30000)),
                     float(st.session_state.get('atr_stop_mult', 2.0)),
                 )
-                tp1, tp2, tp3, tp4 = st.columns(4)
-                with tp1:
-                    st.metric("理想進場區", f"{fmt_num(_trade_plan.get('entry_low'))}～{fmt_num(_trade_plan.get('entry_high'))}")
-                with tp2:
-                    st.metric("追價上限", fmt_num(_trade_plan.get('chase_limit')))
-                with tp3:
-                    st.metric("第一目標", fmt_num(_trade_plan.get('target1')), "1.5R")
-                with tp4:
-                    st.metric("第二目標", fmt_num(_trade_plan.get('target2')), "3.0R")
+                # 不使用 st.metric：其原生 value 容器在窄欄位會套用 overflow:hidden + ellipsis，
+                # 高價股的「低價～高價」區間因而只顯示半截。改用自適應 CSS 卡片完整呈現。
+                _entry_range_txt = (
+                    f"{format_tw_stock_price(_trade_plan.get('entry_low'))} ～ "
+                    f"{format_tw_stock_price(_trade_plan.get('entry_high'))}"
+                )
+                st.markdown(f"""
+                <div class="trade-plan-grid">
+                  <div class="trade-plan-card">
+                    <div class="trade-plan-label">理想進場區</div>
+                    <div class="trade-plan-value range">{_entry_range_txt}</div>
+                  </div>
+                  <div class="trade-plan-card">
+                    <div class="trade-plan-label">追價上限</div>
+                    <div class="trade-plan-value">{format_tw_stock_price(_trade_plan.get('chase_limit'))}</div>
+                  </div>
+                  <div class="trade-plan-card">
+                    <div class="trade-plan-label">第一目標</div>
+                    <div class="trade-plan-value">{format_tw_stock_price(_trade_plan.get('target1'))}</div>
+                    <div class="trade-plan-badge">↑ 1.5R</div>
+                  </div>
+                  <div class="trade-plan-card">
+                    <div class="trade-plan-label">第二目標</div>
+                    <div class="trade-plan-value">{format_tw_stock_price(_trade_plan.get('target2'))}</div>
+                    <div class="trade-plan-badge">↑ 3.0R</div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
 
                 _default_shares = _trade_plan.get('建議股數', 1)
                 if pd.isna(_default_shares) or _default_shares < 1:
