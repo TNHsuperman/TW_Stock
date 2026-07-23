@@ -4377,19 +4377,21 @@ user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
 # ============================================================
-# [方案 C / 4:3] 個股工作台模組化資訊總覽樣式
+# [方案 C / 21:9] 個股工作台模組化資訊總覽樣式
 # ============================================================
 st.markdown("""
 <style>
-.block-container{max-width:1220px!important;padding-left:22px!important;padding-right:22px!important;padding-top:1.15rem!important}
-@media(min-width:1250px){.block-container{width:min(94vw,1220px)!important}}
-.mod43-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 10px}.mod43-title h2{margin:0;font-size:21px;color:#f4f8ff}.mod43-title span{font-size:12px;color:#6f89aa;border:1px solid rgba(94,129,170,.28);padding:4px 9px;border-radius:999px}
+.block-container{max-width:2100px!important;width:97vw!important;padding-left:18px!important;padding-right:18px!important;padding-top:1.05rem!important}
+@media(min-width:1800px){.block-container{width:min(97vw,2100px)!important}}
+.mod43-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 10px}.mod43-title h2{margin:0;font-size:22px;color:#f4f8ff}.mod43-title span{font-size:12px;color:#6f89aa;border:1px solid rgba(94,129,170,.28);padding:4px 9px;border-radius:999px}
 .mod43-card{background:linear-gradient(145deg,rgba(13,26,42,.96),rgba(9,19,32,.96));border:1px solid rgba(78,112,150,.25);border-radius:14px;padding:14px 16px;min-height:100%;box-shadow:0 8px 22px rgba(0,0,0,.12)}
 .mod43-card-title{font-size:14px;font-weight:800;color:#edf4ff;margin-bottom:11px;display:flex;justify-content:space-between;gap:8px}.mod43-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid rgba(110,140,175,.12);font-size:12px}.mod43-row:last-child{border-bottom:0}.mod43-row span:first-child{color:#8398b3}.mod43-row span:last-child{color:#e6eef9;font-weight:700;text-align:right}.mod43-good{color:#35c48d!important}.mod43-bad{color:#f05b6a!important}.mod43-warn{color:#f4b64a!important}.mod43-blue{color:#68a5ff!important}
 .mod43-kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin:10px 0 12px}.mod43-kpi{background:rgba(11,23,38,.94);border:1px solid rgba(79,111,145,.22);border-radius:10px;padding:10px 11px;min-width:0}.mod43-kpi .k{font-size:10px;color:#7790ae;margin-bottom:5px}.mod43-kpi .v{font-size:16px;font-weight:850;color:#eff6ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mod43-mini-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px}.mod43-mini{background:rgba(10,21,35,.95);border:1px solid rgba(73,108,145,.23);border-radius:12px;padding:13px;min-height:138px}.mod43-mini h4{font-size:14px;margin:0 0 10px;color:#eef5ff}.mod43-mini .big{font-size:24px;font-weight:900;color:#35c48d;margin:2px 0 8px}.mod43-mini .sub{font-size:11px;color:#8498b3;line-height:1.7}
+.mod43-mini-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-top:10px}.mod43-mini{background:rgba(10,21,35,.95);border:1px solid rgba(73,108,145,.23);border-radius:12px;padding:13px;min-height:138px}.mod43-mini h4{font-size:14px;margin:0 0 10px;color:#eef5ff}.mod43-mini .big{font-size:24px;font-weight:900;color:#35c48d;margin:2px 0 8px}.mod43-mini .sub{font-size:11px;color:#8498b3;line-height:1.7}
 [data-testid="stHorizontalBlock"]{gap:.72rem!important}[data-testid="stVerticalBlock"]{gap:.55rem!important}.stPlotlyChart{border-radius:12px;overflow:hidden}
-@media(max-width:900px){.block-container{width:100%!important;padding-left:12px!important;padding-right:12px!important}.mod43-kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.mod43-mini-grid{grid-template-columns:1fr}}
+@media(max-width:1500px){.mod43-mini-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1100px){.block-container{width:100%!important;padding-left:12px!important;padding-right:12px!important}.mod43-kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.mod43-mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:760px){.mod43-mini-grid{grid-template-columns:1fr}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -4956,9 +4958,9 @@ with tab_workspace:
             """, unsafe_allow_html=True)
 
             # ============================================================
-            # [方案 C / 4:3] 模組化資訊總覽
+            # [方案 C / 21:9] 模組化資訊總覽
             # ============================================================
-            st.markdown('<div class="mod43-title"><h2>個股工作台｜模組化資訊總覽</h2><span>4:3 DESKTOP WORKSPACE</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="mod43-title"><h2>個股工作台｜模組化資訊總覽</h2><span>21:9 ULTRAWIDE WORKSPACE</span></div>', unsafe_allow_html=True)
             _market_suffix = "TW" if str(current_stock['ticker']).endswith('.TW') else "TWO"
             _overview_kdf = get_kline_data(current_stock['code'], _market_suffix)
             _overview_trade = build_trade_plan(current_stock.to_dict(), float(st.session_state.get('risk_budget', 30000)), float(st.session_state.get('atr_stop_mult', 2.0)))
@@ -4975,12 +4977,12 @@ with tab_workspace:
             </div>
             """, unsafe_allow_html=True)
 
-            _chart_col, _decision_col = st.columns([2.18, 1], gap='medium')
+            _chart_col, _decision_col = st.columns([3.15, 1], gap='medium')
             with _chart_col:
                 st.markdown('<div class="mod43-card-title">K 線走勢 <span style="color:#7189a6;font-weight:500;">日線／還原除權息</span></div>', unsafe_allow_html=True)
                 _overview_fig = draw_k_line(current_stock['ticker'], current_stock['name'], chart_mode='K線圖', chart_period='日', adjusted=True)
                 if _overview_fig:
-                    render_kline_chart_with_axis_price(_overview_fig, height=430)
+                    render_kline_chart_with_axis_price(_overview_fig, height=500)
                 else:
                     st.warning('無法載入 K 線資料，請稍後再試。')
 
