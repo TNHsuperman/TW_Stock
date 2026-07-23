@@ -4319,9 +4319,21 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-topbar-sub{color:var(--muted);font-weight:700;font-size:15px;}
 .wb-topbar-note{font-size:11px;color:var(--muted);white-space:nowrap;}
 
-/* 卡片外殼：六格模組與四欄模組共用 */
+/* 卡片等高網格 ──
+   st.columns 每一欄的高度是各自獨立的，內容多寡不同就會長短不齊。
+   這幾張卡片全是純 HTML／SVG（沒有 Streamlit widget），所以改成塞進
+   同一個 CSS Grid：grid 的同一列預設就會 stretch 成等高，不必靠
+   Streamlit 的 DOM 結構，換版本也不會壞。 */
+.wb-grid6{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;
+  align-items:stretch;}
+.wb-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;
+  align-items:stretch;min-height:430px;}
+
+/* 卡片外殼：改成 flex 直列，讓頁尾註解一律貼齊卡片底部 */
 .wb-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
-  padding:13px 14px;box-sizing:border-box;height:100%;}
+  padding:13px 14px;box-sizing:border-box;height:100%;
+  display:flex;flex-direction:column;}
+.wb-card>.wb-foot{margin-top:auto;}
 .wb-card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;}
 .wb-card-title{font-size:13px;font-weight:800;color:#eaf1fa;letter-spacing:-.01em;white-space:nowrap;}
 .wb-card-note{font-size:10px;color:var(--muted);font-weight:700;white-space:nowrap;}
@@ -4406,10 +4418,14 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-chip-label{font-size:9.5px;font-weight:800;letter-spacing:.1em;color:var(--muted);
   text-transform:uppercase;margin:6px 0 4px;}
 
-/* 窄螢幕：報價卡指標由 6 欄收成 3 欄 / 2 欄 */
+/* 窄螢幕：報價卡指標與六格模組一起收欄，維持等高不變 */
+@media (max-width:1400px){.wb-grid6{grid-template-columns:repeat(3,minmax(0,1fr));}}
 @media (max-width:1180px){.wb-mgrid{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media (max-width:900px){.wb-grid6{grid-template-columns:repeat(2,minmax(0,1fr));}
+  .wb-grid3{grid-template-columns:1fr;min-height:0;}}
 @media (max-width:680px){.wb-mgrid{grid-template-columns:repeat(2,minmax(0,1fr));}
-  .wb-quote-price{font-size:32px;}}
+  .wb-quote-price{font-size:32px;}
+  .wb-grid6{grid-template-columns:1fr;}}
 
 /* 手機候選卡 */
 .st-key-desktop_candidate_list{display:block;}.st-key-mobile_candidate_list{display:none;}
@@ -5265,8 +5281,11 @@ with tab_workspace:
                                 f'{fmt_num(_crow.get("收盤", np.nan), "{:.2f}")}　{fmt_num(_cchg, "{:+.2f}%")}</div>',
                                 unsafe_allow_html=True)
 
-            # ══════════════ 第二列：K線走勢 ／ 交易計畫 ／ 持倉摘要 ／ 風險設定 ══════════════
-            kl_col, plan_col, pos_col, risk_col = st.columns([3.0, 1.05, 1.0, 1.0], gap="small")
+            # ══════════════ 第二列：K線走勢 ／ 交易計畫＋持倉摘要＋風險設定 ══════════════
+            # 右邊三張卡是純 HTML，塞進同一個 .wb-grid3 讓它們互相等高；
+            # 卡片 HTML 一律組成「不含換行」的單行字串，避免縮排被 Markdown
+            # 當成程式碼區塊。
+            kl_col, cards_col = st.columns([3.0, 3.05], gap="small")
 
             with kl_col:
                 _kh1, _kh2 = st.columns([1.6, 2.4])
@@ -5293,8 +5312,8 @@ with tab_workspace:
                 else:
                     st.warning("無法載入 K 線資料，請稍後再試。")
 
-            with plan_col:
-                # 交易計畫摘要：跟下方「交易計畫／建立持倉」表單同一組計算結果
+            with cards_col:
+                # ---------- 交易計畫（與下方「交易計畫／建立持倉」表單同一組計算） ----------
                 _tp = build_trade_plan(current_stock.to_dict(), _risk_budget, _atr_mult)
                 _tp_stop = _tp.get('stop', np.nan)
                 _tp_t1 = _tp.get('target1', np.nan)
@@ -5303,22 +5322,26 @@ with tab_workspace:
                 _t1_pct = (np.nan if (pd.isna(_tp_t1) or pd.isna(price) or price <= 0)
                            else (_tp_t1 - price) / price * 100)
                 _strategy_txt = str(current_stock.get('策略', st.session_state.get('scan_strategy_used', '手動查詢')))
-                st.markdown(f"""
-                <div class="wb-card">
-                  <div class="wb-card-head"><div class="wb-card-title">交易計畫</div></div>
-                  <div class="wb-row"><span>策略方向</span><b>{_strategy_txt}</b></div>
-                  <div class="wb-row"><span>理想進場區</span><b>{fmt_num(_tp.get('entry_low'), '{:.2f}')} ~ {fmt_num(_tp.get('entry_high'), '{:.2f}')}</b></div>
-                  <div class="wb-row"><span>追價上限</span><b>{fmt_num(_tp.get('chase_limit'), '{:.2f}')}</b></div>
-                  <div class="wb-row"><span>停損價</span><b style="color:var(--red);">{fmt_num(_tp_stop, '{:.2f}')} ({fmt_num(_stop_pct, '{:.1f}%')})</b></div>
-                  <div class="wb-row"><span>第一目標</span><b style="color:var(--green);">{fmt_num(_tp_t1, '{:.2f}')} ({fmt_num(_t1_pct, '{:+.1f}%')})</b></div>
-                  <div class="wb-row"><span>第二目標</span><b style="color:var(--green);">{fmt_num(_tp.get('target2'), '{:.2f}')}</b></div>
-                  <div class="wb-row"><span>風險報酬比</span><b>1 : {fmt_num(_tp.get('rr1'), '{:.1f}')}／1 : {fmt_num(_tp.get('rr2'), '{:.1f}')}</b></div>
-                  <div class="wb-foot">價位已依台股升降單位修正為可委託檔位</div>
-                </div>
-                """, unsafe_allow_html=True)
+                _plan_card = (
+                    '<div class="wb-card">'
+                    '<div class="wb-card-head"><div class="wb-card-title">交易計畫</div></div>'
+                    f'<div class="wb-row"><span>策略方向</span><b>{_strategy_txt}</b></div>'
+                    f'<div class="wb-row"><span>理想進場區</span>'
+                    f'<b>{fmt_num(_tp.get("entry_low"), "{:.2f}")} ~ {fmt_num(_tp.get("entry_high"), "{:.2f}")}</b></div>'
+                    f'<div class="wb-row"><span>追價上限</span><b>{fmt_num(_tp.get("chase_limit"), "{:.2f}")}</b></div>'
+                    f'<div class="wb-row"><span>停損價</span><b style="color:var(--red);">'
+                    f'{fmt_num(_tp_stop, "{:.2f}")} ({fmt_num(_stop_pct, "{:.1f}%")})</b></div>'
+                    f'<div class="wb-row"><span>第一目標</span><b style="color:var(--green);">'
+                    f'{fmt_num(_tp_t1, "{:.2f}")} ({fmt_num(_t1_pct, "{:+.1f}%")})</b></div>'
+                    f'<div class="wb-row"><span>第二目標</span><b style="color:var(--green);">'
+                    f'{fmt_num(_tp.get("target2"), "{:.2f}")}</b></div>'
+                    f'<div class="wb-row"><span>風險報酬比</span>'
+                    f'<b>1 : {fmt_num(_tp.get("rr1"), "{:.1f}")}／1 : {fmt_num(_tp.get("rr2"), "{:.1f}")}</b></div>'
+                    '<div class="wb-foot">價位已依台股升降單位修正為可委託檔位</div>'
+                    '</div>'
+                )
 
-            with pos_col:
-                # 持倉摘要：讀既有的持倉 JSON，環圈顯示這一檔在總持倉成本中的占比
+                # ---------- 持倉摘要：讀既有持倉 JSON，環圈為本檔占總持倉成本的比重 ----------
                 _positions = [p for p in load_positions() if p.get('status', 'open') == 'open']
                 _this_pos = next((p for p in _positions if str(p.get('code')) == _code), None)
                 _total_cost = sum(
@@ -5327,47 +5350,44 @@ with tab_workspace:
                 if _this_pos:
                     _pe = float(_this_pos.get('entry_price', 0) or 0)
                     _ps = float(_this_pos.get('shares', 0) or 0)
-                    _pcost = _pe * _ps
-                    _ppct = (_pcost / _total_cost * 100) if _total_cost > 0 else 0.0
+                    _ppct = ((_pe * _ps) / _total_cost * 100) if _total_cost > 0 else 0.0
                     _pnl_pct = ((price - _pe) / _pe * 100) if (pd.notna(price) and _pe > 0) else np.nan
                     _pnl_amt = (price - _pe) * _ps if pd.notna(price) else np.nan
                     _pnl_color = 'var(--green)' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else 'var(--red)'
-                    _donut = wb_svg_donut(_ppct, f"{_ppct:.0f}%",
-                                          '#36c99a' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else '#ff6b7a')
                     _pos_body = (
-                        f'{_donut}'
-                        f'<div class="wb-row"><span>持有股數</span><b>{_ps:,.0f} 股</b></div>'
-                        f'<div class="wb-row"><span>平均成本</span><b>{_pe:,.2f}</b></div>'
-                        f'<div class="wb-row"><span>未實現損益</span>'
-                        f'<b style="color:{_pnl_color};">{fmt_num(_pnl_pct, "{:+.2f}%")}</b></div>'
-                        f'<div class="wb-row"><span>損益金額</span>'
-                        f'<b style="color:{_pnl_color};">{fmt_num(_pnl_amt, "{:+,.0f}")} 元</b></div>'
-                        f'<div class="wb-row"><span>設定停損</span>'
-                        f'<b style="color:var(--red);">{fmt_num(_this_pos.get("stop_price"), "{:.2f}")}</b></div>'
-                        f'<div class="wb-foot">占總持倉成本 {_ppct:.1f}%（共 {len(_positions)} 檔）</div>'
+                        wb_svg_donut(_ppct, f"{_ppct:.0f}%",
+                                     '#36c99a' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else '#ff6b7a')
+                        + f'<div class="wb-row"><span>持有股數</span><b>{_ps:,.0f} 股</b></div>'
+                        + f'<div class="wb-row"><span>平均成本</span><b>{_pe:,.2f}</b></div>'
+                        + f'<div class="wb-row"><span>未實現損益</span>'
+                          f'<b style="color:{_pnl_color};">{fmt_num(_pnl_pct, "{:+.2f}%")}</b></div>'
+                        + f'<div class="wb-row"><span>損益金額</span>'
+                          f'<b style="color:{_pnl_color};">{fmt_num(_pnl_amt, "{:+,.0f}")} 元</b></div>'
+                        + f'<div class="wb-row"><span>設定停損</span><b style="color:var(--red);">'
+                          f'{fmt_num(_this_pos.get("stop_price"), "{:.2f}")}</b></div>'
+                        + f'<div class="wb-foot">占總持倉成本 {_ppct:.1f}%（共 {len(_positions)} 檔）</div>'
                     )
                 else:
                     _sug_cost = _plan.get('投入金額', np.nan)
                     _sug_pct = ((_sug_cost / (_total_cost + _sug_cost) * 100)
                                 if (pd.notna(_sug_cost) and (_total_cost + _sug_cost) > 0) else 0.0)
                     _pos_body = (
-                        f'{wb_svg_donut(_sug_pct, f"{_sug_pct:.0f}%", "#6ea8fe")}'
-                        f'<div class="wb-empty" style="padding:4px 0 8px;text-align:center;">未持有此股</div>'
-                        f'<div class="wb-row"><span>建議張數</span><b>{_lots_txt}</b></div>'
-                        f'<div class="wb-row"><span>預估投入</span>'
-                        f'<b>{fmt_num(_sug_cost, "{:,.0f}")} 元</b></div>'
-                        f'<div class="wb-row"><span>到停損虧損</span>'
-                        f'<b style="color:var(--red);">{fmt_num(_plan.get("實際風險"), "{:,.0f}")} 元</b></div>'
-                        f'<div class="wb-row"><span>目前持倉</span><b>{len(_positions)} 檔</b></div>'
-                        f'<div class="wb-foot">環圈為建立此部位後占總持倉成本的比重</div>'
+                        wb_svg_donut(_sug_pct, f"{_sug_pct:.0f}%", '#6ea8fe')
+                        + '<div class="wb-empty" style="padding:4px 0 8px;text-align:center;">未持有此股</div>'
+                        + f'<div class="wb-row"><span>建議張數</span><b>{_lots_txt}</b></div>'
+                        + f'<div class="wb-row"><span>預估投入</span><b>{fmt_num(_sug_cost, "{:,.0f}")} 元</b></div>'
+                        + f'<div class="wb-row"><span>到停損虧損</span><b style="color:var(--red);">'
+                          f'{fmt_num(_plan.get("實際風險"), "{:,.0f}")} 元</b></div>'
+                        + f'<div class="wb-row"><span>目前持倉</span><b>{len(_positions)} 檔</b></div>'
+                        + '<div class="wb-foot">環圈為建立此部位後占總持倉成本的比重</div>'
                     )
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">持倉摘要</div>'
-                    f'<div class="wb-card-note">持倉中心</div></div>{_pos_body}</div>',
-                    unsafe_allow_html=True)
+                _pos_card = (
+                    '<div class="wb-card"><div class="wb-card-head">'
+                    '<div class="wb-card-title">持倉摘要</div>'
+                    f'<div class="wb-card-note">持倉中心</div></div>{_pos_body}</div>'
+                )
 
-            with risk_col:
+                # ---------- 風險設定 ----------
                 _atr_pct = current_stock.get('ATR比例(%)', np.nan)
                 if pd.isna(_atr_pct):
                     _risk_level, _risk_color = '無資料', 'var(--muted)'
@@ -5377,202 +5397,194 @@ with tab_workspace:
                     _risk_level, _risk_color = '中等', 'var(--yellow)'
                 else:
                     _risk_level, _risk_color = '高波動', 'var(--red)'
-                st.markdown(f"""
-                <div class="wb-card">
-                  <div class="wb-card-head"><div class="wb-card-title">風險設定</div>
-                    <div class="wb-card-note">側欄可調</div></div>
-                  <div class="wb-row"><span>單筆最大虧損</span><b>{_risk_budget:,.0f} 元</b></div>
-                  <div class="wb-row"><span>停損機制</span><b>{_atr_mult:g}× ATR20</b></div>
-                  <div class="wb-row"><span>ATR20</span><b>{fmt_num(current_stock.get('ATR20', np.nan), '{:.2f}')}</b></div>
-                  <div class="wb-row"><span>日波動比例</span><b>{fmt_num(_atr_pct, '{:.2f}%')}</b></div>
-                  <div class="wb-row"><span>風險等級</span><b style="color:{_risk_color};">{_risk_level}</b></div>
-                  <div class="wb-row"><span>建議部位</span><b>{_lots_txt}</b></div>
-                  <div class="wb-row"><span>30日乖離</span><b>{fmt_num(current_stock.get('乖離30MA(%)', np.nan), '{:+.2f}%')}</b></div>
-                  <div class="wb-foot">到「風險與部位設定」可調整預算與倍數</div>
-                </div>
-                """, unsafe_allow_html=True)
+                _risk_card = (
+                    '<div class="wb-card"><div class="wb-card-head">'
+                    '<div class="wb-card-title">風險設定</div>'
+                    '<div class="wb-card-note">側欄可調</div></div>'
+                    f'<div class="wb-row"><span>單筆最大虧損</span><b>{_risk_budget:,.0f} 元</b></div>'
+                    f'<div class="wb-row"><span>停損機制</span><b>{_atr_mult:g}× ATR20</b></div>'
+                    f'<div class="wb-row"><span>ATR20</span>'
+                    f'<b>{fmt_num(current_stock.get("ATR20", np.nan), "{:.2f}")}</b></div>'
+                    f'<div class="wb-row"><span>日波動比例</span><b>{fmt_num(_atr_pct, "{:.2f}%")}</b></div>'
+                    f'<div class="wb-row"><span>風險等級</span>'
+                    f'<b style="color:{_risk_color};">{_risk_level}</b></div>'
+                    f'<div class="wb-row"><span>建議部位</span><b>{_lots_txt}</b></div>'
+                    f'<div class="wb-row"><span>30日乖離</span>'
+                    f'<b>{fmt_num(current_stock.get("乖離30MA(%)", np.nan), "{:+.2f}%")}</b></div>'
+                    '<div class="wb-foot">到「風險與部位設定」可調整預算與倍數</div>'
+                    '</div>'
+                )
 
-            # ══════════════ 第三列：六格資訊模組 ══════════════
-            mod1, mod2, mod3, mod4, mod5, mod6 = st.columns(6, gap="small")
+                st.markdown(f'<div class="wb-grid3">{_plan_card}{_pos_card}{_risk_card}</div>',
+                            unsafe_allow_html=True)
+
+            # ══════════════ 第三列：六格資訊模組（同一個 grid，自動等高）══════════════
+            _mods = []
 
             # ---------- ① 多空指標 ----------
-            with mod1:
-                _inds = calc_bull_bear_indicators(_k_src)
-                if _inds:
-                    _sum = summarize_bull_bear(_inds)
-                    _bull_pct = (_sum['bull'] / _sum['total'] * 100) if _sum['total'] else 0.0
-                    _vcolor = {'偏多': '#36c99a', '偏空': '#ff6b7a', '多空拉鋸': '#f8c766'}.get(_sum['verdict'], '#8796aa')
-                    _rows = ''
-                    for _ind in _inds[:5]:
-                        _c = {'多': 'var(--green)', '空': 'var(--red)', '中性': 'var(--muted)'}.get(_ind['訊號'], 'var(--muted)')
-                        _rows += (f'<div class="wb-row"><span>{_ind["指標"]}</span>'
-                                  f'<b style="color:{_c};">{_ind["訊號"]}方</b></div>')
-                    _body = (f'{wb_svg_gauge(_bull_pct, _sum["verdict"], _vcolor)}{_rows}'
-                             f'<div class="wb-foot">看多 {_sum["bull"]}／看空 {_sum["bear"]}／'
-                             f'中性 {_sum["neutral"]}（共 {_sum["total"]} 項）</div>')
-                else:
-                    _body = '<div class="wb-empty">歷史資料不足 60 個交易日，無法計算多空指標。</div>'
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">多空指標</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+            _inds = calc_bull_bear_indicators(_k_src)
+            if _inds:
+                _sum = summarize_bull_bear(_inds)
+                _bull_pct = (_sum['bull'] / _sum['total'] * 100) if _sum['total'] else 0.0
+                _vcolor = {'偏多': '#36c99a', '偏空': '#ff6b7a', '多空拉鋸': '#f8c766'}.get(_sum['verdict'], '#8796aa')
+                _rows = ''
+                for _ind in _inds[:5]:
+                    _c = {'多': 'var(--green)', '空': 'var(--red)', '中性': 'var(--muted)'}.get(_ind['訊號'], 'var(--muted)')
+                    _rows += (f'<div class="wb-row"><span>{_ind["指標"]}</span>'
+                              f'<b style="color:{_c};">{_ind["訊號"]}方</b></div>')
+                _body = (wb_svg_gauge(_bull_pct, _sum['verdict'], _vcolor) + _rows
+                         + f'<div class="wb-foot">看多 {_sum["bull"]}／看空 {_sum["bear"]}／'
+                           f'中性 {_sum["neutral"]}（共 {_sum["total"]} 項）</div>')
+            else:
+                _body = '<div class="wb-empty">歷史資料不足 60 個交易日，無法計算多空指標。</div>'
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         f'<div class="wb-card-title">多空指標</div></div>{_body}</div>')
 
             # ---------- ② 財務體質 ----------
-            with mod2:
-                _fin = fetch_financial_ratios(_code)
-                _health = calc_financial_health_score(_fin.get('metrics', {}))
-                if _health:
-                    _hcolor = {'var(--green)': '#36c99a', 'var(--yellow)': '#f8c766',
-                               'var(--red)': '#ff6b7a'}.get(_health['color'], '#8eb6ff')
-                    _radar_html = wb_svg_radar(_health['category_scores'], _hcolor)
-                    if not _radar_html:
-                        _radar_html = ''.join(
-                            f'<div class="wb-row"><span>{_cat}</span>'
-                            f'<b>{_sc:.0f}</b></div>'
-                            for _cat, _sc in _health['category_scores'].items()
-                        )
-                    _body = (
-                        f'<div style="text-align:center;margin-bottom:6px;">'
-                        f'<span class="wb-big" style="color:{_hcolor};">{_health["overall"]:.0f}</span>'
-                        f'<span style="font-size:12px;color:var(--muted);"> / 100</span>'
-                        f'<div class="wb-sub">{_health["verdict"]}</div></div>'
-                        # 分類少於 3 種時畫不出多邊形（例如財報只解析到償債＋獲利兩類），
-                        # 這時退回條列顯示，不要讓卡片中間空一塊。
-                        f'{_radar_html}'
-                        f'<div class="wb-foot">{_fin.get("year", "N/A")} 年報｜採用 {_health["n_metrics"]} 項指標</div>'
+            _fin = fetch_financial_ratios(_code)
+            _health = calc_financial_health_score(_fin.get('metrics', {}))
+            if _health:
+                _hcolor = {'var(--green)': '#36c99a', 'var(--yellow)': '#f8c766',
+                           'var(--red)': '#ff6b7a'}.get(_health['color'], '#8eb6ff')
+                # 分類少於 3 種時畫不出多邊形（例如財報只解析到償債＋獲利兩類），
+                # 這時退回條列顯示，不要讓卡片中間空一塊。
+                _radar_html = wb_svg_radar(_health['category_scores'], _hcolor)
+                if not _radar_html:
+                    _radar_html = ''.join(
+                        f'<div class="wb-row"><span>{_cat}</span><b>{_sc:.0f}</b></div>'
+                        for _cat, _sc in _health['category_scores'].items()
                     )
-                else:
-                    _body = ('<div class="wb-empty">查無財務比率資料，可能是新股、金融／保險等'
-                             '特殊財報格式，或來源暫時無回應。</div>')
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">財務體質</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+                _body = (
+                    f'<div style="text-align:center;margin-bottom:6px;">'
+                    f'<span class="wb-big" style="color:{_hcolor};">{_health["overall"]:.0f}</span>'
+                    f'<span style="font-size:12px;color:var(--muted);"> / 100</span>'
+                    f'<div class="wb-sub">{_health["verdict"]}</div></div>'
+                    f'{_radar_html}'
+                    f'<div class="wb-foot">{_fin.get("year", "N/A")} 年報｜採用 {_health["n_metrics"]} 項指標</div>'
+                )
+            else:
+                _body = ('<div class="wb-empty">查無財務比率資料，可能是新股、金融／保險等'
+                         '特殊財報格式，或來源暫時無回應。</div>')
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         f'<div class="wb-card-title">財務體質</div></div>{_body}</div>')
 
             # ---------- ③ 三大法人 ----------
-            with mod3:
-                _inst = fetch_institutional_trading(_code, _mkt)
-                if _inst:
-                    _trs = ''
-                    for _r in _inst[:5]:
-                        _tds = ''
-                        for _f in ('外資', '投信', '自營商', '合計'):
-                            _v = _r.get(_f, np.nan)
-                            _c = '#36c99a' if (pd.notna(_v) and _v >= 0) else '#ff6b7a'
-                            _tds += f'<td style="color:{_c};">{fmt_num(_v, "{:+,.0f}")}</td>'
-                        _trs += f'<tr><td>{str(_r.get("日期", ""))[-5:]}</td>{_tds}</tr>'
-                    _cum = sum(_r.get('合計', 0) or 0 for _r in _inst[:5] if pd.notna(_r.get('合計')))
-                    _cum_c = 'var(--green)' if _cum >= 0 else 'var(--red)'
-                    _body = (
-                        f'<table class="wb-tbl"><thead><tr><th>日期</th><th>外資</th><th>投信</th>'
-                        f'<th>自營</th><th>合計</th></tr></thead><tbody>{_trs}</tbody></table>'
-                        f'<div class="wb-row" style="margin-top:8px;border-top:1px solid var(--border);">'
-                        f'<span>近5日累計</span><b style="color:{_cum_c};">{_cum:+,.0f} 張</b></div>'
-                    )
-                else:
-                    _body = '<div class="wb-empty">查無三大法人資料，可能是新股或來源暫時無回應。</div>'
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">三大法人</div>'
-                    f'<div class="wb-card-note">近5日</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+            _inst = fetch_institutional_trading(_code, _mkt)
+            if _inst:
+                _trs = ''
+                for _r in _inst[:5]:
+                    _tds = ''
+                    for _f in ('外資', '投信', '自營商', '合計'):
+                        _v = _r.get(_f, np.nan)
+                        _c = '#36c99a' if (pd.notna(_v) and _v >= 0) else '#ff6b7a'
+                        _tds += f'<td style="color:{_c};">{fmt_num(_v, "{:+,.0f}")}</td>'
+                    _trs += f'<tr><td>{str(_r.get("日期", ""))[-5:]}</td>{_tds}</tr>'
+                _cum = sum(_r.get('合計', 0) or 0 for _r in _inst[:5] if pd.notna(_r.get('合計')))
+                _cum_c = 'var(--green)' if _cum >= 0 else 'var(--red)'
+                _body = (
+                    '<table class="wb-tbl"><thead><tr><th>日期</th><th>外資</th><th>投信</th>'
+                    f'<th>自營</th><th>合計</th></tr></thead><tbody>{_trs}</tbody></table>'
+                    '<div class="wb-row" style="margin-top:8px;border-top:1px solid var(--border);">'
+                    f'<span>近5日累計</span><b style="color:{_cum_c};">{_cum:+,.0f} 張</b></div>'
+                )
+            else:
+                _body = '<div class="wb-empty">查無三大法人資料，可能是新股或來源暫時無回應。</div>'
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         '<div class="wb-card-title">三大法人</div>'
+                         f'<div class="wb-card-note">近5日</div></div>{_body}</div>')
 
             # ---------- ④ 資券變化 ----------
-            with mod4:
-                _mg = fetch_margin_trading(_code, _mkt)
-                if _mg:
-                    _l = _mg[0]
-                    _mbal = _l.get('融資餘額', np.nan)
-                    _sbal = _l.get('融券餘額', np.nan)
-                    _ratio = ((_sbal / _mbal * 100) if (pd.notna(_mbal) and pd.notna(_sbal) and _mbal > 0)
-                              else np.nan)
-                    _hist = list(reversed(_mg[:30]))
-                    _spark = wb_svg_sparkline(
-                        [[r.get('融資餘額', np.nan) for r in _hist],
-                         [r.get('融券餘額', np.nan) for r in _hist]],
-                        ['#6ea8fe', '#f8c766'], height=48)
-                    _mc = 'var(--green)' if (pd.notna(_l.get('融資增減')) and _l['融資增減'] >= 0) else 'var(--red)'
-                    _sc = 'var(--green)' if (pd.notna(_l.get('融券增減')) and _l['融券增減'] >= 0) else 'var(--red)'
-                    _body = (
-                        f'<div class="wb-row"><span>融資餘額</span><b>{fmt_num(_mbal, "{:,.0f}")} 張</b></div>'
-                        f'<div class="wb-row"><span>融資增減</span>'
-                        f'<b style="color:{_mc};">{fmt_num(_l.get("融資增減"), "{:+,.0f}")}</b></div>'
-                        f'<div class="wb-row"><span>融券餘額</span><b>{fmt_num(_sbal, "{:,.0f}")} 張</b></div>'
-                        f'<div class="wb-row"><span>融券增減</span>'
-                        f'<b style="color:{_sc};">{fmt_num(_l.get("融券增減"), "{:+,.0f}")}</b></div>'
-                        f'<div class="wb-row"><span>券資比</span><b>{fmt_num(_ratio, "{:.2f}%")}</b></div>'
-                        f'<div style="margin-top:9px;">{_spark}</div>'
-                        f'<div class="wb-foot"><span style="color:#6ea8fe;">━</span> 融資餘額　'
-                        f'<span style="color:#f8c766;">━</span> 融券餘額（近 {len(_hist)} 日）</div>'
-                    )
-                else:
-                    _body = '<div class="wb-empty">查無資券資料，可能是無信用交易資格或來源暫時無回應。</div>'
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">資券變化</div>'
-                    f'<div class="wb-card-note">近30日</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+            _mg = fetch_margin_trading(_code, _mkt)
+            if _mg:
+                _l = _mg[0]
+                _mbal = _l.get('融資餘額', np.nan)
+                _sbal = _l.get('融券餘額', np.nan)
+                _ratio = ((_sbal / _mbal * 100) if (pd.notna(_mbal) and pd.notna(_sbal) and _mbal > 0)
+                          else np.nan)
+                _hist = list(reversed(_mg[:30]))
+                _spark = wb_svg_sparkline(
+                    [[r.get('融資餘額', np.nan) for r in _hist],
+                     [r.get('融券餘額', np.nan) for r in _hist]],
+                    ['#6ea8fe', '#f8c766'], height=48)
+                _mc = 'var(--green)' if (pd.notna(_l.get('融資增減')) and _l['融資增減'] >= 0) else 'var(--red)'
+                _sc = 'var(--green)' if (pd.notna(_l.get('融券增減')) and _l['融券增減'] >= 0) else 'var(--red)'
+                _body = (
+                    f'<div class="wb-row"><span>融資餘額</span><b>{fmt_num(_mbal, "{:,.0f}")} 張</b></div>'
+                    f'<div class="wb-row"><span>融資增減</span>'
+                    f'<b style="color:{_mc};">{fmt_num(_l.get("融資增減"), "{:+,.0f}")}</b></div>'
+                    f'<div class="wb-row"><span>融券餘額</span><b>{fmt_num(_sbal, "{:,.0f}")} 張</b></div>'
+                    f'<div class="wb-row"><span>融券增減</span>'
+                    f'<b style="color:{_sc};">{fmt_num(_l.get("融券增減"), "{:+,.0f}")}</b></div>'
+                    f'<div class="wb-row"><span>券資比</span><b>{fmt_num(_ratio, "{:.2f}%")}</b></div>'
+                    f'<div style="margin-top:9px;">{_spark}</div>'
+                    f'<div class="wb-foot"><span style="color:#6ea8fe;">━</span> 融資餘額　'
+                    f'<span style="color:#f8c766;">━</span> 融券餘額（近 {len(_hist)} 日）</div>'
+                )
+            else:
+                _body = '<div class="wb-empty">查無資券資料，可能是無信用交易資格或來源暫時無回應。</div>'
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         '<div class="wb-card-title">資券變化</div>'
+                         f'<div class="wb-card-note">近30日</div></div>{_body}</div>')
 
             # ---------- ⑤ 法人目標價 ----------
-            with mod5:
-                _tgt = fetch_analyst_target_price(_code)
-                _tsum = summarize_target_price(_tgt, price) if _tgt else {}
-                if _tsum:
-                    _up = _tsum.get('upside_pct', np.nan)
-                    _upc = 'var(--green)' if (pd.notna(_up) and _up >= 0) else 'var(--red)'
-                    # 依「新評等」文字歸類成買進／持有／中立三檔，算出近期評等分布
-                    _buy = _hold = _neu = 0
-                    for _r in _tgt[:12]:
-                        _txt = str(_r.get('新評等', ''))
-                        if any(w in _txt for w in ('買進', '買超', '增持', '優於', '強力', 'Buy', 'Outperform')):
-                            _buy += 1
-                        elif any(w in _txt for w in ('持有', '中立', '同步', 'Hold', 'Neutral')):
-                            _hold += 1
-                        else:
-                            _neu += 1
-                    _tot = max(_buy + _hold + _neu, 1)
-                    _body = (
-                        f'<div style="text-align:center;margin-bottom:4px;">'
-                        f'<span class="wb-big">{fmt_num(_tsum["avg_target"], "{:.2f}")}</span>'
-                        f'<div class="wb-sub">近 {_tsum["n_ratings"]} 筆平均目標價</div></div>'
-                        f'<div style="text-align:center;font-family:Roboto Mono,monospace;'
-                        f'font-size:17px;font-weight:700;color:{_upc};margin-bottom:8px;">'
-                        f'{fmt_num(_up, "{:+.2f}%")}</div>'
-                        f'{wb_bar_row("買進", _buy / _tot * 100, "#36c99a")}'
-                        f'{wb_bar_row("持有", _hold / _tot * 100, "#6ea8fe")}'
-                        f'{wb_bar_row("中立", _neu / _tot * 100, "#8796aa")}'
-                        f'<div class="wb-row" style="margin-top:6px;"><span>最高／最低</span>'
-                        f'<b>{fmt_num(_tsum["max_target"], "{:.1f}")} / {fmt_num(_tsum["min_target"], "{:.1f}")}</b></div>'
-                        f'<div class="wb-foot">最新 {_tsum["latest_broker"]}｜{_tsum["latest_date"]}</div>'
-                    )
-                else:
-                    _body = '<div class="wb-empty">近期無外資／券商評等紀錄，或來源暫時無回應。</div>'
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">法人目標價</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+            _tgt = fetch_analyst_target_price(_code)
+            _tsum = summarize_target_price(_tgt, price) if _tgt else {}
+            if _tsum:
+                _up = _tsum.get('upside_pct', np.nan)
+                _upc = 'var(--green)' if (pd.notna(_up) and _up >= 0) else 'var(--red)'
+                # 依「新評等」文字歸類成買進／持有／中立三檔，算出近期評等分布
+                _buy = _hold = _neu = 0
+                for _r in _tgt[:12]:
+                    _txt = str(_r.get('新評等', ''))
+                    if any(w in _txt for w in ('買進', '買超', '增持', '優於', '強力', 'Buy', 'Outperform')):
+                        _buy += 1
+                    elif any(w in _txt for w in ('持有', '中立', '同步', 'Hold', 'Neutral')):
+                        _hold += 1
+                    else:
+                        _neu += 1
+                _tot = max(_buy + _hold + _neu, 1)
+                _body = (
+                    f'<div style="text-align:center;margin-bottom:4px;">'
+                    f'<span class="wb-big">{fmt_num(_tsum["avg_target"], "{:.2f}")}</span>'
+                    f'<div class="wb-sub">近 {_tsum["n_ratings"]} 筆平均目標價</div></div>'
+                    f'<div style="text-align:center;font-family:Roboto Mono,monospace;'
+                    f'font-size:17px;font-weight:700;color:{_upc};margin-bottom:8px;">'
+                    f'{fmt_num(_up, "{:+.2f}%")}</div>'
+                    f'{wb_bar_row("買進", _buy / _tot * 100, "#36c99a")}'
+                    f'{wb_bar_row("持有", _hold / _tot * 100, "#6ea8fe")}'
+                    f'{wb_bar_row("中立", _neu / _tot * 100, "#8796aa")}'
+                    f'<div class="wb-row" style="margin-top:6px;"><span>最高／最低</span>'
+                    f'<b>{fmt_num(_tsum["max_target"], "{:.1f}")} / {fmt_num(_tsum["min_target"], "{:.1f}")}</b></div>'
+                    f'<div class="wb-foot">最新 {_tsum["latest_broker"]}｜{_tsum["latest_date"]}</div>'
+                )
+            else:
+                _body = '<div class="wb-empty">近期無外資／券商評等紀錄，或來源暫時無回應。</div>'
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         f'<div class="wb-card-title">法人目標價</div></div>{_body}</div>')
 
             # ---------- ⑥ 最新新聞 ----------
-            with mod6:
-                _news = get_tw_stock_news(_code)
-                if _news:
-                    _items = ''
-                    for _n in _news[:5]:
-                        _items += (
-                            f'<a class="wb-news" href="{_n["link"]}" target="_blank">'
-                            f'<div class="wb-news-t">{_n["title"]}</div>'
-                            f'<div class="wb-news-m"><span style="color:{_n["color"]};">'
-                            f'{_n["sentiment"]}</span>　{_n["publisher"]}</div></a>'
-                        )
-                    _body = _items + '<div class="wb-foot">標題關鍵字初步標記，非人工判讀</div>'
-                else:
-                    _body = '<div class="wb-empty">目前無法取得即時新聞，稍後重新整理即可再試。</div>'
-                st.markdown(
-                    f'<div class="wb-card"><div class="wb-card-head">'
-                    f'<div class="wb-card-title">最新新聞</div></div>{_body}</div>',
-                    unsafe_allow_html=True)
+            # 這一格內容天生最長，等高之後會決定整列高度；限 4 則避免把其他卡片
+            # 一起撐得太高，其餘新聞在「完整分析明細 → 個股新聞」看得到。
+            _news = get_tw_stock_news(_code)
+            if _news:
+                _items = ''
+                for _n in _news[:4]:
+                    _items += (
+                        f'<a class="wb-news" href="{_n["link"]}" target="_blank">'
+                        f'<div class="wb-news-t">{_n["title"]}</div>'
+                        f'<div class="wb-news-m"><span style="color:{_n["color"]};">'
+                        f'{_n["sentiment"]}</span>　{_n["publisher"]}</div></a>'
+                    )
+                _body = _items + '<div class="wb-foot">標題關鍵字初步標記，非人工判讀</div>'
+            else:
+                _body = '<div class="wb-empty">目前無法取得即時新聞，稍後重新整理即可再試。</div>'
+            _mods.append('<div class="wb-card"><div class="wb-card-head">'
+                         f'<div class="wb-card-title">最新新聞</div></div>{_body}</div>')
+
+            st.markdown(f'<div class="wb-grid6">{"".join(_mods)}</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
 
             # [新功能] 交易計畫：沿用上方 ATR 停損與風險預算，可直接建立／更新持倉。
             with st.expander("🧭 交易計畫／建立持倉",
