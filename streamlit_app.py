@@ -6,6 +6,7 @@ from io import StringIO
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from bs4 import BeautifulSoup
 import random
 import re
@@ -178,6 +179,50 @@ def _safe_number(value, default=np.nan):
         return number if np.isfinite(number) else default
     except Exception:
         return default
+
+
+def is_etf_instrument(stock: dict) -> bool:
+    """依股票資料判斷 ETF／ETN；這類商品的升降單位與一般股票不同。"""
+    code = str(stock.get('code', '') or '').strip()
+    industry = str(stock.get('industry', '') or '').strip().upper()
+    name = str(stock.get('name', '') or '').strip().upper()
+    return industry in {'ETF', 'ETN'} or code.startswith('00') or 'ETF' in name or 'ETN' in name
+
+
+def get_tw_price_tick(price: float, is_etf: bool = False) -> float:
+    """取得台股可申報價格的最小升降單位。"""
+    p = _safe_number(price)
+    if pd.isna(p) or p <= 0:
+        return 0.01
+    if is_etf:
+        return 0.01 if p < 50 else 0.05
+    if p < 10:
+        return 0.01
+    if p < 50:
+        return 0.05
+    if p < 100:
+        return 0.10
+    if p < 500:
+        return 0.50
+    if p < 1000:
+        return 1.00
+    return 5.00
+
+
+def round_to_tw_tick(price: float, is_etf: bool = False, mode: str = 'nearest') -> float:
+    """把計算價位修正成台股可實際下單的價格檔位。"""
+    p = _safe_number(price)
+    if pd.isna(p) or p <= 0:
+        return np.nan
+    tick = Decimal(str(get_tw_price_tick(p, is_etf)))
+    value = Decimal(str(p)) / tick
+    rounding = {
+        'down': ROUND_FLOOR,
+        'up': ROUND_CEILING,
+        'nearest': ROUND_HALF_UP,
+    }.get(mode, ROUND_HALF_UP)
+    result = value.to_integral_value(rounding=rounding) * tick
+    return float(result)
 
 
 def load_positions() -> list:
@@ -2622,18 +2667,9 @@ def calc_atr(df: pd.DataFrame, period: int = 20) -> float:
         return np.nan
 
 
-def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=1000) -> dict:
-    """[新功能] 由 ATR 推出停損價，再由「單筆可承受虧損」反推該買幾張。
-
-    邏輯是部位大小服從風險，而不是服從資金：
-        停損價   = 現價 − atr_mult × ATR
-        每張風險 = (現價 − 停損價) × 1000 股
-        建議張數 = 單筆可承受虧損 ÷ 每張風險（無條件捨去）
-
-    這樣不論標的波動大小，一次做錯的損失都被壓在同一個數字上——
-    波動大的股票自動買少一點，波動小的可以買多一點。固定百分比停損
-    做不到這件事（同樣 8%，對台積電太寬、對投機小型股太緊）。
-    """
+def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=1000,
+                       is_etf: bool = False) -> dict:
+    """由 ATR 推出有效停損檔位，再由單筆可承受虧損反推部位大小。"""
     empty = {"停損價": np.nan, "停損幅度(%)": np.nan, "每張風險": np.nan,
              "建議張數": np.nan, "建議股數": np.nan, "投入金額": np.nan, "實際風險": np.nan}
     try:
@@ -2641,20 +2677,22 @@ def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=100
         atr = float(atr)
         if not np.isfinite(price) or not np.isfinite(atr) or price <= 0 or atr <= 0:
             return empty
-        stop = price - atr_mult * atr
-        if stop <= 0:
+
+        # ATR 算出的理論價位先轉成交易所允許的升降單位，後續風險與張數
+        # 全部以這個可實際下單的停損價重算，避免畫面出現 153.18、197.73 等無效檔位。
+        stop = round_to_tw_tick(price - atr_mult * atr, is_etf=is_etf, mode='nearest')
+        if pd.isna(stop) or stop <= 0 or stop >= price:
             return empty
+
         risk_per_share = price - stop
         risk_per_lot = risk_per_share * lot_size
         if risk_per_lot <= 0:
             return empty
         lots = int(max(0, np.floor(float(risk_budget) / risk_per_lot)))
-        # [新功能] 高價股（例如千元以上）常常一張的風險就超過預算，整股會算出 0 張。
-        # 台股零股交易已經很普及，這時改給「建議股數」，功能才不會對高價股失效。
         shares = int(max(0, np.floor(float(risk_budget) / risk_per_share)))
         unit_lots = lots if lots > 0 else shares / lot_size
         return {
-            "停損價": round(stop, 2),
+            "停損價": stop,
             "停損幅度(%)": round(risk_per_share / price * 100, 2),
             "每張風險": round(risk_per_lot, 0),
             "建議張數": lots,
@@ -2667,28 +2705,40 @@ def calc_position_plan(price, atr, atr_mult=2.0, risk_budget=30000, lot_size=100
 
 
 def build_trade_plan(stock: dict, risk_budget: float, atr_mult: float) -> dict:
-    """把 ATR 部位計算延伸為可直接建立持倉的交易計畫。"""
+    """把 ATR 部位計算延伸為可直接建立持倉、且符合台股升降單位的交易計畫。"""
     price = _safe_number(stock.get('收盤'))
     atr = _safe_number(stock.get('ATR20'))
-    base = calc_position_plan(price, atr, atr_mult, risk_budget)
+    is_etf = is_etf_instrument(stock)
+    base = calc_position_plan(price, atr, atr_mult, risk_budget, is_etf=is_etf)
     stop = _safe_number(base.get('停損價'))
     if pd.isna(price) or pd.isna(stop) or price <= stop:
         return {
             'entry_low': np.nan, 'entry_high': np.nan, 'chase_limit': np.nan,
             'stop': stop, 'target1': np.nan, 'target2': np.nan,
-            'rr1': np.nan, 'rr2': np.nan, **base,
+            'rr1': np.nan, 'rr2': np.nan, 'price_tick': get_tw_price_tick(price, is_etf),
+            'is_etf': is_etf, **base,
         }
+
     risk_per_share = price - stop
-    entry_low = max(0.01, price - (0.30 * atr if pd.notna(atr) else 0))
-    entry_high = price + (0.20 * atr if pd.notna(atr) else 0)
-    chase_limit = price + (0.50 * atr if pd.notna(atr) else 0)
-    target1 = price + 1.5 * risk_per_share
-    target2 = price + 3.0 * risk_per_share
+    entry_low = round_to_tw_tick(max(0.01, price - 0.30 * atr), is_etf)
+    entry_high = round_to_tw_tick(price + 0.20 * atr, is_etf)
+    chase_limit = round_to_tw_tick(price + 0.50 * atr, is_etf)
+    target1 = round_to_tw_tick(price + 1.5 * risk_per_share, is_etf)
+    target2 = round_to_tw_tick(price + 3.0 * risk_per_share, is_etf)
+
+    # 極低價或極小 ATR 時，四捨五入後可能落在相同檔位；至少保留一個有效跳動單位。
+    if pd.notna(target1) and target1 <= price:
+        target1 = round_to_tw_tick(price + get_tw_price_tick(price, is_etf), is_etf, mode='up')
+    if pd.notna(target2) and target2 <= target1:
+        target2 = round_to_tw_tick(target1 + get_tw_price_tick(target1, is_etf), is_etf, mode='up')
+
     return {
-        'entry_low': round(entry_low, 2), 'entry_high': round(entry_high, 2),
-        'chase_limit': round(chase_limit, 2), 'stop': round(stop, 2),
-        'target1': round(target1, 2), 'target2': round(target2, 2),
-        'rr1': 1.5, 'rr2': 3.0, **base,
+        'entry_low': entry_low, 'entry_high': entry_high,
+        'chase_limit': chase_limit, 'stop': stop,
+        'target1': target1, 'target2': target2,
+        'rr1': 1.5, 'rr2': 3.0,
+        'price_tick': get_tw_price_tick(price, is_etf), 'is_etf': is_etf,
+        **base,
     }
 
 
@@ -4695,7 +4745,10 @@ with tab_workspace:
                 _mult = float(st.session_state.get("atr_stop_mult", 2.0))
                 _budget = float(st.session_state.get("risk_budget", 30000))
                 _plans = [
-                    calc_position_plan(r.get("收盤", np.nan), r.get("ATR20", np.nan), _mult, _budget)
+                    calc_position_plan(
+                        r.get("收盤", np.nan), r.get("ATR20", np.nan), _mult, _budget,
+                        is_etf=is_etf_instrument(r.to_dict()),
+                    )
                     for _, r in view_df.iterrows()
                 ]
                 view_df = view_df.copy()
@@ -4840,10 +4893,12 @@ with tab_workspace:
 
             # [新功能] ATR 停損與建議張數：把「這檔該買幾張、錯了在哪裡認輸」
             # 直接放進報價卡，不用另外拿計算機。
+            _current_is_etf = is_etf_instrument(current_stock.to_dict())
             _plan = calc_position_plan(
                 price, current_stock.get('ATR20', np.nan),
                 float(st.session_state.get('atr_stop_mult', 2.0)),
                 float(st.session_state.get('risk_budget', 30000)),
+                is_etf=_current_is_etf,
             )
             _atr_txt = fmt_num(current_stock.get('ATR20', np.nan), '{:.2f}')
             _stop_txt = fmt_num(_plan['停損價'], '{:.2f}')
@@ -4891,15 +4946,34 @@ with tab_workspace:
                     float(st.session_state.get('atr_stop_mult', 2.0)),
                 )
                 tp1, tp2, tp3, tp4 = st.columns(4)
-                with tp1:
-                    st.metric("理想進場區", f"{fmt_num(_trade_plan.get('entry_low'))}～{fmt_num(_trade_plan.get('entry_high'))}")
-                with tp2:
-                    st.metric("追價上限", fmt_num(_trade_plan.get('chase_limit')))
-                with tp3:
-                    st.metric("第一目標", fmt_num(_trade_plan.get('target1')), "1.5R")
-                with tp4:
-                    st.metric("第二目標", fmt_num(_trade_plan.get('target2')), "3.0R")
 
+                def _render_plan_price(label: str, value: str, badge: str = '', compact: bool = False):
+                    badge_html = (f'<div style="display:inline-block;margin-top:7px;padding:2px 9px;border-radius:999px;'
+                                  f'background:rgba(53,196,141,.18);color:#35c48d;font-size:13px;font-weight:800;">↑ {badge}</div>') if badge else ''
+                    font_size = 'clamp(25px,2.35vw,38px)' if compact else 'clamp(28px,2.6vw,40px)'
+                    st.markdown(
+                        f'<div style="min-width:0;padding:4px 0 14px;overflow:visible;">'
+                        f'<div style="font-size:14px;color:#91a7c4;margin-bottom:5px;">{label}</div>'
+                        f'<div style="font-size:{font_size};line-height:1.12;color:#f4f8ff;white-space:nowrap;'
+                        f'letter-spacing:-1.2px;font-variant-numeric:tabular-nums;overflow:visible;">{value}</div>'
+                        f'{badge_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                with tp1:
+                    _render_plan_price(
+                        "理想進場區",
+                        f"{fmt_num(_trade_plan.get('entry_low'))}～{fmt_num(_trade_plan.get('entry_high'))}",
+                        compact=True,
+                    )
+                with tp2:
+                    _render_plan_price("追價上限", fmt_num(_trade_plan.get('chase_limit')))
+                with tp3:
+                    _render_plan_price("第一目標", fmt_num(_trade_plan.get('target1')), "1.5R")
+                with tp4:
+                    _render_plan_price("第二目標", fmt_num(_trade_plan.get('target2')), "3.0R")
+
+                st.caption("以上價位已依台股股票／ETF 的最小升降單位，自動修正為可實際委託的價格檔位。")
                 _default_shares = _trade_plan.get('建議股數', 1)
                 if pd.isna(_default_shares) or _default_shares < 1:
                     _default_shares = 1
@@ -4907,6 +4981,29 @@ with tab_workspace:
                 _fallback_stop = _safe_number(_trade_plan.get('stop'), price * 0.95)
                 _fallback_target1 = _safe_number(_trade_plan.get('target1'), price + (price - _fallback_stop) * 1.5)
                 _fallback_target2 = _safe_number(_trade_plan.get('target2'), price + (price - _fallback_stop) * 3.0)
+
+                # 舊版若已存入不符合升降單位的價格，載入表單時也一併校正。
+                _entry_default = round_to_tw_tick(
+                    _safe_number(_existing_position.get('entry_price'), price) if _existing_position else price,
+                    _current_is_etf,
+                )
+                _stop_default = round_to_tw_tick(
+                    _safe_number(_existing_position.get('stop_price'), _fallback_stop) if _existing_position else _fallback_stop,
+                    _current_is_etf,
+                )
+                _target1_default = round_to_tw_tick(
+                    _safe_number(_existing_position.get('target1'), _fallback_target1) if _existing_position else _fallback_target1,
+                    _current_is_etf,
+                )
+                _target2_default = round_to_tw_tick(
+                    _safe_number(_existing_position.get('target2'), _fallback_target2) if _existing_position else _fallback_target2,
+                    _current_is_etf,
+                )
+                _entry_tick = get_tw_price_tick(_entry_default, _current_is_etf)
+                _stop_tick = get_tw_price_tick(_stop_default, _current_is_etf)
+                _target1_tick = get_tw_price_tick(_target1_default, _current_is_etf)
+                _target2_tick = get_tw_price_tick(_target2_default, _current_is_etf)
+
                 if _existing_position:
                     st.info("這檔股票已有未平倉紀錄；儲存後會更新原持倉，不會建立重複部位。")
 
@@ -4915,8 +5012,8 @@ with tab_workspace:
                     with f1:
                         entry_price_input = st.number_input(
                             "實際／預計進場價", min_value=0.01,
-                            value=float(_existing_position.get('entry_price', price) if _existing_position else price),
-                            step=0.1, format="%.2f",
+                            value=float(_entry_default),
+                            step=_entry_tick, format="%.2f",
                         )
                         shares_input = st.number_input(
                             "持有股數", min_value=1,
@@ -4926,19 +5023,19 @@ with tab_workspace:
                     with f2:
                         stop_input = st.number_input(
                             "停損價", min_value=0.01,
-                            value=float(_safe_number(_existing_position.get('stop_price'), _fallback_stop) if _existing_position else _fallback_stop),
-                            step=0.1, format="%.2f",
+                            value=float(_stop_default),
+                            step=_stop_tick, format="%.2f",
                         )
                         target1_input = st.number_input(
                             "第一目標價", min_value=0.01,
-                            value=float(_safe_number(_existing_position.get('target1'), _fallback_target1) if _existing_position else _fallback_target1),
-                            step=0.1, format="%.2f",
+                            value=float(_target1_default),
+                            step=_target1_tick, format="%.2f",
                         )
                     with f3:
                         target2_input = st.number_input(
                             "第二目標價", min_value=0.01,
-                            value=float(_safe_number(_existing_position.get('target2'), _fallback_target2) if _existing_position else _fallback_target2),
-                            step=0.1, format="%.2f",
+                            value=float(_target2_default),
+                            step=_target2_tick, format="%.2f",
                         )
                         entry_date_input = st.date_input(
                             "進場日期",
@@ -4961,9 +5058,13 @@ with tab_workspace:
                         "💼 建立／更新持倉", type="primary", use_container_width=True
                     )
                     if save_trade_clicked:
-                        if stop_input >= entry_price_input:
+                        _entry_valid = round_to_tw_tick(entry_price_input, _current_is_etf)
+                        _stop_valid = round_to_tw_tick(stop_input, _current_is_etf)
+                        _target1_valid = round_to_tw_tick(target1_input, _current_is_etf)
+                        _target2_valid = round_to_tw_tick(target2_input, _current_is_etf)
+                        if _stop_valid >= _entry_valid:
                             st.error("停損價必須低於進場價。")
-                        elif target1_input <= entry_price_input or target2_input <= target1_input:
+                        elif _target1_valid <= _entry_valid or _target2_valid <= _target1_valid:
                             st.error("第一目標必須高於進場價，第二目標必須高於第一目標。")
                         else:
                             position_payload = {
@@ -4971,9 +5072,9 @@ with tab_workspace:
                                 'ticker': current_stock['ticker'], 'industry': current_stock.get('industry', '未分類'),
                                 '市場別': current_stock.get('市場別', ''),
                                 'entry_date': entry_date_input.strftime('%Y-%m-%d'),
-                                'entry_price': round(float(entry_price_input), 2), 'shares': int(shares_input),
-                                'stop_price': round(float(stop_input), 2),
-                                'target1': round(float(target1_input), 2), 'target2': round(float(target2_input), 2),
+                                'entry_price': _entry_valid, 'shares': int(shares_input),
+                                'stop_price': _stop_valid,
+                                'target1': _target1_valid, 'target2': _target2_valid,
                                 'strategy': strategy_input.strip(), 'note': note_input.strip(),
                                 'telegram_alert': bool(telegram_alert_input),
                             }
@@ -5782,30 +5883,41 @@ with tab_portfolio:
         position_map = {f"{p.get('name')} ({p.get('code')})": p for p in open_positions}
         selected_label = st.selectbox("選擇持倉", list(position_map.keys()), key="manage_position_select")
         selected_position = position_map[selected_label]
+        _selected_is_etf = is_etf_instrument(selected_position)
+        _selected_price_base = _safe_number(selected_position.get('last_price'), _safe_number(selected_position.get('entry_price'), 0.01))
+        _selected_tick = get_tw_price_tick(_selected_price_base, _selected_is_etf)
+        _edit_entry_default = round_to_tw_tick(_safe_number(selected_position.get('entry_price'), 0.01), _selected_is_etf)
+        _edit_stop_default = round_to_tw_tick(_safe_number(selected_position.get('stop_price'), 0.01), _selected_is_etf)
+        _edit_target1_default = round_to_tw_tick(_safe_number(selected_position.get('target1'), 0.01), _selected_is_etf)
+        _edit_target2_default = round_to_tw_tick(_safe_number(selected_position.get('target2'), 0.01), _selected_is_etf)
 
         with st.form("edit_position_form"):
             e1, e2, e3 = st.columns(3)
             with e1:
-                edit_entry = st.number_input("進場成本", min_value=0.01, value=float(selected_position.get('entry_price', 0.01)), step=0.1, format='%.2f')
+                edit_entry = st.number_input("進場成本", min_value=0.01, value=float(_edit_entry_default), step=_selected_tick, format='%.2f')
                 edit_shares = st.number_input("持有股數", min_value=1, value=int(selected_position.get('shares', 1)), step=1)
             with e2:
-                edit_stop = st.number_input("停損價", min_value=0.01, value=float(selected_position.get('stop_price', 0.01)), step=0.1, format='%.2f')
-                edit_target1 = st.number_input("第一目標", min_value=0.01, value=float(selected_position.get('target1', 0.01)), step=0.1, format='%.2f')
+                edit_stop = st.number_input("停損價", min_value=0.01, value=float(_edit_stop_default), step=_selected_tick, format='%.2f')
+                edit_target1 = st.number_input("第一目標", min_value=0.01, value=float(_edit_target1_default), step=_selected_tick, format='%.2f')
             with e3:
-                edit_target2 = st.number_input("第二目標", min_value=0.01, value=float(selected_position.get('target2', 0.01)), step=0.1, format='%.2f')
+                edit_target2 = st.number_input("第二目標", min_value=0.01, value=float(_edit_target2_default), step=_selected_tick, format='%.2f')
                 edit_tg = st.checkbox("啟用 Telegram 停損警示", value=bool(selected_position.get('telegram_alert', True)))
             edit_strategy = st.text_input("策略", value=str(selected_position.get('strategy', '')))
             edit_note = st.text_area("交易筆記", value=str(selected_position.get('note', '')))
             if st.form_submit_button("儲存持倉修改", type="primary", use_container_width=True):
-                if edit_stop >= edit_entry:
+                _edit_entry_valid = round_to_tw_tick(edit_entry, _selected_is_etf)
+                _edit_stop_valid = round_to_tw_tick(edit_stop, _selected_is_etf)
+                _edit_target1_valid = round_to_tw_tick(edit_target1, _selected_is_etf)
+                _edit_target2_valid = round_to_tw_tick(edit_target2, _selected_is_etf)
+                if _edit_stop_valid >= _edit_entry_valid:
                     st.error("停損價必須低於進場成本。")
-                elif edit_target1 <= edit_entry or edit_target2 <= edit_target1:
+                elif _edit_target1_valid <= _edit_entry_valid or _edit_target2_valid <= _edit_target1_valid:
                     st.error("目標價設定不正確。")
                 else:
                     ok = update_position(selected_position['id'], {
-                        'entry_price': round(float(edit_entry), 2), 'shares': int(edit_shares),
-                        'stop_price': round(float(edit_stop), 2),
-                        'target1': round(float(edit_target1), 2), 'target2': round(float(edit_target2), 2),
+                        'entry_price': _edit_entry_valid, 'shares': int(edit_shares),
+                        'stop_price': _edit_stop_valid,
+                        'target1': _edit_target1_valid, 'target2': _edit_target2_valid,
                         'strategy': edit_strategy.strip(), 'note': edit_note.strip(),
                         'telegram_alert': bool(edit_tg), 'stop_alert_active': False,
                     })
@@ -5819,11 +5931,11 @@ with tab_portfolio:
         c1, c2 = st.columns(2)
         with c1:
             with st.form("close_position_form"):
-                close_price_input = st.number_input("平倉價", min_value=0.01, value=float(_safe_number(selected_position.get('last_price'), _safe_number(selected_position.get('entry_price'), 0.01))), step=0.1, format='%.2f')
+                close_price_input = st.number_input("平倉價", min_value=0.01, value=float(_safe_number(selected_position.get('last_price'), _safe_number(selected_position.get('entry_price'), 0.01))), step=_selected_tick, format='%.2f')
                 close_date_input = st.date_input("平倉日期", value=get_tw_now().date())
                 close_note_input = st.text_input("平倉原因", placeholder="停損、達標、趨勢轉弱、分批停利…")
                 if st.form_submit_button("✅ 確認平倉", use_container_width=True):
-                    if close_position(selected_position['id'], close_price_input, close_date_input.strftime('%Y-%m-%d'), close_note_input):
+                    if close_position(selected_position['id'], round_to_tw_tick(close_price_input, _selected_is_etf), close_date_input.strftime('%Y-%m-%d'), close_note_input):
                         st.session_state.portfolio_quotes = pd.DataFrame()
                         st.success("已完成平倉並保留績效紀錄。")
                         st.rerun()
