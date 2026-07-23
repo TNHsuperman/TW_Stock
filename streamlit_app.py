@@ -4382,10 +4382,27 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   margin:22px 0 4px;padding-top:13px;border-top:1px solid var(--border);
   font-size:11px;color:var(--muted);letter-spacing:.02em;}
 
-/* 候選 chips 按鈕列：壓低高度、等寬不換行 */
+/* 候選 chips 按鈕列：橫向捲動，一次瀏覽全部候選股 ──
+   Streamlit 的 st.columns 預設是 flex:1 1 0 平均分寬，欄位一多每一欄就被壓到
+   剩幾十 px。這裡把橫列改成 nowrap + overflow-x:auto，並給每一欄固定寬度，
+   欄數再多也只是往右延伸、用捲軸瀏覽，不會互相擠壓。 */
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']{
+  flex-wrap:nowrap!important;overflow-x:auto!important;overflow-y:hidden!important;
+  gap:6px!important;padding:2px 2px 6px;
+  scrollbar-width:thin;scrollbar-color:rgba(110,168,254,.5) rgba(148,163,184,.10);
+  overscroll-behavior-x:contain;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']>div{
+  flex:0 0 118px!important;width:118px!important;min-width:118px!important;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar{height:9px;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-track{
+  background:rgba(148,163,184,.10);border-radius:999px;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb{
+  background:rgba(110,168,254,.5);border-radius:999px;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb:hover{
+  background:rgba(110,168,254,.78);}
 .st-key-wb_chip_row [data-testid='stButton']>button{
-  min-height:34px!important;font-size:11px!important;padding:2px 6px!important;
-  white-space:nowrap!important;overflow:hidden!important;}
+  min-height:34px!important;font-size:11px!important;padding:2px 5px!important;
+  white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 .wb-chip-label{font-size:9.5px;font-weight:800;letter-spacing:.1em;color:var(--muted);
   text-transform:uppercase;margin:6px 0 4px;}
 
@@ -5220,19 +5237,22 @@ with tab_workspace:
                         st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
                         st.rerun()
 
-                # 候選股橫向 chips：取代原本常駐的左側清單，只顯示目前位置附近的
-                # 4 檔，完整表格移到下方「候選股票清單」收合區，功能一項沒少。
-                st.markdown('<div class="wb-chip-label">自選／候選股</div>', unsafe_allow_html=True)
+                # 候選股橫向捲動列：取代原本常駐的左側清單，一次把所有候選股都排出來，
+                # 用捲軸左右瀏覽（CSS 在 .st-key-wb_chip_row 那段）。完整表格仍在
+                # 下方「候選股票清單」收合區，功能一項沒少。
+                _max_chips = 150      # 上限保護：候選過多時只排前 150 檔，避免一次產生上千個
+                _n_chips = min(total_found, _max_chips)  # widget 讓每次重跑都變慢
+                _more_txt = f'（僅列前 {_max_chips} 檔，其餘請用下方完整表格）' if total_found > _max_chips else ''
+                st.markdown(
+                    f'<div class="wb-chip-label">自選／候選股　{total_found} 檔・可左右捲動{_more_txt}</div>',
+                    unsafe_allow_html=True)
                 with st.container(key="wb_chip_row"):
-                    _win = min(4, total_found)
-                    _start = max(0, min(st.session_state.current_idx - _win // 2, total_found - _win))
-                    _chip_cols = st.columns(_win) if _win > 0 else []
-                    for _ci in range(_win):
-                        _pos = _start + _ci
+                    _chip_cols = st.columns(_n_chips) if _n_chips > 0 else []
+                    for _pos in range(_n_chips):
                         _crow = df.iloc[_pos]
                         _cchg = _crow.get('漲跌幅(%)', np.nan)
                         _clabel = f"{_crow['name']} {_crow['code']}"
-                        with _chip_cols[_ci]:
+                        with _chip_cols[_pos]:
                             if st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
                                          use_container_width=True,
                                          type="primary" if _pos == st.session_state.current_idx else "secondary"):
