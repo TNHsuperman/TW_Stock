@@ -4391,7 +4391,12 @@ st.markdown("""
 [data-testid="stHorizontalBlock"]{gap:.72rem!important}[data-testid="stVerticalBlock"]{gap:.55rem!important}.stPlotlyChart{border-radius:12px;overflow:hidden}
 @media(max-width:1500px){.mod43-mini-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:1100px){.block-container{width:100%!important;padding-left:12px!important;padding-right:12px!important}.mod43-kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.mod43-mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:760px){.mod43-mini-grid{grid-template-columns:1fr}}
+
+.image-layout-topbar{display:grid;grid-template-columns:minmax(260px,1.7fr) repeat(3,minmax(118px,.55fr));gap:10px;align-items:center;margin:4px 0 10px}
+.image-watch-strip{display:flex;gap:8px;overflow-x:auto;padding:8px 4px 10px;scrollbar-width:thin}.image-watch-chip{flex:0 0 auto;min-width:150px;background:rgba(10,22,37,.96);border:1px solid rgba(76,110,147,.26);border-radius:10px;padding:8px 11px}.image-watch-chip.active{border-color:#26d0b1;box-shadow:0 0 0 1px rgba(38,208,177,.18)}.image-watch-chip .n{font-size:11px;color:#9bb0c9}.image-watch-chip .p{font-size:13px;font-weight:800;margin-top:3px}.image-stock-header{display:grid;grid-template-columns:minmax(290px,1.1fr) repeat(6,minmax(100px,.42fr));gap:0;background:linear-gradient(145deg,rgba(13,27,44,.98),rgba(9,19,32,.98));border:1px solid rgba(78,112,150,.25);border-radius:14px;margin:6px 0 10px;overflow:hidden}.image-stock-main{padding:15px 18px;border-right:1px solid rgba(97,127,163,.18)}.image-stock-main .nm{font-size:21px;font-weight:900;color:#f4f8ff}.image-stock-main .px{font-size:38px;font-weight:900;color:#35d3a3;line-height:1.12;margin-top:8px}.image-stock-main .chg{font-size:14px;font-weight:800;margin-left:8px}.image-stock-kpi{padding:14px 12px;border-right:1px solid rgba(97,127,163,.14);display:flex;flex-direction:column;justify-content:center}.image-stock-kpi .k{font-size:10px;color:#7890ad;margin-bottom:5px}.image-stock-kpi .v{font-size:15px;font-weight:800;color:#eef5ff}.image-main-grid{display:grid;grid-template-columns:minmax(680px,2.45fr) repeat(3,minmax(220px,.72fr));gap:10px;align-items:stretch}.image-main-grid>div{min-width:0}.image-decision-card{height:100%;min-height:500px}.image-decision-card .mod43-card{display:flex;flex-direction:column;height:100%}.image-decision-card .card-spacer{flex:1}.mod43-mini-grid{grid-template-columns:repeat(6,minmax(190px,1fr));overflow-x:auto;padding-bottom:3px}.mod43-mini{min-width:190px;min-height:250px}.candidate-sidebar-note{font-size:12px;color:#8398b3}
+@media(max-width:1700px){.image-main-grid{grid-template-columns:minmax(620px,2.2fr) repeat(3,minmax(190px,.68fr))}.image-stock-header{grid-template-columns:minmax(270px,1.05fr) repeat(6,minmax(88px,.4fr))}.mod43-mini-grid{grid-template-columns:repeat(3,minmax(0,1fr));overflow:visible}.mod43-mini{min-height:170px}}
+@media(max-width:1250px){.image-main-grid{grid-template-columns:2fr 1fr}.image-decision-card{min-height:auto}.image-stock-header{grid-template-columns:repeat(3,1fr)}.image-stock-main{grid-column:1/-1}.image-layout-topbar{grid-template-columns:1fr 1fr}.mod43-mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:760px){.image-main-grid{grid-template-columns:1fr}.image-layout-topbar{grid-template-columns:1fr}.image-stock-header{grid-template-columns:repeat(2,1fr)}.mod43-mini-grid{grid-template-columns:1fr}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -4599,9 +4604,7 @@ def render_manual_search_box(key_suffix: str, with_border: bool = True):
     抽成函式方便在不同位置重複渲染（例如右欄工作台頂端、或完全沒有候選股票時的
     空狀態），用 key_suffix 讓每個位置的 widget key 不會互相衝突。
     """
-    ctx = (st.expander("快速查詢其他股票", expanded=False)
-           if key_suffix == "panel"
-           else st.container(border=with_border, key=f"manual_search_{key_suffix}"))
+    ctx = st.container(border=with_border, key=f"manual_search_{key_suffix}")
     with ctx:
         st.markdown('<div class="candidate-row-hint">輸入上市／上櫃股票代碼，即可直接開啟完整個股分析，不必重新執行全市場掃描。</div>', unsafe_allow_html=True)
         msc1, msc2 = st.columns([3, 1])
@@ -4726,7 +4729,9 @@ with tab_workspace:
                 "ATR 用 20 日 Wilder 平滑，已把跳空缺口計入。"
             )
 
-        left_col, right_col = st.columns([0.78, 3.22], gap="medium")
+        # 圖片版型：候選清單不再常駐占用左側寬度，改為收合工具區；主工作區使用完整超寬畫布。
+        left_col = st.expander("📋 候選股票與策略工具", expanded=False)
+        right_col = st.container()
 
         # ══════════════ 左欄：候選清單（常駐，切換右側檢視時不消失）══════════════
         with left_col:
@@ -4940,8 +4945,21 @@ with tab_workspace:
                 _lots_txt, _lots_color = '0', 'var(--red)'
                 _lots_note = '波動過大，用目前風險預算連零股都買不下去'
 
+            # 圖片版型：在主畫面頂端顯示候選／自選股票橫向快選列。
+            _strip_rows = df.head(8) if isinstance(df, pd.DataFrame) and not df.empty else pd.DataFrame([current_stock])
+            _chips = []
+            for _, _sr in _strip_rows.iterrows():
+                _sc = str(_sr.get('code', ''))
+                _sn = str(_sr.get('name', ''))
+                _sp = _sr.get('收盤', np.nan)
+                _schg = _sr.get('漲跌幅(%)', np.nan)
+                _active = ' active' if _sc == str(current_stock['code']) else ''
+                _cls = 'mod43-good' if pd.notna(_schg) and _schg >= 0 else 'mod43-bad'
+                _chips.append(f'<div class="image-watch-chip{_active}"><div class="n">{_sn} {_sc}</div><div class="p">{fmt_num(_sp, "{:.2f}")} <span class="{_cls}">{fmt_num(_schg, "{:+.2f}%")}</span></div></div>')
+            st.markdown('<div class="image-watch-strip">' + ''.join(_chips) + '</div>', unsafe_allow_html=True)
+
             st.markdown(f"""
-            <div class="quote-panel" style="margin-top:8px;">
+            <div class="quote-panel" style="margin-top:4px;">
               <div class="quote-head"><div class="quote-title">{current_stock['name']} · {current_stock['code']}</div><div class="quote-tag">{current_stock.get('市場別', '')}</div><div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{hot_tag_html}</div>
               <div><span class="quote-price">{fmt_num(price, '{:.2f}')}</span><span class="quote-change" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span></div>
               <div class="quote-metrics">
@@ -4960,24 +4978,49 @@ with tab_workspace:
             # ============================================================
             # [方案 C / 21:9] 模組化資訊總覽
             # ============================================================
-            st.markdown('<div class="mod43-title"><h2>個股工作台｜模組化資訊總覽</h2><span>21:9 ULTRAWIDE WORKSPACE</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="mod43-title"><h2>個股工作台｜模組化資訊總覽</h2><span>21:9 IMAGE-ALIGNED WORKSPACE</span></div>', unsafe_allow_html=True)
             _market_suffix = "TW" if str(current_stock['ticker']).endswith('.TW') else "TWO"
             _overview_kdf = get_kline_data(current_stock['code'], _market_suffix)
             _overview_trade = build_trade_plan(current_stock.to_dict(), float(st.session_state.get('risk_budget', 30000)), float(st.session_state.get('atr_stop_mult', 2.0)))
             _overview_position = find_open_position(current_stock['code'])
 
             st.markdown(f"""
-            <div class="mod43-kpi-grid">
-              <div class="mod43-kpi"><div class="k">成交量</div><div class="v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
-              <div class="mod43-kpi"><div class="k">量比 20 日</div><div class="v">{fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')}</div></div>
-              <div class="mod43-kpi"><div class="k">本益比</div><div class="v">{fmt_num(current_stock.get('本益比', np.nan), '{:.1f}x')}</div></div>
-              <div class="mod43-kpi"><div class="k">營收年增</div><div class="v">{fmt_num(current_stock.get('營收年增', np.nan), '{:+.1f}%')}</div></div>
-              <div class="mod43-kpi"><div class="k">RSI 14</div><div class="v">{fmt_num(current_stock.get('RSI14', np.nan), '{:.1f}')}</div></div>
-              <div class="mod43-kpi"><div class="k">ATR 比例</div><div class="v">{fmt_num(current_stock.get('ATR比例(%)', np.nan), '{:.1f}%')}</div></div>
+            <div class="image-stock-header">
+              <div class="image-stock-main"><div class="nm">{current_stock['name']}　{current_stock['code']}　<span style="font-size:11px;color:#8ea4be;">{current_stock.get('市場別','')}｜{current_stock.get('industry','未分類')}</span></div><div><span class="px">{fmt_num(price, '{:.2f}')}</span><span class="chg" style="color:{chg_color};">{chg_amt_txt} ({chg_txt})</span></div><div style="font-size:10px;color:#7189a5;margin-top:6px;">更新時間 {get_tw_now().strftime('%m/%d %H:%M')}</div></div>
+              <div class="image-stock-kpi"><div class="k">成交量</div><div class="v">{fmt_num(current_stock.get('成交量(張)', np.nan), '{:,.0f}')} 張</div></div>
+              <div class="image-stock-kpi"><div class="k">量比 20 日</div><div class="v">{fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x')}</div></div>
+              <div class="image-stock-kpi"><div class="k">本益比</div><div class="v">{fmt_num(current_stock.get('本益比', np.nan), '{:.1f}x')}</div></div>
+              <div class="image-stock-kpi"><div class="k">營收年增</div><div class="v">{fmt_num(current_stock.get('營收年增', np.nan), '{:+.1f}%')}</div></div>
+              <div class="image-stock-kpi"><div class="k">財務評分</div><div class="v">{score_txt}</div></div>
+              <div class="image-stock-kpi"><div class="k">ATR 停損</div><div class="v mod43-bad">{_stop_txt}</div></div>
             </div>
             """, unsafe_allow_html=True)
 
-            _chart_col, _decision_col = st.columns([3.15, 1], gap='medium')
+            _entry_low = _overview_trade.get('entry_low', np.nan)
+            _entry_high = _overview_trade.get('entry_high', np.nan)
+            _stop = _overview_trade.get('stop', np.nan)
+            _target1 = _overview_trade.get('target1', np.nan)
+            _target2 = _overview_trade.get('target2', np.nan)
+            _rr = np.nan
+            try:
+                if pd.notna(_stop) and pd.notna(_target2) and pd.notna(price) and price > _stop:
+                    _rr = (_target2 - price) / (price - _stop)
+            except Exception:
+                pass
+
+            if _overview_position:
+                _pos_cost = _safe_number(_overview_position.get('entry_price'), np.nan)
+                _pos_shares = int(_safe_number(_overview_position.get('shares'), 0))
+                _pos_pnl = (price - _pos_cost) * _pos_shares if pd.notna(price) and pd.notna(_pos_cost) else np.nan
+                _pos_ret = (price / _pos_cost - 1) * 100 if pd.notna(price) and pd.notna(_pos_cost) and _pos_cost > 0 else np.nan
+                _pos_title = '持有中'
+            else:
+                _pos_cost, _pos_shares, _pos_pnl, _pos_ret = np.nan, 0, np.nan, np.nan
+                _pos_title = '未持有此股'
+            _pnl_class = 'mod43-good' if pd.notna(_pos_pnl) and _pos_pnl >= 0 else 'mod43-bad'
+            _ret_class = 'mod43-good' if pd.notna(_pos_ret) and _pos_ret >= 0 else 'mod43-bad'
+
+            _chart_col, _trade_col, _position_col, _risk_col = st.columns([2.45, .72, .72, .72], gap='small')
             with _chart_col:
                 st.markdown('<div class="mod43-card-title">K 線走勢 <span style="color:#7189a6;font-weight:500;">日線／還原除權息</span></div>', unsafe_allow_html=True)
                 _overview_fig = draw_k_line(current_stock['ticker'], current_stock['name'], chart_mode='K線圖', chart_period='日', adjusted=True)
@@ -4986,53 +5029,38 @@ with tab_workspace:
                 else:
                     st.warning('無法載入 K 線資料，請稍後再試。')
 
-            with _decision_col:
-                _entry_low = _overview_trade.get('entry_low', np.nan)
-                _entry_high = _overview_trade.get('entry_high', np.nan)
-                _stop = _overview_trade.get('stop', np.nan)
-                _target1 = _overview_trade.get('target1', np.nan)
-                _target2 = _overview_trade.get('target2', np.nan)
-                _rr = np.nan
-                try:
-                    if pd.notna(_stop) and pd.notna(_target2) and pd.notna(price) and price > _stop:
-                        _rr = (_target2 - price) / (price - _stop)
-                except Exception:
-                    pass
+            with _trade_col:
                 st.markdown(f"""
-                <div class="mod43-card"><div class="mod43-card-title">交易計畫 <span class="mod43-blue">波段決策</span></div>
+                <div class="image-decision-card"><div class="mod43-card"><div class="mod43-card-title">交易計畫 <span class="mod43-blue">波段偏多</span></div>
                   <div class="mod43-row"><span>理想進場區</span><span>{fmt_num(_entry_low)} ～ {fmt_num(_entry_high)}</span></div>
                   <div class="mod43-row"><span>停損價</span><span class="mod43-bad">{fmt_num(_stop)}</span></div>
                   <div class="mod43-row"><span>第一目標</span><span class="mod43-good">{fmt_num(_target1)}</span></div>
                   <div class="mod43-row"><span>第二目標</span><span class="mod43-good">{fmt_num(_target2)}</span></div>
                   <div class="mod43-row"><span>建議部位</span><span>{_lots_txt}</span></div>
                   <div class="mod43-row"><span>預估 R 倍數</span><span class="mod43-blue">{fmt_num(_rr, '{:.1f}R')}</span></div>
-                </div>""", unsafe_allow_html=True)
-                st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-                if _overview_position:
-                    _pos_cost = _safe_number(_overview_position.get('entry_price'), np.nan)
-                    _pos_shares = int(_safe_number(_overview_position.get('shares'), 0))
-                    _pos_pnl = (price - _pos_cost) * _pos_shares if pd.notna(price) and pd.notna(_pos_cost) else np.nan
-                    _pos_ret = (price / _pos_cost - 1) * 100 if pd.notna(price) and pd.notna(_pos_cost) and _pos_cost > 0 else np.nan
-                    _pos_title = '持有中'
-                else:
-                    _pos_cost, _pos_shares, _pos_pnl, _pos_ret = np.nan, 0, np.nan, np.nan
-                    _pos_title = '尚未建立持倉'
-                _pnl_class = 'mod43-good' if pd.notna(_pos_pnl) and _pos_pnl >= 0 else 'mod43-bad'
-                _ret_class = 'mod43-good' if pd.notna(_pos_ret) and _pos_ret >= 0 else 'mod43-bad'
+                  <div class="card-spacer"></div><div style="font-size:10px;color:#7189a6;line-height:1.7;">依 ATR、支撐與風險預算產生；可於下方展開編輯並建立持倉。</div>
+                </div></div>""", unsafe_allow_html=True)
+
+            with _position_col:
                 st.markdown(f"""
-                <div class="mod43-card"><div class="mod43-card-title">持倉摘要 <span>{_pos_title}</span></div>
+                <div class="image-decision-card"><div class="mod43-card"><div class="mod43-card-title">持倉摘要 <span>{_pos_title}</span></div>
                   <div class="mod43-row"><span>平均成本</span><span>{fmt_num(_pos_cost)}</span></div>
                   <div class="mod43-row"><span>持有股數</span><span>{_pos_shares:,} 股</span></div>
                   <div class="mod43-row"><span>未實現損益</span><span class="{_pnl_class}">{fmt_num(_pos_pnl, '{:+,.0f} 元')}</span></div>
                   <div class="mod43-row"><span>報酬率</span><span class="{_ret_class}">{fmt_num(_pos_ret, '{:+.2f}%')}</span></div>
-                </div>""", unsafe_allow_html=True)
-                st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+                  <div class="card-spacer"></div><div style="height:92px;width:92px;border-radius:50%;border:14px solid rgba(69,94,124,.25);margin:12px auto;display:flex;align-items:center;justify-content:center;color:#8fa5be;font-weight:800;">{fmt_num(_pos_ret, '{:+.1f}%')}</div>
+                </div></div>""", unsafe_allow_html=True)
+
+            with _risk_col:
                 st.markdown(f"""
-                <div class="mod43-card"><div class="mod43-card-title">風險設定 <span class="mod43-warn">中等</span></div>
+                <div class="image-decision-card"><div class="mod43-card"><div class="mod43-card-title">風險設定 <span class="mod43-warn">中等</span></div>
                   <div class="mod43-row"><span>單筆風險額度</span><span>{int(st.session_state.get('risk_budget', 30000)):,} 元</span></div>
                   <div class="mod43-row"><span>ATR 停損倍數</span><span>{float(st.session_state.get('atr_stop_mult', 2.0)):g}× ATR</span></div>
                   <div class="mod43-row"><span>預估停損風險</span><span class="mod43-bad">{_risk_txt} 元</span></div>
-                </div>""", unsafe_allow_html=True)
+                  <div class="mod43-row"><span>停損機制</span><span>價格／ATR</span></div>
+                  <div class="mod43-row"><span>建議部位</span><span>{_lots_txt}</span></div>
+                  <div class="card-spacer"></div><div style="font-size:10px;color:#7189a6;line-height:1.7;">修改風險額度或 ATR 倍數後，交易計畫與建議張數會同步重算。</div>
+                </div></div>""", unsafe_allow_html=True)
 
             _overview_indicators = calc_bull_bear_indicators(_overview_kdf)
             _overview_summary = summarize_bull_bear(_overview_indicators) if _overview_indicators else {'verdict':'資料不足','bull':0,'bear':0,'neutral':0,'total':0}
