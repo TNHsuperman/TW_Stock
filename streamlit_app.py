@@ -1501,6 +1501,28 @@ def build_pe_river_data(code: str, market_suffix: str, ticker: str) -> dict:
     if len(merged) < 30:
         return {}
 
+    # [修正] 對齊尾端收盤價。yfinance 的長期日線更新比交易所慢（尤其是台股
+    # 收盤後到隔日開盤前那段時間），不補的話河流圖的「目前股價」會停在昨收，
+    # 跟上方報價卡對不起來，連帶本益比與相對位置也一起算錯。
+    # get_kline_data 是報價卡同一個來源（TWSE／TPEx），拿它的最後一根補齊：
+    # 日期較新就補一列、同一天但價格不同就覆蓋。TTM_EPS 沿用最後一季，季報不會日日變動。
+    try:
+        _k_latest = get_kline_data(code, market_suffix)
+        if _k_latest is not None and not _k_latest.empty:
+            _k_date = pd.to_datetime(_k_latest["date"].iloc[-1]).normalize()
+            _k_close = float(_k_latest["close"].iloc[-1])
+            _m_date = pd.to_datetime(merged["date"].iloc[-1]).normalize()
+            if pd.notna(_k_close) and _k_close > 0:
+                if _k_date > _m_date:
+                    _tail = merged.iloc[[-1]].copy()
+                    _tail["date"] = _k_date
+                    _tail["close"] = _k_close
+                    merged = pd.concat([merged, _tail], ignore_index=True)
+                elif _k_date == _m_date:
+                    merged.iloc[-1, merged.columns.get_loc("close")] = _k_close
+    except Exception:
+        pass  # 補不到就沿用 yfinance 的序列，不讓整張圖掛掉
+
     merged["本益比"] = merged["close"] / merged["TTM_EPS"]
     latest_pe = float(merged["本益比"].iloc[-1])
 
