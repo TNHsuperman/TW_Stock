@@ -4479,6 +4479,19 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   .tv-caption{font-size:13px;}
   [data-testid='stTabs'] button p{font-size:16px!important;}
   [data-testid='stExpander'] summary p{font-size:15.5px!important;}
+  /* 「完整分析明細」收合區裡的自訂元件 */
+  .report-row{font-size:15px;padding:12px 0;}
+  .tv-section{font-size:17.5px;}
+  .metric-k{font-size:11.5px;}
+  .control-note{font-size:15px;}
+  .detail-nav-title{font-size:12.5px;}
+  .candidate-row-hint{font-size:13px;}
+  .radar-check{font-size:15px;}
+  .strategy-badge{font-size:10.5px;padding:4px 11px;}
+  .side-title{font-size:17px;}
+  .quote-title{font-size:26px;}
+  .quote-price{font-size:47px;}
+  .quote-change{font-size:17px;}
 }
 @media(min-width:2300px){
   .app-title{font-size:44px;}
@@ -4487,7 +4500,20 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   .tv-value{font-size:36px;}
   [data-testid='stTabs'] button p{font-size:18px!important;}
   [data-testid='stExpander'] summary p{font-size:17px!important;}
+  .report-row{font-size:16.5px;}
+  .tv-section{font-size:19px;}
+  .control-note{font-size:16.5px;}
+  .radar-check{font-size:16.5px;}
+  .quote-title{font-size:29px;}
+  .quote-price{font-size:52px;}
 }
+
+/* Streamlit 自己的元件（st.caption、st.markdown 內文、下拉選單、表格、
+   欄位標籤…）全都是 rem 基準，直接調 html 的基準字級一次全部帶起來，
+   不用逐個 data-testid 去猜。上面那些自訂 class 是 px，不受影響，
+   所以兩邊要分開處理。 */
+@media(min-width:1700px){ html{font-size:17.5px;} }
+@media(min-width:2300px){ html{font-size:19px;} }
 
 @media(max-width:1100px){
   .block-container{padding:18px 18px 52px!important;}
