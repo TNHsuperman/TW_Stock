@@ -4115,7 +4115,7 @@ html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
   font-family:'Inter','Noto Sans TC',sans-serif!important;
 }
 
-.block-container{max-width:1680px!important;padding:22px 30px 72px!important;}
+.block-container{max-width:min(2560px,100%)!important;padding:22px clamp(12px,2vw,56px) 72px!important;margin:0 auto!important;}
 
 /* ── 頁首：單一主視覺，不再堆疊厚重卡片 ── */
 .app-hero{
@@ -4315,17 +4315,17 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 /* ── 模組化資訊總覽（個股工作台新版面）── */
 .wb-topbar{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
   padding:0 0 11px;margin:0 0 12px;border-bottom:1px solid var(--border);}
-.wb-topbar-title{font-size:19px;font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
+.wb-topbar-title{font-size:clamp(19px,1.05vw,26px);font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
 .wb-topbar-sep{color:rgba(148,163,184,.4);margin:0 10px;font-weight:400;}
-.wb-topbar-sub{color:var(--muted);font-weight:700;font-size:17px;}
-.wb-topbar-note{font-size:12px;color:var(--muted);white-space:nowrap;}
+.wb-topbar-sub{color:var(--muted);font-weight:700;font-size:clamp(17px,.95vw,23px);}
+.wb-topbar-note{font-size:clamp(12px,.62vw,15px);color:var(--muted);white-space:nowrap;}
 
 /* 卡片等高網格 ──
    st.columns 每一欄的高度是各自獨立的，內容多寡不同就會長短不齊。
    這幾張卡片全是純 HTML／SVG（沒有 Streamlit widget），所以改成塞進
    同一個 CSS Grid：grid 的同一列預設就會 stretch 成等高，不必靠
    Streamlit 的 DOM 結構，換版本也不會壞。 */
-.wb-grid6{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;
+.wb-grid6{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:clamp(8px,.7vw,16px);
   align-items:stretch;}
 .wb-solo{display:grid;min-height:430px;}
 
@@ -4334,27 +4334,27 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   background:var(--surface);border:1px solid var(--border);border-radius:12px;
   padding:9px 11px;margin-bottom:7px;}
 .wb-river-legend{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;
-  margin-top:6px;font-family:'Roboto Mono',monospace;color:#b3c2d4;font-size:11.5px;}
+  margin-top:6px;font-family:'Roboto Mono',monospace;color:#b3c2d4;font-size:clamp(11.5px,.62vw,14px);}
 .wb-river-note{font-size:11.5px;color:var(--muted);line-height:1.65;margin-top:6px;}
 
 /* 卡片外殼：改成 flex 直列，讓頁尾註解一律貼齊卡片底部 */
 .wb-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
-  padding:13px 14px;box-sizing:border-box;height:100%;
+  padding:clamp(12px,.85vw,20px) clamp(13px,.9vw,22px);box-sizing:border-box;height:100%;
   display:flex;flex-direction:column;}
 .wb-card>.wb-foot{margin-top:auto;}
 .wb-card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;}
-.wb-card-title{font-size:15px;font-weight:800;color:#eaf1fa;letter-spacing:-.01em;white-space:nowrap;}
-.wb-card-note{font-size:11.5px;color:var(--muted);font-weight:700;white-space:nowrap;}
+.wb-card-title{font-size:clamp(15px,.82vw,19px);font-weight:800;color:#eaf1fa;letter-spacing:-.01em;white-space:nowrap;}
+.wb-card-note{font-size:clamp(11.5px,.62vw,14px);color:var(--muted);font-weight:700;white-space:nowrap;}
 .wb-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6.5px 0;
-  border-bottom:1px solid rgba(148,163,184,.08);font-size:13px;color:#b3c2d4;}
+  border-bottom:1px solid rgba(148,163,184,.08);font-size:clamp(13px,.72vw,16px);color:#b3c2d4;}
 .wb-row:last-child{border-bottom:0;}
-.wb-row b{font-family:'Roboto Mono',monospace;font-weight:700;color:#eaf1fa;font-size:13.5px;
+.wb-row b{font-family:'Roboto Mono',monospace;font-weight:700;color:#eaf1fa;font-size:clamp(13.5px,.75vw,16.5px);
   white-space:nowrap;}
-.wb-empty{color:var(--muted);font-size:13px;line-height:1.85;padding:14px 0;}
-.wb-big{font-family:'Roboto Mono',monospace;font-size:29px;font-weight:700;color:#f4f8ff;
+.wb-empty{color:var(--muted);font-size:clamp(13px,.7vw,16px);line-height:1.85;padding:14px 0;}
+.wb-big{font-family:'Roboto Mono',monospace;font-size:clamp(29px,1.75vw,42px);font-weight:700;color:#f4f8ff;
   line-height:1.15;letter-spacing:-.03em;}
-.wb-sub{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6;}
-.wb-foot{font-size:11.5px;color:var(--muted);margin-top:9px;padding-top:8px;
+.wb-sub{font-size:clamp(12px,.66vw,15px);color:var(--muted);margin-top:4px;line-height:1.6;}
+.wb-foot{font-size:clamp(11.5px,.62vw,14px);color:var(--muted);margin-top:9px;padding-top:8px;
   border-top:1px solid rgba(148,163,184,.09);}
 
 /* 報價主卡 */
@@ -4362,23 +4362,23 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   padding:15px 18px;position:relative;overflow:hidden;}
 .wb-quote:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
 .wb-quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:6px;}
-.wb-quote-name{font-size:25px;font-weight:800;letter-spacing:-.02em;color:#f4f8ff;}
-.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:21px;font-weight:700;color:var(--muted);}
+.wb-quote-name{font-size:clamp(25px,1.5vw,38px);font-weight:800;letter-spacing:-.02em;color:#f4f8ff;}
+.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:clamp(21px,1.25vw,31px);font-weight:700;color:var(--muted);}
 .wb-quote-body{display:flex;align-items:flex-start;gap:26px;flex-wrap:wrap;}
 .wb-quote-left{flex:0 0 auto;}
-.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;
+.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:clamp(42px,2.55vw,66px);font-weight:700;
   line-height:1.05;letter-spacing:-.04em;}
-.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:16.5px;font-weight:700;margin-left:9px;}
+.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:clamp(16.5px,1vw,24px);font-weight:700;margin-left:9px;}
 .wb-mgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px 10px;flex:1 1 430px;
   align-content:start;padding-top:4px;}
 .wb-mgrid>div{min-width:0;}
-.wb-mk{font-size:11.5px;font-weight:700;color:var(--muted);white-space:nowrap;}
-.wb-mv{font-family:'Roboto Mono',monospace;font-size:14.5px;font-weight:700;color:#e9f0fa;
+.wb-mk{font-size:clamp(11.5px,.62vw,14px);font-weight:700;color:var(--muted);white-space:nowrap;}
+.wb-mv{font-family:'Roboto Mono',monospace;font-size:clamp(14.5px,.8vw,18px);font-weight:700;color:#e9f0fa;
   margin-top:3px;white-space:nowrap;}
 
 /* 迷你表格（三大法人逐日） */
-.wb-tbl{width:100%;border-collapse:collapse;font-family:'Roboto Mono',monospace;font-size:12px;}
-.wb-tbl th{color:var(--muted);font-weight:700;text-align:right;padding:4px 1px;font-size:11px;
+.wb-tbl{width:100%;border-collapse:collapse;font-family:'Roboto Mono',monospace;font-size:clamp(12px,.66vw,15px);}
+.wb-tbl th{color:var(--muted);font-weight:700;text-align:right;padding:4px 1px;font-size:clamp(11px,.6vw,13.5px);
   border-bottom:1px solid var(--border);}
 .wb-tbl th:first-child,.wb-tbl td:first-child{text-align:left;}
 .wb-tbl td{text-align:right;padding:4.5px 1px;color:#cdd9e8;
@@ -4389,9 +4389,9 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-news{display:block;text-decoration:none;padding:7px 0;
   border-bottom:1px solid rgba(148,163,184,.08);}
 .wb-news:last-child{border-bottom:0;}
-.wb-news-t{font-size:13px;line-height:1.55;color:#dbe6f3;font-weight:600;}
+.wb-news-t{font-size:clamp(13px,.7vw,16px);line-height:1.55;color:#dbe6f3;font-weight:600;}
 .wb-news:hover .wb-news-t{color:#9fc5ff;}
-.wb-news-m{font-size:11px;color:var(--muted);margin-top:3px;font-family:'Roboto Mono',monospace;}
+.wb-news-m{font-size:clamp(11px,.58vw,13px);color:var(--muted);margin-top:3px;font-family:'Roboto Mono',monospace;}
 
 /* 點一下放大：純 CSS 覆蓋層（靠 tabindex + :focus，不需要 JS） */
 .wb-zoom{outline:none;cursor:zoom-in;border-radius:10px;
@@ -4429,7 +4429,7 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   scrollbar-width:thin;scrollbar-color:rgba(110,168,254,.5) rgba(148,163,184,.10);
   overscroll-behavior-x:contain;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']>div{
-  flex:0 0 134px!important;width:134px!important;min-width:134px!important;}
+  flex:0 0 clamp(134px,8vw,180px)!important;width:clamp(134px,8vw,180px)!important;min-width:clamp(134px,8vw,180px)!important;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar{height:9px;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-track{
   background:rgba(148,163,184,.10);border-radius:999px;}
@@ -4438,9 +4438,9 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb:hover{
   background:rgba(110,168,254,.78);}
 .st-key-wb_chip_row [data-testid='stButton']>button{
-  min-height:38px!important;font-size:12.5px!important;padding:2px 6px!important;
+  min-height:38px!important;font-size:clamp(12.5px,.66vw,15px)!important;padding:2px 6px!important;
   white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
-.wb-chip-label{font-size:11px;font-weight:800;letter-spacing:.1em;color:var(--muted);
+.wb-chip-label{font-size:clamp(11px,.58vw,13px);font-weight:800;letter-spacing:.1em;color:var(--muted);
   text-transform:uppercase;margin:6px 0 4px;}
 
 /* 窄螢幕：報價卡指標與六格模組一起收欄，維持等高不變 */
@@ -4462,6 +4462,32 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .mobile-stock-card .msc-metrics{display:flex;gap:13px;font-family:'Roboto Mono',monospace;font-size:12px;color:#c8d4e3;}.mobile-stock-card .msc-metrics span{color:var(--muted);margin-right:3px;}
 
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:#09111d}::-webkit-scrollbar-thumb{background:#26364b;border-radius:999px}::-webkit-scrollbar-thumb:hover{background:#334862}
+
+/* 大螢幕：把固定 px 的全域元件一起放大，避免高解析度下整頁字太小 */
+@media(min-width:1700px){
+  .app-title{font-size:38px;}
+  .app-sub{font-size:15px;max-width:1000px;}
+  .app-kicker{font-size:12.5px;}
+  .meta-k{font-size:11.5px;}
+  .meta-v{font-size:17px;}
+  .workflow-step{font-size:12.5px;padding:9px 12px;}
+  .workflow-step b{width:24px;height:24px;font-size:11.5px;}
+  .section-title{font-size:21px;}
+  .section-help{font-size:13.5px;}
+  .tv-label{font-size:11.5px;}
+  .tv-value{font-size:32px;}
+  .tv-caption{font-size:13px;}
+  [data-testid='stTabs'] button p{font-size:16px!important;}
+  [data-testid='stExpander'] summary p{font-size:15.5px!important;}
+}
+@media(min-width:2300px){
+  .app-title{font-size:44px;}
+  .app-sub{font-size:16.5px;}
+  .section-title{font-size:23px;}
+  .tv-value{font-size:36px;}
+  [data-testid='stTabs'] button p{font-size:18px!important;}
+  [data-testid='stExpander'] summary p{font-size:17px!important;}
+}
 
 @media(max-width:1100px){
   .block-container{padding:18px 18px 52px!important;}
