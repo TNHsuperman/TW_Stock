@@ -4327,8 +4327,15 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
    Streamlit 的 DOM 結構，換版本也不會壞。 */
 .wb-grid6{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;
   align-items:stretch;}
-.wb-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;
-  align-items:stretch;min-height:430px;}
+.wb-solo{display:grid;min-height:430px;}
+
+/* 本益比河流圖：標題列 + 四格摘要 + 圖 + 彩色圖例 */
+.wb-river-stat{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:9px 11px;margin-bottom:7px;}
+.wb-river-legend{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;
+  margin-top:5px;font-family:'Roboto Mono',monospace;color:#b3c2d4;}
+.wb-river-note{font-size:10px;color:var(--muted);line-height:1.65;margin-top:6px;}
 
 /* 卡片外殼：改成 flex 直列，讓頁尾註解一律貼齊卡片底部 */
 .wb-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
@@ -4440,7 +4447,8 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 @media (max-width:1400px){.wb-grid6{grid-template-columns:repeat(3,minmax(0,1fr));}}
 @media (max-width:1180px){.wb-mgrid{grid-template-columns:repeat(3,minmax(0,1fr));}}
 @media (max-width:900px){.wb-grid6{grid-template-columns:repeat(2,minmax(0,1fr));}
-  .wb-grid3{grid-template-columns:1fr;min-height:0;}}
+  .wb-solo{min-height:0;}
+  .wb-river-stat{grid-template-columns:repeat(2,minmax(0,1fr));}}
 @media (max-width:680px){.wb-mgrid{grid-template-columns:repeat(2,minmax(0,1fr));}
   .wb-quote-price{font-size:32px;}
   .wb-grid6{grid-template-columns:1fr;}}
@@ -5345,7 +5353,7 @@ with tab_workspace:
             # 右邊三張卡是純 HTML，塞進同一個 .wb-grid3 讓它們互相等高；
             # 卡片 HTML 一律組成「不含換行」的單行字串，避免縮排被 Markdown
             # 當成程式碼區塊。
-            kl_col, cards_col = st.columns([3.0, 3.05], gap="small")
+            kl_col, plan_col, river_col = st.columns([3.0, 1.05, 2.0], gap="small")
 
             with kl_col:
                 _kh1, _kh2 = st.columns([1.6, 2.4])
@@ -5372,7 +5380,7 @@ with tab_workspace:
                 else:
                     st.warning("無法載入 K 線資料，請稍後再試。")
 
-            with cards_col:
+            with plan_col:
                 # ---------- 交易計畫（與下方「交易計畫／建立持倉」表單同一組計算） ----------
                 _tp = build_trade_plan(current_stock.to_dict(), _risk_budget, _atr_mult)
                 _tp_stop = _tp.get('stop', np.nan)
@@ -5401,85 +5409,116 @@ with tab_workspace:
                     '</div>'
                 )
 
-                # ---------- 持倉摘要：讀既有持倉 JSON，環圈為本檔占總持倉成本的比重 ----------
-                _positions = [p for p in load_positions() if p.get('status', 'open') == 'open']
-                _this_pos = next((p for p in _positions if str(p.get('code')) == _code), None)
-                _total_cost = sum(
-                    float(p.get('entry_price', 0) or 0) * float(p.get('shares', 0) or 0) for p in _positions
-                )
-                if _this_pos:
-                    _pe = float(_this_pos.get('entry_price', 0) or 0)
-                    _ps = float(_this_pos.get('shares', 0) or 0)
-                    _ppct = ((_pe * _ps) / _total_cost * 100) if _total_cost > 0 else 0.0
-                    _pnl_pct = ((price - _pe) / _pe * 100) if (pd.notna(price) and _pe > 0) else np.nan
-                    _pnl_amt = (price - _pe) * _ps if pd.notna(price) else np.nan
-                    _pnl_color = 'var(--green)' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else 'var(--red)'
-                    _pos_body = (
-                        wb_zoomable(wb_svg_donut(
-                            _ppct, f"{_ppct:.0f}%",
-                            '#36c99a' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else '#ff6b7a'),
-                            '點一下放大持倉占比')
-                        + f'<div class="wb-row"><span>持有股數</span><b>{_ps:,.0f} 股</b></div>'
-                        + f'<div class="wb-row"><span>平均成本</span><b>{_pe:,.2f}</b></div>'
-                        + f'<div class="wb-row"><span>未實現損益</span>'
-                          f'<b style="color:{_pnl_color};">{fmt_num(_pnl_pct, "{:+.2f}%")}</b></div>'
-                        + f'<div class="wb-row"><span>損益金額</span>'
-                          f'<b style="color:{_pnl_color};">{fmt_num(_pnl_amt, "{:+,.0f}")} 元</b></div>'
-                        + f'<div class="wb-row"><span>設定停損</span><b style="color:var(--red);">'
-                          f'{fmt_num(_this_pos.get("stop_price"), "{:.2f}")}</b></div>'
-                        + f'<div class="wb-foot">占總持倉成本 {_ppct:.1f}%（共 {len(_positions)} 檔）</div>'
-                    )
-                else:
-                    _sug_cost = _plan.get('投入金額', np.nan)
-                    _sug_pct = ((_sug_cost / (_total_cost + _sug_cost) * 100)
-                                if (pd.notna(_sug_cost) and (_total_cost + _sug_cost) > 0) else 0.0)
-                    _pos_body = (
-                        wb_zoomable(wb_svg_donut(_sug_pct, f"{_sug_pct:.0f}%", '#6ea8fe'),
-                                    '點一下放大建議部位占比')
-                        + '<div class="wb-empty" style="padding:4px 0 8px;text-align:center;">未持有此股</div>'
-                        + f'<div class="wb-row"><span>建議張數</span><b>{_lots_txt}</b></div>'
-                        + f'<div class="wb-row"><span>預估投入</span><b>{fmt_num(_sug_cost, "{:,.0f}")} 元</b></div>'
-                        + f'<div class="wb-row"><span>到停損虧損</span><b style="color:var(--red);">'
-                          f'{fmt_num(_plan.get("實際風險"), "{:,.0f}")} 元</b></div>'
-                        + f'<div class="wb-row"><span>目前持倉</span><b>{len(_positions)} 檔</b></div>'
-                        + '<div class="wb-foot">環圈為建立此部位後占總持倉成本的比重</div>'
-                    )
-                _pos_card = (
-                    '<div class="wb-card"><div class="wb-card-head">'
-                    '<div class="wb-card-title">持倉摘要</div>'
-                    f'<div class="wb-card-note">持倉中心</div></div>{_pos_body}</div>'
-                )
+                # 持倉摘要與風險設定兩張卡改放本益比河流圖（見右欄）。
+                # 這兩項資訊沒有消失：持倉在「持倉中心」頁籤，風險參數在側邊欄的
+                # 「風險與部位設定」，而且交易計畫卡本來就已經帶到停損價與風險報酬比。
+                st.markdown(f'<div class="wb-solo">{_plan_card}</div>', unsafe_allow_html=True)
 
-                # ---------- 風險設定 ----------
-                _atr_pct = current_stock.get('ATR比例(%)', np.nan)
-                if pd.isna(_atr_pct):
-                    _risk_level, _risk_color = '無資料', 'var(--muted)'
-                elif _atr_pct < 2.5:
-                    _risk_level, _risk_color = '低波動', 'var(--green)'
-                elif _atr_pct < 4.5:
-                    _risk_level, _risk_color = '中等', 'var(--yellow)'
-                else:
-                    _risk_level, _risk_color = '高波動', 'var(--red)'
-                _risk_card = (
-                    '<div class="wb-card"><div class="wb-card-head">'
-                    '<div class="wb-card-title">風險設定</div>'
-                    '<div class="wb-card-note">側欄可調</div></div>'
-                    f'<div class="wb-row"><span>單筆最大虧損</span><b>{_risk_budget:,.0f} 元</b></div>'
-                    f'<div class="wb-row"><span>停損機制</span><b>{_atr_mult:g}× ATR20</b></div>'
-                    f'<div class="wb-row"><span>ATR20</span>'
-                    f'<b>{fmt_num(current_stock.get("ATR20", np.nan), "{:.2f}")}</b></div>'
-                    f'<div class="wb-row"><span>日波動比例</span><b>{fmt_num(_atr_pct, "{:.2f}%")}</b></div>'
-                    f'<div class="wb-row"><span>風險等級</span>'
-                    f'<b style="color:{_risk_color};">{_risk_level}</b></div>'
-                    f'<div class="wb-row"><span>建議部位</span><b>{_lots_txt}</b></div>'
-                    f'<div class="wb-row"><span>30日乖離</span>'
-                    f'<b>{fmt_num(current_stock.get("乖離30MA(%)", np.nan), "{:+.2f}%")}</b></div>'
-                    '<div class="wb-foot">到「風險與部位設定」可調整預算與倍數</div>'
-                    '</div>'
-                )
+            with river_col:
+                # ---------- 本益比河流圖 ----------
+                # 用近四季 EPS 滾動加總（TTM）× 這檔股票「自己」歷史本益比的分位數，
+                # 還原出隨獲利成長而移動的評價區間，再把實際股價疊上去。
+                # 兩個資料來源（季度 EPS、3 年日線）都有 24 小時快取，切換個股時
+                # 第一次會慢一點，之後同一天內都直接命中快取。
+                _rh1, _rh2 = st.columns([1.9, 1.5])
+                with _rh1:
+                    st.markdown('<div class="wb-card-title" style="padding-top:9px;">本益比河流圖</div>',
+                                unsafe_allow_html=True)
+                with _rh2:
+                    st.link_button(
+                        "🔗 Goodinfo 官方圖",
+                        f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PER&STOCK_ID={_code}",
+                        use_container_width=True,
+                    )
 
-                st.markdown(f'<div class="wb-grid3">{_plan_card}{_pos_card}{_risk_card}</div>',
-                            unsafe_allow_html=True)
+                _river = build_pe_river_data(_code, _mkt, current_stock['ticker'])
+                if _river:
+                    _rdf = _river['df']
+                    _bands = _river['bands']
+                    _latest_pe = _river.get('latest_pe', np.nan)
+                    _latest_close = float(_rdf['close'].iloc[-1])
+
+                    # 目前本益比落在自身歷史的百分位：這是河流圖真正要回答的問題
+                    _pe_ser = _rdf['本益比'].replace([np.inf, -np.inf], np.nan).dropna()
+                    _pe_ser = _pe_ser[(_pe_ser > 0) & (_pe_ser < 200)]
+                    _pe_pct = (float((_pe_ser < _latest_pe).mean() * 100)
+                               if (len(_pe_ser) and pd.notna(_latest_pe)) else np.nan)
+                    if pd.isna(_pe_pct):
+                        _pos_txt, _pos_color = 'N/A', '#e9f0fa'
+                    elif _pe_pct < 30:
+                        _pos_txt, _pos_color = f'偏低 {_pe_pct:.0f}%', 'var(--green)'
+                    elif _pe_pct <= 70:
+                        _pos_txt, _pos_color = f'中間 {_pe_pct:.0f}%', '#8eb6ff'
+                    else:
+                        _pos_txt, _pos_color = f'偏高 {_pe_pct:.0f}%', 'var(--red)'
+
+                    _rstats = [
+                        ('目前股價', f'{_latest_close:.2f}', ''),
+                        ('本益比TTM', f'{fmt_num(_latest_pe, "{:.1f}")}x', ''),
+                        ('歷史區間', f'{_river["pe_min"]:.1f}~{_river["pe_max"]:.1f}', ''),
+                        ('相對位置', _pos_txt, _pos_color),
+                    ]
+                    _rhtml = ''
+                    for _rk, _rv, _rc in _rstats:
+                        _rs = f' style="color:{_rc};"' if _rc else ''
+                        _rhtml += (f'<div><div class="wb-mk">{_rk}</div>'
+                                   f'<div class="wb-mv"{_rs}>{_rv}</div></div>')
+                    st.markdown(f'<div class="wb-river-stat">{_rhtml}</div>', unsafe_allow_html=True)
+
+                    # 由低到高疊出「河流」：相鄰兩條分位線之間填色，
+                    # 綠（便宜）→ 藍 → 黃 → 紅（貴），比五條裸線好讀得多。
+                    _band_labels = sorted(_bands, key=lambda k: _bands[k])
+                    _fills = ['rgba(54,201,154,.20)', 'rgba(110,168,254,.16)',
+                              'rgba(248,199,102,.15)', 'rgba(255,107,122,.17)']
+                    _lines = ['#36c99a', '#6ea8fe', '#8eb6ff', '#f8c766', '#ff6b7a']
+                    _fig = go.Figure()
+                    for _bi, _lb in enumerate(_band_labels):
+                        _fig.add_trace(go.Scatter(
+                            x=_rdf['date'], y=_rdf[_lb], mode='lines',
+                            name=f'{_lb} {_bands[_lb]:.1f}x',
+                            line=dict(width=1.0, color=_lines[_bi % len(_lines)]),
+                            fill=None if _bi == 0 else 'tonexty',
+                            fillcolor=None if _bi == 0 else _fills[(_bi - 1) % len(_fills)],
+                            hovertemplate=f'{_lb} {_bands[_lb]:.1f}x<br>%{{y:.2f}}<extra></extra>',
+                        ))
+                    _fig.add_trace(go.Scatter(
+                        x=_rdf['date'], y=_rdf['close'], mode='lines', name='實際股價',
+                        line=dict(width=2.2, color='#e6edf3'),
+                        hovertemplate='%{x|%Y-%m-%d}<br>股價 %{y:.2f}<extra></extra>',
+                    ))
+                    _fig.update_layout(
+                        height=278, template='plotly_dark', showlegend=False,
+                        paper_bgcolor='#0d1624', plot_bgcolor='#0d1624',
+                        margin=dict(l=6, r=6, t=6, b=6),
+                        xaxis=dict(gridcolor='rgba(148,163,184,0.08)'),
+                        yaxis=dict(gridcolor='rgba(148,163,184,0.08)', tickfont=dict(size=10)),
+                        hovermode='x unified',
+                    )
+                    st.plotly_chart(_fig, use_container_width=True,
+                                    key=f"pe_river_panel_{_code}")
+
+                    # 圖太窄放不下 Plotly 圖例，改用一行彩色文字說明各區間
+                    _legend = '　'.join(
+                        f'<span style="color:{_lines[_i % len(_lines)]};">━</span>'
+                        f'<span style="font-size:9.5px;">{_lb.split("(")[0]} {_bands[_lb]:.0f}x</span>'
+                        for _i, _lb in enumerate(_band_labels)
+                    )
+                    st.markdown(
+                        f'<div class="wb-river-legend">{_legend}　'
+                        f'<span style="color:#e6edf3;">━</span>'
+                        f'<span style="font-size:9.5px;">實際股價</span></div>'
+                        '<div class="wb-river-note">色帶＝近四季EPS × 自身歷史本益比分位數推算的理論價位。'
+                        '股價落在綠帶代表相對自己過去便宜、紅帶代表相對貴，'
+                        '是統計相對位置，不是目標價也不是買賣建議。</div>',
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="wb-card" style="min-height:372px;">'
+                        '<div class="wb-empty">資料不足以計算本益比河流圖。<br><br>'
+                        '需要至少 5 季 EPS（滾動出 2 個以上 TTM 資料點）與 3 年日線；'
+                        '新股、EPS 揭露筆數太少、或本業虧損（TTM EPS ≤ 0）都會落到這裡。'
+                        '<br><br>可改用右上角的 Goodinfo 官方河流圖。</div></div>',
+                        unsafe_allow_html=True)
 
             # ══════════════ 第三列：六格資訊模組（同一個 grid，自動等高）══════════════
             _mods = []
@@ -5651,6 +5690,7 @@ with tab_workspace:
             st.markdown(f'<div class="wb-grid6">{"".join(_mods)}</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
 
 
 
