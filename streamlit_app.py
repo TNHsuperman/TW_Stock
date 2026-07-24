@@ -1306,11 +1306,12 @@ def fetch_financial_ratios(code: str) -> dict:
         return {}
 
     ratio_df = ratio_df.rename(columns=lambda c: str(c).strip())
-    # 年度欄位通常由新到舊排列，取第一個當作最新年度。
+    # 年度欄位的排序在不同個股頁面並不一致（有由新到舊、也有由舊到新），
+    # 不能直接取第一欄，要比大小挑出最新年度。
     year_cols = [c for c in ratio_df.columns if re.fullmatch(r"\d{4}年", c)]
     if not year_cols:
         return {}
-    latest_col = year_cols[0]
+    latest_col = max(year_cols, key=lambda c: int(c[:4]))
 
     metrics = {}
     for _, row in ratio_df.iterrows():
@@ -4630,6 +4631,33 @@ def wb_svg_donut(pct, center_text, color="#36c99a"):
     )
 
 
+def wb_financial_footnote(fin: dict, health: dict) -> str:
+    """財務體質卡片的頁尾說明。
+
+    原本寫成「2019年 年報｜採用 7 項指標」有三個問題：
+      1.「2019年」＋「年報」的「年」重複。
+      2. 卡片上只畫出 3 個分類，卻寫 7 項指標，看起來對不起來；
+         實際上是 7 項指標先彙總成 3 個分類再畫雷達圖。
+      3. 年度太舊時完全沒有提示，容易誤以為是最新財報。
+    """
+    raw = str(fin.get('year', '') or '')
+    m = re.search(r'(\d{4})', raw)
+    n_metrics = health.get('n_metrics', 0)
+    n_cats = len(health.get('category_scores', {}))
+    if m:
+        fy = int(m.group(1))
+        age = get_tw_now().year - fy
+        if age >= 3:
+            head = (f'<span style="color:var(--yellow);">財報年度 {fy}'
+                    f'（已 {age} 年未更新）</span>')
+        else:
+            head = f'財報年度 {fy}'
+    else:
+        head = '財報年度不明'
+    return (f'<div class="wb-foot">{head}<br>'
+            f'{n_metrics} 項指標彙總為 {n_cats} 個分類</div>')
+
+
 def wb_zoomable(inner_html, hint="點一下放大"):
     """把圖表包成「點一下放大」的容器。
 
@@ -5498,7 +5526,7 @@ with tab_workspace:
                     f'<span style="font-size:12px;color:var(--muted);"> / 100</span>'
                     f'<div class="wb-sub">{_health["verdict"]}</div></div>'
                     f'{_radar_html}'
-                    f'<div class="wb-foot">{_fin.get("year", "N/A")} 年報｜採用 {_health["n_metrics"]} 項指標</div>'
+                    + wb_financial_footnote(_fin, _health)
                 )
             else:
                 _body = ('<div class="wb-empty">查無財務比率資料，可能是新股、金融／保險等'
@@ -5623,6 +5651,7 @@ with tab_workspace:
             st.markdown(f'<div class="wb-grid6">{"".join(_mods)}</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
 
 
 
@@ -6114,7 +6143,17 @@ with tab_workspace:
                           </div>
                         </div>
                         """, unsafe_allow_html=True)
-                        st.caption(f"資料時間：{fin_data.get('year', 'N/A')} 年報｜共採用 {health['n_metrics']} 項指標計算")
+                        # 「2019年 年報」的『年』會重複，年度太舊也沒有提示；
+                        # 另外雷達圖畫的是分類數，跟指標數不同，這裡一併說明清楚。
+                        _fy_m = re.search(r'(\d{4})', str(fin_data.get('year', '') or ''))
+                        _fy_age = (get_tw_now().year - int(_fy_m.group(1))) if _fy_m else 0
+                        _fy_txt = f'財報年度 {_fy_m.group(1)}' if _fy_m else '財報年度不明'
+                        if _fy_m and _fy_age >= 3:
+                            _fy_txt += f'（已 {_fy_age} 年未更新，僅供參考）'
+                        st.caption(
+                            f"{_fy_txt}｜{health['n_metrics']} 項指標彙總為 "
+                            f"{len(health['category_scores'])} 個分類"
+                        )
 
                         for it in health['items']:
                             badge_color = 'var(--green)' if it['分數'] >= 60 else ('var(--yellow)' if it['分數'] >= 35 else 'var(--red)')
