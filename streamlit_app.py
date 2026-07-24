@@ -4315,10 +4315,10 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 /* ── 模組化資訊總覽（個股工作台新版面）── */
 .wb-topbar{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
   padding:0 0 11px;margin:0 0 12px;border-bottom:1px solid var(--border);}
-.wb-topbar-title{font-size:17px;font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
+.wb-topbar-title{font-size:19px;font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
 .wb-topbar-sep{color:rgba(148,163,184,.4);margin:0 10px;font-weight:400;}
-.wb-topbar-sub{color:var(--muted);font-weight:700;font-size:15px;}
-.wb-topbar-note{font-size:11px;color:var(--muted);white-space:nowrap;}
+.wb-topbar-sub{color:var(--muted);font-weight:700;font-size:17px;}
+.wb-topbar-note{font-size:12px;color:var(--muted);white-space:nowrap;}
 
 /* 卡片等高網格 ──
    st.columns 每一欄的高度是各自獨立的，內容多寡不同就會長短不齊。
@@ -4334,8 +4334,8 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   background:var(--surface);border:1px solid var(--border);border-radius:12px;
   padding:9px 11px;margin-bottom:7px;}
 .wb-river-legend{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;
-  margin-top:5px;font-family:'Roboto Mono',monospace;color:#b3c2d4;}
-.wb-river-note{font-size:10px;color:var(--muted);line-height:1.65;margin-top:6px;}
+  margin-top:6px;font-family:'Roboto Mono',monospace;color:#b3c2d4;font-size:11.5px;}
+.wb-river-note{font-size:11.5px;color:var(--muted);line-height:1.65;margin-top:6px;}
 
 /* 卡片外殼：改成 flex 直列，讓頁尾註解一律貼齊卡片底部 */
 .wb-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;
@@ -4343,18 +4343,18 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   display:flex;flex-direction:column;}
 .wb-card>.wb-foot{margin-top:auto;}
 .wb-card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;}
-.wb-card-title{font-size:13px;font-weight:800;color:#eaf1fa;letter-spacing:-.01em;white-space:nowrap;}
-.wb-card-note{font-size:10px;color:var(--muted);font-weight:700;white-space:nowrap;}
+.wb-card-title{font-size:15px;font-weight:800;color:#eaf1fa;letter-spacing:-.01em;white-space:nowrap;}
+.wb-card-note{font-size:11.5px;color:var(--muted);font-weight:700;white-space:nowrap;}
 .wb-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6.5px 0;
-  border-bottom:1px solid rgba(148,163,184,.08);font-size:11.5px;color:#b3c2d4;}
+  border-bottom:1px solid rgba(148,163,184,.08);font-size:13px;color:#b3c2d4;}
 .wb-row:last-child{border-bottom:0;}
-.wb-row b{font-family:'Roboto Mono',monospace;font-weight:700;color:#eaf1fa;font-size:12px;
+.wb-row b{font-family:'Roboto Mono',monospace;font-weight:700;color:#eaf1fa;font-size:13.5px;
   white-space:nowrap;}
-.wb-empty{color:var(--muted);font-size:11.5px;line-height:1.85;padding:14px 0;}
-.wb-big{font-family:'Roboto Mono',monospace;font-size:25px;font-weight:700;color:#f4f8ff;
+.wb-empty{color:var(--muted);font-size:13px;line-height:1.85;padding:14px 0;}
+.wb-big{font-family:'Roboto Mono',monospace;font-size:29px;font-weight:700;color:#f4f8ff;
   line-height:1.15;letter-spacing:-.03em;}
-.wb-sub{font-size:10.5px;color:var(--muted);margin-top:4px;line-height:1.6;}
-.wb-foot{font-size:10px;color:var(--muted);margin-top:9px;padding-top:8px;
+.wb-sub{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6;}
+.wb-foot{font-size:11.5px;color:var(--muted);margin-top:9px;padding-top:8px;
   border-top:1px solid rgba(148,163,184,.09);}
 
 /* 報價主卡 */
@@ -4362,23 +4362,23 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   padding:15px 18px;position:relative;overflow:hidden;}
 .wb-quote:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
 .wb-quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:6px;}
-.wb-quote-name{font-size:23px;font-weight:800;letter-spacing:-.02em;color:#f4f8ff;}
-.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:19px;font-weight:700;color:var(--muted);}
+.wb-quote-name{font-size:25px;font-weight:800;letter-spacing:-.02em;color:#f4f8ff;}
+.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:21px;font-weight:700;color:var(--muted);}
 .wb-quote-body{display:flex;align-items:flex-start;gap:26px;flex-wrap:wrap;}
 .wb-quote-left{flex:0 0 auto;}
-.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:38px;font-weight:700;
+.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;
   line-height:1.05;letter-spacing:-.04em;}
-.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:14.5px;font-weight:700;margin-left:9px;}
+.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:16.5px;font-weight:700;margin-left:9px;}
 .wb-mgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px 10px;flex:1 1 430px;
   align-content:start;padding-top:4px;}
 .wb-mgrid>div{min-width:0;}
-.wb-mk{font-size:10px;font-weight:700;color:var(--muted);white-space:nowrap;}
-.wb-mv{font-family:'Roboto Mono',monospace;font-size:13px;font-weight:700;color:#e9f0fa;
+.wb-mk{font-size:11.5px;font-weight:700;color:var(--muted);white-space:nowrap;}
+.wb-mv{font-family:'Roboto Mono',monospace;font-size:14.5px;font-weight:700;color:#e9f0fa;
   margin-top:3px;white-space:nowrap;}
 
 /* 迷你表格（三大法人逐日） */
-.wb-tbl{width:100%;border-collapse:collapse;font-family:'Roboto Mono',monospace;font-size:10.5px;}
-.wb-tbl th{color:var(--muted);font-weight:700;text-align:right;padding:3px 1px;font-size:9.5px;
+.wb-tbl{width:100%;border-collapse:collapse;font-family:'Roboto Mono',monospace;font-size:12px;}
+.wb-tbl th{color:var(--muted);font-weight:700;text-align:right;padding:4px 1px;font-size:11px;
   border-bottom:1px solid var(--border);}
 .wb-tbl th:first-child,.wb-tbl td:first-child{text-align:left;}
 .wb-tbl td{text-align:right;padding:4.5px 1px;color:#cdd9e8;
@@ -4389,9 +4389,9 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-news{display:block;text-decoration:none;padding:7px 0;
   border-bottom:1px solid rgba(148,163,184,.08);}
 .wb-news:last-child{border-bottom:0;}
-.wb-news-t{font-size:11.5px;line-height:1.55;color:#dbe6f3;font-weight:600;}
+.wb-news-t{font-size:13px;line-height:1.55;color:#dbe6f3;font-weight:600;}
 .wb-news:hover .wb-news-t{color:#9fc5ff;}
-.wb-news-m{font-size:9.5px;color:var(--muted);margin-top:3px;font-family:'Roboto Mono',monospace;}
+.wb-news-m{font-size:11px;color:var(--muted);margin-top:3px;font-family:'Roboto Mono',monospace;}
 
 /* 點一下放大：純 CSS 覆蓋層（靠 tabindex + :focus，不需要 JS） */
 .wb-zoom{outline:none;cursor:zoom-in;border-radius:10px;
@@ -4429,7 +4429,7 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
   scrollbar-width:thin;scrollbar-color:rgba(110,168,254,.5) rgba(148,163,184,.10);
   overscroll-behavior-x:contain;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']>div{
-  flex:0 0 118px!important;width:118px!important;min-width:118px!important;}
+  flex:0 0 134px!important;width:134px!important;min-width:134px!important;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar{height:9px;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-track{
   background:rgba(148,163,184,.10);border-radius:999px;}
@@ -4438,9 +4438,9 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb:hover{
   background:rgba(110,168,254,.78);}
 .st-key-wb_chip_row [data-testid='stButton']>button{
-  min-height:34px!important;font-size:11px!important;padding:2px 5px!important;
+  min-height:38px!important;font-size:12.5px!important;padding:2px 6px!important;
   white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
-.wb-chip-label{font-size:9.5px;font-weight:800;letter-spacing:.1em;color:var(--muted);
+.wb-chip-label{font-size:11px;font-weight:800;letter-spacing:.1em;color:var(--muted);
   text-transform:uppercase;margin:6px 0 4px;}
 
 /* 窄螢幕：報價卡指標與六格模組一起收欄，維持等高不變 */
@@ -4538,8 +4538,8 @@ def wb_svg_gauge(pct, label, color="#36c99a"):
         f'stroke="{color}" stroke-width="10" stroke-linecap="round" '
         f'stroke-dasharray="{filled:.2f} {arc * 2:.2f}"/>'
         f'<text x="{cx}" y="{cy - 16}" text-anchor="middle" fill="{color}" '
-        f'font-size="13.5" font-weight="800">{label}</text>'
-        f'<text x="{cx}" y="{cy - 1}" text-anchor="middle" fill="#8796aa" font-size="11.5" '
+        f'font-size="15.5" font-weight="800">{label}</text>'
+        f'<text x="{cx}" y="{cy - 1}" text-anchor="middle" fill="#8796aa" font-size="13" '
         f'font-family="Roboto Mono,monospace">{pct:.0f}%</text>'
         f'</svg>'
     )
@@ -4554,7 +4554,7 @@ def wb_svg_radar(scores, color="#36c99a"):
         return ''
     # viewBox 要留出軸標籤的寬度：最左／最右的標籤是 4 個中文字（約 40px），
     # 從圓心往外 69px，所以左右各留 120-69-40≈11px 的安全邊界，不會再被切掉。
-    cx, cy, rmax = 120.0, 86.0, 54.0
+    cx, cy, rmax = 129.0, 90.0, 56.0
     # 從正上方開始、順時針排列，跟一般財報雷達圖的閱讀習慣一致
     angles = [(-np.pi / 2) + (2 * np.pi * i / n) for i in range(n)]
 
@@ -4575,19 +4575,19 @@ def wb_svg_radar(scores, color="#36c99a"):
     for a, lb, v in zip(angles, labels, vals):
         lx = cx + (rmax + 15) * float(np.cos(a))
         ly = cy + (rmax + 15) * float(np.sin(a))
-        ly = min(max(ly, 17.0), 152.0)      # 上下夾住，避免第二行的數字掉出畫布
+        ly = min(max(ly, 19.0), 158.0)      # 上下夾住，避免第二行的數字掉出畫布
         anchor = 'middle'
         if float(np.cos(a)) > 0.35:
             anchor = 'start'
         elif float(np.cos(a)) < -0.35:
             anchor = 'end'
         text += (f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" fill="#8796aa" '
-                 f'font-size="10" font-weight="700">{lb}</text>'
-                 f'<text x="{lx:.1f}" y="{ly + 11:.1f}" text-anchor="{anchor}" fill="#c8d4e3" '
-                 f'font-size="9.5" font-family="Roboto Mono,monospace">{v:.0f}</text>')
+                 f'font-size="11.5" font-weight="700">{lb}</text>'
+                 f'<text x="{lx:.1f}" y="{ly + 12.5:.1f}" text-anchor="{anchor}" fill="#c8d4e3" '
+                 f'font-size="11" font-family="Roboto Mono,monospace">{v:.0f}</text>')
 
     return (
-        f'<svg viewBox="0 0 240 178" style="width:100%;display:block;margin:0 auto;">'
+        f'<svg viewBox="0 0 258 186" style="width:100%;display:block;margin:0 auto;">'
         f'{grid}'
         f'<polygon points="{data_pts}" fill="{color}33" stroke="{color}" stroke-width="1.7" '
         f'stroke-linejoin="round"/>'
@@ -4633,7 +4633,7 @@ def wb_svg_donut(pct, center_text, color="#36c99a"):
         f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" stroke-width="10" '
         f'stroke-linecap="round" stroke-dasharray="{circ * pct / 100:.2f} {circ:.2f}" '
         f'transform="rotate(-90 {cx} {cy})"/>'
-        f'<text x="{cx}" y="{cy + 5}" text-anchor="middle" fill="#eaf1fa" font-size="16" '
+        f'<text x="{cx}" y="{cy + 6}" text-anchor="middle" fill="#eaf1fa" font-size="18" '
         f'font-weight="700" font-family="Roboto Mono,monospace">{center_text}</text>'
         f'</svg>'
     )
@@ -4683,9 +4683,9 @@ def wb_bar_row(label, pct, color="#36c99a"):
     pct = 0.0 if pd.isna(pct) else float(min(max(float(pct), 0.0), 100.0))
     return (
         f'<div style="display:flex;align-items:center;gap:8px;margin:7px 0;">'
-        f'<span style="font-size:11px;color:#b9c7d8;width:30px;flex:none;">{label}</span>'
+        f'<span style="font-size:12.5px;color:#b9c7d8;width:34px;flex:none;">{label}</span>'
         f'<span class="wb-bar"><i style="width:{pct:.0f}%;background:{color};"></i></span>'
-        f'<span style="font-size:11px;color:#cdd9e8;font-family:Roboto Mono,monospace;'
+        f'<span style="font-size:12.5px;color:#cdd9e8;font-family:Roboto Mono,monospace;'
         f'width:32px;text-align:right;flex:none;">{pct:.0f}%</span></div>'
     )
 
@@ -5353,7 +5353,7 @@ with tab_workspace:
             # 右邊三張卡是純 HTML，塞進同一個 .wb-grid3 讓它們互相等高；
             # 卡片 HTML 一律組成「不含換行」的單行字串，避免縮排被 Markdown
             # 當成程式碼區塊。
-            kl_col, plan_col, river_col = st.columns([3.0, 1.05, 2.0], gap="small")
+            kl_col, river_col = st.columns([3.0, 2.2], gap="small")
 
             with kl_col:
                 _kh1, _kh2 = st.columns([1.6, 2.4])
@@ -5370,7 +5370,7 @@ with tab_workspace:
                 k_fig = draw_k_line(current_stock['ticker'], current_stock['name'],
                                     chart_mode='K線圖', chart_period='日', adjusted=show_adjusted)
                 if k_fig:
-                    render_kline_chart_with_axis_price(k_fig, height=372)
+                    render_kline_chart_with_axis_price(k_fig, height=390)
                     try:
                         preload_tickers = [df.iloc[(st.session_state.current_idx + offset) % total_found]['ticker']
                                            for offset in (-1, 1)]
@@ -5380,39 +5380,35 @@ with tab_workspace:
                 else:
                     st.warning("無法載入 K 線資料，請稍後再試。")
 
-            with plan_col:
-                # ---------- 交易計畫（與下方「交易計畫／建立持倉」表單同一組計算） ----------
-                _tp = build_trade_plan(current_stock.to_dict(), _risk_budget, _atr_mult)
-                _tp_stop = _tp.get('stop', np.nan)
-                _tp_t1 = _tp.get('target1', np.nan)
-                _stop_pct = (np.nan if (pd.isna(_tp_stop) or pd.isna(price) or price <= 0)
-                             else (_tp_stop - price) / price * 100)
-                _t1_pct = (np.nan if (pd.isna(_tp_t1) or pd.isna(price) or price <= 0)
-                           else (_tp_t1 - price) / price * 100)
-                _strategy_txt = str(current_stock.get('策略', st.session_state.get('scan_strategy_used', '手動查詢')))
-                _plan_card = (
-                    '<div class="wb-card">'
-                    '<div class="wb-card-head"><div class="wb-card-title">交易計畫</div></div>'
-                    f'<div class="wb-row"><span>策略方向</span><b>{_strategy_txt}</b></div>'
-                    f'<div class="wb-row"><span>理想進場區</span>'
-                    f'<b>{fmt_num(_tp.get("entry_low"), "{:.2f}")} ~ {fmt_num(_tp.get("entry_high"), "{:.2f}")}</b></div>'
-                    f'<div class="wb-row"><span>追價上限</span><b>{fmt_num(_tp.get("chase_limit"), "{:.2f}")}</b></div>'
-                    f'<div class="wb-row"><span>停損價</span><b style="color:var(--red);">'
-                    f'{fmt_num(_tp_stop, "{:.2f}")} ({fmt_num(_stop_pct, "{:.1f}%")})</b></div>'
-                    f'<div class="wb-row"><span>第一目標</span><b style="color:var(--green);">'
-                    f'{fmt_num(_tp_t1, "{:.2f}")} ({fmt_num(_t1_pct, "{:+.1f}%")})</b></div>'
-                    f'<div class="wb-row"><span>第二目標</span><b style="color:var(--green);">'
-                    f'{fmt_num(_tp.get("target2"), "{:.2f}")}</b></div>'
-                    f'<div class="wb-row"><span>風險報酬比</span>'
-                    f'<b>1 : {fmt_num(_tp.get("rr1"), "{:.1f}")}／1 : {fmt_num(_tp.get("rr2"), "{:.1f}")}</b></div>'
-                    '<div class="wb-foot">價位已依台股升降單位修正為可委託檔位</div>'
-                    '</div>'
-                )
+            # ---------- 交易計畫卡：先組好字串，下排跟其他模組一起排進 .wb-grid6 ----------
+            # （與下方「交易計畫／建立持倉」表單同一組計算）
+            _tp = build_trade_plan(current_stock.to_dict(), _risk_budget, _atr_mult)
+            _tp_stop = _tp.get('stop', np.nan)
+            _tp_t1 = _tp.get('target1', np.nan)
+            _stop_pct = (np.nan if (pd.isna(_tp_stop) or pd.isna(price) or price <= 0)
+                         else (_tp_stop - price) / price * 100)
+            _t1_pct = (np.nan if (pd.isna(_tp_t1) or pd.isna(price) or price <= 0)
+                       else (_tp_t1 - price) / price * 100)
+            _strategy_txt = str(current_stock.get('策略', st.session_state.get('scan_strategy_used', '手動查詢')))
+            _plan_card = (
+                '<div class="wb-card">'
+                '<div class="wb-card-head"><div class="wb-card-title">交易計畫</div></div>'
+                f'<div class="wb-row"><span>策略方向</span><b>{_strategy_txt}</b></div>'
+                f'<div class="wb-row"><span>理想進場區</span>'
+                f'<b>{fmt_num(_tp.get("entry_low"), "{:.2f}")} ~ {fmt_num(_tp.get("entry_high"), "{:.2f}")}</b></div>'
+                f'<div class="wb-row"><span>追價上限</span><b>{fmt_num(_tp.get("chase_limit"), "{:.2f}")}</b></div>'
+                f'<div class="wb-row"><span>停損價</span><b style="color:var(--red);">'
+                f'{fmt_num(_tp_stop, "{:.2f}")} ({fmt_num(_stop_pct, "{:.1f}%")})</b></div>'
+                f'<div class="wb-row"><span>第一目標</span><b style="color:var(--green);">'
+                f'{fmt_num(_tp_t1, "{:.2f}")} ({fmt_num(_t1_pct, "{:+.1f}%")})</b></div>'
+                f'<div class="wb-row"><span>第二目標</span><b style="color:var(--green);">'
+                f'{fmt_num(_tp.get("target2"), "{:.2f}")}</b></div>'
+                f'<div class="wb-row"><span>風險報酬比</span>'
+                f'<b>1 : {fmt_num(_tp.get("rr1"), "{:.1f}")}／1 : {fmt_num(_tp.get("rr2"), "{:.1f}")}</b></div>'
+                '<div class="wb-foot">價位已依台股升降單位修正為可委託檔位</div>'
+                '</div>'
+            )
 
-                # 持倉摘要與風險設定兩張卡改放本益比河流圖（見右欄）。
-                # 這兩項資訊沒有消失：持倉在「持倉中心」頁籤，風險參數在側邊欄的
-                # 「風險與部位設定」，而且交易計畫卡本來就已經帶到停損價與風險報酬比。
-                st.markdown(f'<div class="wb-solo">{_plan_card}</div>', unsafe_allow_html=True)
 
             with river_col:
                 # ---------- 本益比河流圖 ----------
@@ -5487,7 +5483,7 @@ with tab_workspace:
                         hovertemplate='%{x|%Y-%m-%d}<br>股價 %{y:.2f}<extra></extra>',
                     ))
                     _fig.update_layout(
-                        height=278, template='plotly_dark', showlegend=False,
+                        height=296, template='plotly_dark', showlegend=False,
                         paper_bgcolor='#0d1624', plot_bgcolor='#0d1624',
                         margin=dict(l=6, r=6, t=6, b=6),
                         xaxis=dict(gridcolor='rgba(148,163,184,0.08)'),
@@ -5503,13 +5499,12 @@ with tab_workspace:
                         f'<span style="font-size:9.5px;">{_lb.split("(")[0]} {_bands[_lb]:.0f}x</span>'
                         for _i, _lb in enumerate(_band_labels)
                     )
+                    # 只留彩色圖例（看圖要用），移除底下那段長說明。
+                    # 完整的計算方式與免責說明仍在「完整分析明細 → 本益比河流圖」。
                     st.markdown(
                         f'<div class="wb-river-legend">{_legend}　'
                         f'<span style="color:#e6edf3;">━</span>'
-                        f'<span style="font-size:9.5px;">實際股價</span></div>'
-                        '<div class="wb-river-note">色帶＝近四季EPS × 自身歷史本益比分位數推算的理論價位。'
-                        '股價落在綠帶代表相對自己過去便宜、紅帶代表相對貴，'
-                        '是統計相對位置，不是目標價也不是買賣建議。</div>',
+                        f'<span>實際股價</span></div>',
                         unsafe_allow_html=True)
                 else:
                     st.markdown(
@@ -5520,8 +5515,10 @@ with tab_workspace:
                         '<br><br>可改用右上角的 Goodinfo 官方河流圖。</div></div>',
                         unsafe_allow_html=True)
 
-            # ══════════════ 第三列：六格資訊模組（同一個 grid，自動等高）══════════════
-            _mods = []
+            # ══════════════ 第三列：六格模組（交易計畫＋五項分析，同一個 grid 自動等高）══════════════
+            # 交易計畫排在最前面（最需要立即行動的資訊），最新新聞移除——
+            # 它天生最長會把整列撐高，完整清單在「完整分析明細 → 個股新聞」。
+            _mods = [_plan_card]
 
             # ---------- ① 多空指標 ----------
             _inds = calc_bull_bear_indicators(_k_src)
@@ -5668,28 +5665,10 @@ with tab_workspace:
             _mods.append('<div class="wb-card"><div class="wb-card-head">'
                          f'<div class="wb-card-title">法人目標價</div></div>{_body}</div>')
 
-            # ---------- ⑥ 最新新聞 ----------
-            # 這一格內容天生最長，等高之後會決定整列高度；限 4 則避免把其他卡片
-            # 一起撐得太高，其餘新聞在「完整分析明細 → 個股新聞」看得到。
-            _news = get_tw_stock_news(_code)
-            if _news:
-                _items = ''
-                for _n in _news[:4]:
-                    _items += (
-                        f'<a class="wb-news" href="{_n["link"]}" target="_blank">'
-                        f'<div class="wb-news-t">{_n["title"]}</div>'
-                        f'<div class="wb-news-m"><span style="color:{_n["color"]};">'
-                        f'{_n["sentiment"]}</span>　{_n["publisher"]}</div></a>'
-                    )
-                _body = _items + '<div class="wb-foot">標題關鍵字初步標記，非人工判讀</div>'
-            else:
-                _body = '<div class="wb-empty">目前無法取得即時新聞，稍後重新整理即可再試。</div>'
-            _mods.append('<div class="wb-card"><div class="wb-card-head">'
-                         f'<div class="wb-card-title">最新新聞</div></div>{_body}</div>')
-
             st.markdown(f'<div class="wb-grid6">{"".join(_mods)}</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
 
 
 
