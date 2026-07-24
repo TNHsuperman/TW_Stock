@@ -4385,6 +4385,23 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-news:hover .wb-news-t{color:#9fc5ff;}
 .wb-news-m{font-size:9.5px;color:var(--muted);margin-top:3px;font-family:'Roboto Mono',monospace;}
 
+/* 點一下放大：純 CSS 覆蓋層（靠 tabindex + :focus，不需要 JS） */
+.wb-zoom{outline:none;cursor:zoom-in;border-radius:10px;
+  transition:background .15s ease;position:relative;}
+.wb-zoom:hover{background:rgba(110,168,254,.07);}
+.wb-zoom:hover:before{content:'⤢';position:absolute;top:2px;right:4px;
+  font-size:11px;color:var(--accent);opacity:.75;}
+.wb-zoom:focus{position:fixed;left:6vw;right:6vw;top:8vh;bottom:8vh;z-index:1000000;
+  background:var(--surface);border:1px solid rgba(110,168,254,.55);border-radius:18px;
+  box-shadow:0 26px 80px rgba(0,0,0,.7);cursor:zoom-out;
+  display:flex;align-items:center;justify-content:center;padding:34px;}
+.wb-zoom:focus:before{content:none;}
+.wb-zoom:focus .wb-zoom-inner{width:100%;max-width:760px;}
+.wb-zoom:focus svg{width:100%!important;max-width:100%!important;height:auto!important;
+  max-height:70vh;}
+.wb-zoom:focus:after{content:'點畫面任一處關閉';position:absolute;bottom:14px;left:0;right:0;
+  text-align:center;font-size:12px;color:var(--muted);letter-spacing:.05em;}
+
 /* 評等長條 */
 .wb-bar{height:9px;border-radius:999px;background:rgba(148,163,184,.13);overflow:hidden;flex:1;}
 .wb-bar>i{display:block;height:100%;border-radius:999px;}
@@ -4526,7 +4543,9 @@ def wb_svg_radar(scores, color="#36c99a"):
     n = len(labels)
     if n < 3:
         return ''
-    cx, cy, rmax = 88.0, 82.0, 52.0
+    # viewBox 要留出軸標籤的寬度：最左／最右的標籤是 4 個中文字（約 40px），
+    # 從圓心往外 69px，所以左右各留 120-69-40≈11px 的安全邊界，不會再被切掉。
+    cx, cy, rmax = 120.0, 86.0, 54.0
     # 從正上方開始、順時針排列，跟一般財報雷達圖的閱讀習慣一致
     angles = [(-np.pi / 2) + (2 * np.pi * i / n) for i in range(n)]
 
@@ -4547,18 +4566,19 @@ def wb_svg_radar(scores, color="#36c99a"):
     for a, lb, v in zip(angles, labels, vals):
         lx = cx + (rmax + 15) * float(np.cos(a))
         ly = cy + (rmax + 15) * float(np.sin(a))
+        ly = min(max(ly, 17.0), 152.0)      # 上下夾住，避免第二行的數字掉出畫布
         anchor = 'middle'
         if float(np.cos(a)) > 0.35:
             anchor = 'start'
         elif float(np.cos(a)) < -0.35:
             anchor = 'end'
         text += (f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" fill="#8796aa" '
-                 f'font-size="8.5" font-weight="700">{lb}</text>'
-                 f'<text x="{lx:.1f}" y="{ly + 9:.1f}" text-anchor="{anchor}" fill="#c8d4e3" '
-                 f'font-size="8.5" font-family="Roboto Mono,monospace">{v:.0f}</text>')
+                 f'font-size="10" font-weight="700">{lb}</text>'
+                 f'<text x="{lx:.1f}" y="{ly + 11:.1f}" text-anchor="{anchor}" fill="#c8d4e3" '
+                 f'font-size="9.5" font-family="Roboto Mono,monospace">{v:.0f}</text>')
 
     return (
-        f'<svg viewBox="0 0 176 168" style="width:100%;max-width:190px;display:block;margin:0 auto;">'
+        f'<svg viewBox="0 0 240 178" style="width:100%;display:block;margin:0 auto;">'
         f'{grid}'
         f'<polygon points="{data_pts}" fill="{color}33" stroke="{color}" stroke-width="1.7" '
         f'stroke-linejoin="round"/>'
@@ -4608,6 +4628,18 @@ def wb_svg_donut(pct, center_text, color="#36c99a"):
         f'font-weight="700" font-family="Roboto Mono,monospace">{center_text}</text>'
         f'</svg>'
     )
+
+
+def wb_zoomable(inner_html, hint="點一下放大"):
+    """把圖表包成「點一下放大」的容器。
+
+    Streamlit 的 st.markdown 不會執行 JS，而這幾張卡片是純 HTML 塞在同一個
+    CSS Grid 裡（為了等高），也不能中途插 st.button。所以改用純 CSS：
+    給 div 一個 tabindex 讓它可以被點擊聚焦，再用 :focus 把它變成 position:fixed
+    的全螢幕覆蓋層；點畫面其他地方會自動失焦收起來。不依賴任何腳本。
+    """
+    return (f'<div class="wb-zoom" tabindex="0" role="button" title="{hint}">'
+            f'<div class="wb-zoom-inner">{inner_html}</div></div>')
 
 
 def wb_bar_row(label, pct, color="#36c99a"):
@@ -5355,8 +5387,10 @@ with tab_workspace:
                     _pnl_amt = (price - _pe) * _ps if pd.notna(price) else np.nan
                     _pnl_color = 'var(--green)' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else 'var(--red)'
                     _pos_body = (
-                        wb_svg_donut(_ppct, f"{_ppct:.0f}%",
-                                     '#36c99a' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else '#ff6b7a')
+                        wb_zoomable(wb_svg_donut(
+                            _ppct, f"{_ppct:.0f}%",
+                            '#36c99a' if (pd.notna(_pnl_pct) and _pnl_pct >= 0) else '#ff6b7a'),
+                            '點一下放大持倉占比')
                         + f'<div class="wb-row"><span>持有股數</span><b>{_ps:,.0f} 股</b></div>'
                         + f'<div class="wb-row"><span>平均成本</span><b>{_pe:,.2f}</b></div>'
                         + f'<div class="wb-row"><span>未實現損益</span>'
@@ -5372,7 +5406,8 @@ with tab_workspace:
                     _sug_pct = ((_sug_cost / (_total_cost + _sug_cost) * 100)
                                 if (pd.notna(_sug_cost) and (_total_cost + _sug_cost) > 0) else 0.0)
                     _pos_body = (
-                        wb_svg_donut(_sug_pct, f"{_sug_pct:.0f}%", '#6ea8fe')
+                        wb_zoomable(wb_svg_donut(_sug_pct, f"{_sug_pct:.0f}%", '#6ea8fe'),
+                                    '點一下放大建議部位占比')
                         + '<div class="wb-empty" style="padding:4px 0 8px;text-align:center;">未持有此股</div>'
                         + f'<div class="wb-row"><span>建議張數</span><b>{_lots_txt}</b></div>'
                         + f'<div class="wb-row"><span>預估投入</span><b>{fmt_num(_sug_cost, "{:,.0f}")} 元</b></div>'
@@ -5432,7 +5467,8 @@ with tab_workspace:
                     _c = {'多': 'var(--green)', '空': 'var(--red)', '中性': 'var(--muted)'}.get(_ind['訊號'], 'var(--muted)')
                     _rows += (f'<div class="wb-row"><span>{_ind["指標"]}</span>'
                               f'<b style="color:{_c};">{_ind["訊號"]}方</b></div>')
-                _body = (wb_svg_gauge(_bull_pct, _sum['verdict'], _vcolor) + _rows
+                _body = (wb_zoomable(wb_svg_gauge(_bull_pct, _sum['verdict'], _vcolor),
+                                 '點一下放大多空儀表') + _rows
                          + f'<div class="wb-foot">看多 {_sum["bull"]}／看空 {_sum["bear"]}／'
                            f'中性 {_sum["neutral"]}（共 {_sum["total"]} 項）</div>')
             else:
@@ -5449,6 +5485,8 @@ with tab_workspace:
                 # 分類少於 3 種時畫不出多邊形（例如財報只解析到償債＋獲利兩類），
                 # 這時退回條列顯示，不要讓卡片中間空一塊。
                 _radar_html = wb_svg_radar(_health['category_scores'], _hcolor)
+                if _radar_html:
+                    _radar_html = wb_zoomable(_radar_html, '點一下放大財務體質雷達圖')
                 if not _radar_html:
                     _radar_html = ''.join(
                         f'<div class="wb-row"><span>{_cat}</span><b>{_sc:.0f}</b></div>'
@@ -5506,6 +5544,7 @@ with tab_workspace:
                     [[r.get('融資餘額', np.nan) for r in _hist],
                      [r.get('融券餘額', np.nan) for r in _hist]],
                     ['#6ea8fe', '#f8c766'], height=48)
+                _spark = wb_zoomable(_spark, '點一下放大資券走勢')
                 _mc = 'var(--green)' if (pd.notna(_l.get('融資增減')) and _l['融資增減'] >= 0) else 'var(--red)'
                 _sc = 'var(--green)' if (pd.notna(_l.get('融券增減')) and _l['融券增減'] >= 0) else 'var(--red)'
                 _body = (
@@ -5584,6 +5623,7 @@ with tab_workspace:
             st.markdown(f'<div class="wb-grid6">{"".join(_mods)}</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
 
 
             # [新功能] 交易計畫：沿用上方 ATR 停損與風險預算，可直接建立／更新持倉。
