@@ -549,7 +549,7 @@ def get_stock_market_list():
     2) 再抓 TWSE / TPEx OpenAPI JSON，避免 read_html 大表格解析。
     3) OpenAPI 失敗時才用舊 ISIN HTML 備援，且 timeout 較短。
     """
-    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v2_industry_fixed.json')
+    cache_file = os.path.join(os.path.dirname(__file__) if '__file__' in globals() else '.', 'stock_market_cache_v3_industry_quality.json')
     today = get_tw_now().strftime('%Y-%m-%d')
 
 
@@ -611,16 +611,34 @@ def get_stock_market_list():
             pass
         return []
 
+    def industry_quality_ok(data):
+        """避免把只有代碼／名稱、產業全部未分類的行情備援寫入每日快取。"""
+        if not isinstance(data, list) or len(data) <= 100:
+            return False
+        for market_name in ('上市', '上櫃'):
+            subset = [x for x in data if isinstance(x, dict) and x.get('市場別') == market_name]
+            if len(subset) < 50:
+                return False
+            valid = sum(
+                1 for x in subset
+                if normalize_industry(x.get('industry', '未分類'))
+                not in ('', '未分類', 'None', 'nan')
+            )
+            # 公司基本資料正常時，絕大多數股票都有產業別；低於 45% 視為污染快取。
+            if valid / max(len(subset), 1) < 0.45:
+                return False
+        return True
+
     def save_local_cache(data):
         try:
-            if data and len(data) > 100:
+            if industry_quality_ok(data):
                 with open(cache_file, 'w', encoding='utf-8') as f:
                     json.dump({'date': today, 'data': data}, f, ensure_ascii=False)
         except Exception:
             pass
 
     cached = load_local_cache(allow_stale=False)
-    if cached:
+    if cached and industry_quality_ok(cached):
         return cached
 
     session = requests.Session()
@@ -722,17 +740,26 @@ def get_stock_market_list():
             parsed = parse_openapi_rows(rows, suffix, market_type)
             for s in parsed:
                 key = s['ticker']
-                # 若基本資料已經有產業別，不要被每日行情的未分類覆蓋。
+                # 若先讀到每日行情（產業未分類），後續公司基本資料可補回產業別。
                 if key not in seen:
                     stocks.append(s)
                     seen.add(key)
+                else:
+                    current = next((x for x in stocks if x.get('ticker') == key), None)
+                    if current is not None:
+                        old_industry = normalize_industry(current.get('industry', '未分類'))
+                        new_industry = normalize_industry(s.get('industry', '未分類'))
+                        if old_industry == '未分類' and new_industry != '未分類':
+                            current['industry'] = new_industry
+                        if not current.get('name') and s.get('name'):
+                            current['name'] = s['name']
             if len(stocks) >= 1200:
                 # 已足夠涵蓋上市櫃，多半不用再跑慢速備援。
                 pass
         except Exception:
             continue
 
-    if len(stocks) > 500:
+    if len(stocks) > 500 and industry_quality_ok(stocks):
         stocks = sorted(stocks, key=lambda x: x['code'])
         save_local_cache(stocks)
         return stocks
@@ -755,12 +782,19 @@ def get_stock_market_list():
                     code, name = val.split('　', 1)
                     if len(code) == 4 and code.isdigit():
                         key = f'{code}.{mkt}'
+                        isin_industry = normalize_industry(row.get('產業別', '未分類'))
                         if key in seen:
+                            current = next((x for x in stocks if x.get('ticker') == key), None)
+                            if current is not None:
+                                if normalize_industry(current.get('industry', '未分類')) == '未分類' and isin_industry != '未分類':
+                                    current['industry'] = isin_industry
+                                if not current.get('name'):
+                                    current['name'] = normalize_stock_name(name)
                             continue
                         stocks.append({
                             'ticker': key,
                             'name': normalize_stock_name(name),
-                            'industry': normalize_industry(row.get('產業別', '未分類')), 
+                            'industry': isin_industry,
                             'code': code,
                             '市場別': market_type,
                         })
@@ -1443,8 +1477,25 @@ def fetch_financial_health_score(code: str) -> float:
 
 MARKET_PULSE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
-    'market_pulse_cache_v2.json',
+    'market_pulse_cache_v3.json',
 )
+MARKET_PROFILE_CACHE_FILE = os.path.join(
+    os.path.dirname(__file__) if '__file__' in globals() else '.',
+    'market_profile_cache_v3.json',
+)
+
+_MP_INDUSTRY_CODE_MAP = {
+    '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維',
+    '05': '電機機械', '06': '電器電纜', '07': '化學生技醫療', '08': '玻璃陶瓷',
+    '09': '造紙工業', '10': '鋼鐵工業', '11': '橡膠工業', '12': '汽車工業',
+    '14': '建材營造', '15': '航運業', '16': '觀光餐旅', '17': '金融保險業',
+    '18': '貿易百貨業', '20': '其他業', '21': '化學工業', '22': '生技醫療業',
+    '23': '油電燃氣業', '24': '半導體業', '25': '電腦及週邊設備業', '26': '光電業',
+    '27': '通信網路業', '28': '電子零組件業', '29': '電子通路業', '30': '資訊服務業',
+    '31': '其他電子業', '32': '文化創意業', '33': '農業科技業', '34': '電子商務',
+    '35': '綠能環保', '36': '數位雲端', '37': '運動休閒', '38': '居家生活',
+    '80': '管理股票', '91': '存託憑證', '92': 'ETF', '93': '受益證券', '94': '認購售權證',
+}
 
 
 def _mp_to_float(v):
@@ -1486,6 +1537,39 @@ def _mp_clean_code(value) -> str:
     return match.group(1) if match else ""
 
 
+def _mp_normalize_industry(value) -> str:
+    text = BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
+    text = text.replace("　", " ").strip()
+    if text in ("", "-", "--", "None", "null", "nan", "未分類"):
+        return "未分類"
+    code = text.zfill(2) if text.isdigit() and len(text) <= 2 else text
+    if code in _MP_INDUSTRY_CODE_MAP:
+        return _MP_INDUSTRY_CODE_MAP[code]
+    match = re.match(r"^(\d{1,2})\s*[、,，\-:：]?\s*(.*)$", text)
+    if match:
+        industry_code = match.group(1).zfill(2)
+        label = match.group(2).strip()
+        if label and not label.isdigit():
+            return label
+        return _MP_INDUSTRY_CODE_MAP.get(industry_code, "未分類")
+    # 官方資料有時使用「其他」而非「其他業」，保留原名稱即可。
+    return text
+
+
+def _mp_format_quote_date(value) -> str:
+    """將民國 7 碼日期（1150724）或西元日期統一顯示成 YYYY-MM-DD。"""
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    try:
+        if len(digits) == 8 and digits.startswith("20"):
+            return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+        if len(digits) == 7:
+            return f"{int(digits[:3]) + 1911:04d}-{digits[3:5]}-{digits[5:7]}"
+    except Exception:
+        pass
+    return raw
+
+
 def _mp_apply_change_sign(change, sign_value):
     """部分 API 把漲跌符號與漲跌金額分欄，這裡合併成有正負號的數值。"""
     if pd.isna(change):
@@ -1498,13 +1582,28 @@ def _mp_apply_change_sign(change, sign_value):
     return float(change)
 
 
+def _mp_api_headers(url: str) -> dict:
+    """官方站台專用標頭；避免沿用 Yahoo Referer 造成部分 TPEx API 拒絕請求。"""
+    if "tpex.org.tw" in url:
+        referer = "https://www.tpex.org.tw/zh-tw/"
+    else:
+        referer = "https://openapi.twse.com.tw/"
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+        "Referer": referer,
+        "Cache-Control": "no-cache",
+    }
+
+
 def _mp_fetch_json(url: str, timeout: int = 12):
-    """官方 OpenAPI 下載；短暫錯誤重試一次。"""
-    for attempt in range(2):
+    """官方 OpenAPI 下載；針對 403/429/5xx 做短暫重試。"""
+    for attempt in range(3):
         try:
             response = requests.get(
                 url,
-                headers=get_headers(),
+                headers=_mp_api_headers(url),
                 timeout=(4, timeout),
                 verify=False,
             )
@@ -1513,23 +1612,138 @@ def _mp_fetch_json(url: str, timeout: int = 12):
                     return response.json()
                 except Exception:
                     encoding = response.apparent_encoding or "utf-8"
-                    return json.loads(response.content.decode(encoding, errors="ignore"))
+                    return json.loads(response.content.decode(encoding, errors="ignore").lstrip("\ufeff"))
+            if response.status_code not in (403, 429, 500, 502, 503, 504):
+                break
         except Exception:
             pass
-        if attempt == 0:
-            time.sleep(0.35)
+        if attempt < 2:
+            time.sleep(0.45 * (attempt + 1))
     return None
 
 
+def _mp_payload_rows(payload) -> list:
+    """容許 OpenAPI 直接回 list，或把 rows 包在 data／records 等節點。"""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "aaData", "result", "records", "items", "rows"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return rows
+    # 某些舊版回應會有 data9 這類欄位。
+    for key, rows in payload.items():
+        if str(key).lower().startswith("data") and isinstance(rows, list):
+            return rows
+    return []
+
+
+def _mp_profile_is_valid(profile: dict) -> bool:
+    return _mp_normalize_industry((profile or {}).get("industry")) != "未分類"
+
+
+def _mp_load_profile_cache(market: str) -> dict:
+    try:
+        if not os.path.exists(MARKET_PROFILE_CACHE_FILE):
+            return {}
+        with open(MARKET_PROFILE_CACHE_FILE, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        rows = payload.get(market, {}).get("profiles", {}) if isinstance(payload, dict) else {}
+        if not isinstance(rows, dict):
+            return {}
+        return {
+            str(code): {
+                "name": str(item.get("name", "") or "").strip(),
+                "industry": _mp_normalize_industry(item.get("industry", "未分類")),
+            }
+            for code, item in rows.items()
+            if _mp_clean_code(code) and isinstance(item, dict)
+        }
+    except Exception:
+        return {}
+
+
+def _mp_save_profile_cache(market: str, profiles: dict) -> None:
+    valid_count = sum(1 for p in profiles.values() if _mp_profile_is_valid(p))
+    if valid_count < 100:
+        return
+    try:
+        payload = {}
+        if os.path.exists(MARKET_PROFILE_CACHE_FILE):
+            with open(MARKET_PROFILE_CACHE_FILE, "r", encoding="utf-8") as file:
+                old = json.load(file)
+                if isinstance(old, dict):
+                    payload = old
+        payload[market] = {
+            "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "profiles": profiles,
+        }
+        temp_file = MARKET_PROFILE_CACHE_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(temp_file, MARKET_PROFILE_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _mp_fetch_official_profiles(market: str) -> dict:
+    """直接取得公司產業別；TPEx 失敗時以公開發行公司基本資料交叉補值。"""
+    if market == "TW":
+        urls = [
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_P",
+        ]
+    else:
+        urls = [
+            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O?l=zh-tw",
+            # 公開發行公司基本資料包含上櫃公司，可在 TPEx 公司資料端暫時被擋時補產業別。
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_P",
+            # 少數環境仍可讀到這個相容路徑，放最後嘗試，不依賴它。
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
+        ]
+
+    profiles = {}
+    for url in urls:
+        rows = _mp_payload_rows(_mp_fetch_json(url, timeout=14))
+        if not rows:
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = _mp_clean_code(_mp_pick(row, [
+                "公司代號", "Code", "證券代號", "SecuritiesCompanyCode", "股票代號", "有價證券代號",
+            ]))
+            if not code:
+                continue
+            name = str(_mp_pick(row, [
+                "公司簡稱", "公司名稱", "Name", "證券名稱", "CompanyName", "股票名稱",
+            ], "") or "").strip()
+            industry = _mp_normalize_industry(_mp_pick(row, [
+                "產業別", "產業類別", "Industry", "industry", "IndustryCode", "產業代號",
+            ], "未分類"))
+            current = profiles.setdefault(code, {"name": "", "industry": "未分類"})
+            if name and not current.get("name"):
+                current["name"] = normalize_stock_name(name)
+            if industry != "未分類":
+                current["industry"] = industry
+        # 已取得足夠產業資料就不再呼叫後續備援，減少等待。
+        if sum(1 for p in profiles.values() if _mp_profile_is_valid(p)) >= 300:
+            break
+    return profiles
+
+
 def _mp_stock_profiles(market: str) -> dict:
-    """取得指定市場的代碼、名稱與產業別對照；排除 ETF／ETN／權證。"""
+    """取得代碼、名稱、產業別；合併一般股票清單、獨立官方 API 與磁碟快取。"""
     market_label = "上市" if market == "TW" else "上櫃"
     profiles = {}
+
+    # 先讀既有股票清單，名稱通常最完整；即使產業快取曾污染，也只把有效產業帶進來。
     try:
         stocks = get_stock_market_list()
     except Exception:
         stocks = []
-
     excluded_industries = {"ETF", "ETN", "受益證券", "認購售權證", "存託憑證"}
     for stock in stocks or []:
         if str(stock.get("市場別", "")).strip() != market_label:
@@ -1538,26 +1752,60 @@ def _mp_stock_profiles(market: str) -> dict:
         if not code:
             continue
         name = str(stock.get("name", "") or "").strip()
-        industry = str(stock.get("industry", "未分類") or "未分類").strip()
-        upper_name = name.upper()
+        industry = _mp_normalize_industry(stock.get("industry", "未分類"))
         if code.startswith("00") or industry.upper() in excluded_industries:
             continue
-        if "ETF" in upper_name or "ETN" in upper_name or "權證" in name:
+        if "ETF" in name.upper() or "ETN" in name.upper() or "權證" in name:
             continue
-        profiles[code] = {
-            "name": name,
-            "industry": industry if industry else "未分類",
-        }
-    return profiles
+        profiles[code] = {"name": name, "industry": industry}
+
+    # 舊快取只補空值，不覆蓋本次抓到的新資料。
+    cached_profiles = _mp_load_profile_cache(market)
+    for code, item in cached_profiles.items():
+        current = profiles.setdefault(code, {"name": "", "industry": "未分類"})
+        if not current.get("name") and item.get("name"):
+            current["name"] = item["name"]
+        if not _mp_profile_is_valid(current) and _mp_profile_is_valid(item):
+            current["industry"] = item["industry"]
+
+    # 無論股票清單是否有資料，都直接嘗試官方公司基本資料，以修復「全部未分類」問題。
+    official_profiles = _mp_fetch_official_profiles(market)
+    for code, item in official_profiles.items():
+        current = profiles.setdefault(code, {"name": "", "industry": "未分類"})
+        if item.get("name"):
+            current["name"] = item["name"]
+        if _mp_profile_is_valid(item):
+            current["industry"] = item["industry"]
+
+    valid_profiles = {code: item for code, item in profiles.items() if not code.startswith("00")}
+    _mp_save_profile_cache(market, valid_profiles)
+    return valid_profiles
 
 
 def _mp_normalize_quote(row: dict, market: str, profiles: dict):
-    """把 TWSE／TPEx 不同欄名統一成市場觀察所需欄位。"""
+    """把 TWSE／TPEx 不同欄名統一；即使產業表暫時失敗，仍保留漲跌家數。"""
     code = _mp_clean_code(_mp_pick(row, [
         "Code", "證券代號", "公司代號", "SecuritiesCompanyCode",
         "股票代號", "有價證券代號",
     ]))
-    if not code or code not in profiles:
+    if not code or code.startswith("00"):
+        return None
+
+    profile = profiles.get(code, {})
+    row_name = str(_mp_pick(row, [
+        "Name", "證券名稱", "公司簡稱", "CompanyName", "股票名稱",
+    ], "") or "").strip()
+    name = str(profile.get("name", "") or row_name).strip()
+    upper_name = name.upper()
+    if "ETF" in upper_name or "ETN" in upper_name or "權證" in name:
+        return None
+
+    industry = _mp_normalize_industry(profile.get("industry", "未分類"))
+    if industry == "未分類":
+        industry = _mp_normalize_industry(_mp_pick(row, [
+            "產業別", "產業類別", "Industry", "industry", "IndustryCode",
+        ], "未分類"))
+    if industry in ("ETF", "ETN", "受益證券", "認購售權證", "存託憑證"):
         return None
 
     close = _mp_to_float(_mp_pick(row, [
@@ -1575,7 +1823,7 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
     change = _mp_apply_change_sign(change, sign_value)
 
     change_pct = _mp_to_float(_mp_pick(row, [
-        "ChangePercent", "ChangeRate", "漲跌幅", "漲跌幅(%)", "漲跌%",
+        "ChangePercent", "ChangeRate", "漲跌幅", "漲跌幅(%)", "漲跌%", "ChangePercentString",
     ]))
     if pd.isna(change_pct) and pd.notna(close) and pd.notna(change):
         previous_close = close - change
@@ -1583,22 +1831,20 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
             change_pct = change / previous_close * 100
 
     trade_value = _mp_to_float(_mp_pick(row, [
-        "TradeValue", "TransactionAmount", "成交金額", "成交值", "Amount",
+        "TradeValue", "TransactionAmount", "成交金額", "成交值", "Amount", "成交金額(元)",
     ]))
     trade_volume = _mp_to_float(_mp_pick(row, [
-        "TradeVolume", "TradingShares", "成交股數", "成交量", "Volume",
+        "TradeVolume", "TradingShares", "成交股數", "成交量", "Volume", "成交股數(股)",
     ]))
-    quote_date = str(_mp_pick(row, ["Date", "日期", "TradeDate", "資料日期"], "") or "").strip()
+    quote_date = _mp_format_quote_date(_mp_pick(row, ["Date", "日期", "TradeDate", "資料日期"], ""))
 
-    # 沒有漲跌幅就無法放入市場結構統計；停牌或無成交個股略過。
     if pd.isna(change_pct):
         return None
 
-    profile = profiles[code]
     return {
         "code": code,
-        "name": profile.get("name", ""),
-        "industry": profile.get("industry", "未分類"),
+        "name": name,
+        "industry": industry,
         "close": close,
         "open": open_price,
         "change": change,
@@ -1614,8 +1860,6 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
 def fetch_official_market_quotes(market: str) -> pd.DataFrame:
     """取得上市／上櫃最新收盤行情，並統一欄位格式。"""
     profiles = _mp_stock_profiles(market)
-    if not profiles:
-        return pd.DataFrame()
 
     if market == "TW":
         urls = [
@@ -1624,22 +1868,18 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
     else:
         urls = [
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?l=zh-tw",
             "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
         ]
 
     for url in urls:
         payload = _mp_fetch_json(url)
-        if isinstance(payload, dict):
-            # 某些 API 版本會把資料包在 data / aaData / tables 裡。
-            for key in ("data", "aaData", "result", "records"):
-                if isinstance(payload.get(key), list):
-                    payload = payload[key]
-                    break
-        if not isinstance(payload, list):
+        rows_payload = _mp_payload_rows(payload)
+        if not rows_payload:
             continue
 
         rows = []
-        for item in payload:
+        for item in rows_payload:
             normalized = _mp_normalize_quote(item, market, profiles)
             if normalized:
                 rows.append(normalized)
@@ -1662,18 +1902,23 @@ def _mp_load_disk_cache(market: str) -> dict:
         with open(MARKET_PULSE_CACHE_FILE, "r", encoding="utf-8") as file:
             payload = json.load(file)
         item = payload.get(market, {}) if isinstance(payload, dict) else {}
-        if not isinstance(item, dict) or not item.get("industry"):
+        if not isinstance(item, dict):
+            return {}
+        industry_rows = item.get("industry", [])
+        # 即使舊快取沒有產業資料，也允許個股漲跌分布使用 breadth。
+        if not industry_rows and not item.get("breadth"):
             return {}
         return {
-            "industry": pd.DataFrame(item.get("industry", [])),
+            "industry": pd.DataFrame(industry_rows),
             "breadth": item.get("breadth", {}),
             "total": int(item.get("total", 0) or 0),
             "up": int(item.get("up", 0) or 0),
             "down": int(item.get("down", 0) or 0),
             "flat": int(item.get("flat", 0) or 0),
-            "quote_date": item.get("quote_date", ""),
+            "quote_date": _mp_format_quote_date(item.get("quote_date", "")),
             "saved_at": item.get("saved_at", ""),
             "source": item.get("source", "TWSE／TPEx 官方 OpenAPI"),
+            "industry_coverage": float(item.get("industry_coverage", 0) or 0),
             "is_cached": True,
         }
     except Exception:
@@ -1698,6 +1943,7 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
             "quote_date": pulse.get("quote_date", ""),
             "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
             "source": "TWSE／TPEx 官方 OpenAPI",
+            "industry_coverage": float(pulse.get("industry_coverage", 0) or 0),
         }
         temp_file = MARKET_PULSE_CACHE_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as file:
@@ -1714,11 +1960,12 @@ def build_market_pulse(market: str) -> dict:
     if quotes.empty:
         return _mp_load_disk_cache(market)
 
-    # 產業報酬採個股等權平均；成交額與成交比重則反映產業資金集中度。
-    industry_base = quotes[
+    valid_industry_mask = (
         quotes["industry"].notna()
-        & ~quotes["industry"].isin(["", "未分類", "ETF", "ETN", "認購售權證"])
-    ].copy()
+        & ~quotes["industry"].isin(["", "未分類", "ETF", "ETN", "認購售權證", "受益證券", "存託憑證"])
+    )
+    industry_base = quotes[valid_industry_mask].copy()
+    industry_coverage = float(valid_industry_mask.mean()) if len(quotes) else 0.0
 
     if industry_base.empty:
         industry = pd.DataFrame()
@@ -1763,7 +2010,10 @@ def build_market_pulse(market: str) -> dict:
         "平盤": flat,
     }
 
-    quote_dates = [str(v).strip() for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist() if str(v).strip()]
+    quote_dates = [
+        _mp_format_quote_date(v) for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist()
+        if str(v).strip()
+    ]
     quote_date = max(quote_dates) if quote_dates else ""
     pulse = {
         "industry": industry,
@@ -1775,6 +2025,7 @@ def build_market_pulse(market: str) -> dict:
         "quote_date": quote_date,
         "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "TWSE／TPEx 官方 OpenAPI",
+        "industry_coverage": industry_coverage,
         "is_cached": False,
     }
     _mp_save_disk_cache(market, pulse)
@@ -7472,7 +7723,11 @@ with tab_market:
     elif mp_sub == "📊 產業類股表現":
         ind = pulse.get("industry", pd.DataFrame())
         if ind.empty:
-            st.warning("無法取得產業類股資料，請稍後再試。")
+            coverage = float(pulse.get("industry_coverage", 0) or 0)
+            st.warning(
+                "個股行情已取得，但公司產業對照資料暫時不可用。"
+                f"目前產業覆蓋率為 {coverage:.0%}；可先切換至「個股漲跌分布」，系統也會持續使用最近成功快取。"
+            )
         else:
             pm_mode = st.radio(
                 "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
