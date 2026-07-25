@@ -7326,9 +7326,14 @@ with tab_market:
             show_cols = ["industry", "平均漲跌幅", "家數"]
             if "成交比重" in show.columns:
                 show_cols.append("成交比重")
+            def _mp_color_tw(val):
+                if pd.isna(val): return ''
+                c = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
+                return f'color: {c}; font-weight: bold'
+
             st.dataframe(
                 show[show_cols].style.map(
-                    color_tw_style, subset=["平均漲跌幅"]),
+                    _mp_color_tw, subset=["平均漲跌幅"]),
                 use_container_width=True, hide_index=True,
                 column_config={
                     "industry": st.column_config.TextColumn("產業別"),
