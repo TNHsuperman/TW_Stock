@@ -1420,6 +1420,165 @@ def fetch_financial_health_score(code: str) -> float:
 # 理論價位帶，畫成河流狀的區域圖，再把實際股價疊在上面。
 # 這是「相對自己過去本益比區間」的估算，不是官方資料、也不是目標價，僅供參考。
 
+# ============================================================
+# [新頁籤] 市場觀察：產業類股表現 ＋ 個股漲跌分布
+# ============================================================
+# 資料全部來自 TWSE／TPEx 的當日全市場行情 OpenAPI，跟掃描預篩用的是
+# 同一批端點，不接第三方（玩股網）。抓一次全市場個股當日漲跌幅後，
+# 在本地彙總成「各產業平均漲跌幅」與「八段漲跌分布」，@st.cache_data
+# 快取 10 分鐘，避免每次切子頁都重打。
+
+def _mp_to_float(v):
+    """把 OpenAPI 回傳的字串數字轉 float：處理千分位逗號、+/- 號、'--'、空字串。"""
+    if v is None:
+        return np.nan
+    s = str(v).replace(",", "").replace("+", "").strip()
+    if s in ("", "--", "-", "X", "N/A", "null", "None"):
+        return np.nan
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def _mp_pick(row, keys, default=None):
+    for k in keys:
+        if k in row and str(row[k]).strip() not in ("", "null", "None"):
+            return row[k]
+    return default
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_market_daily_quotes(market: str) -> pd.DataFrame:
+    """全市場個股當日行情（代碼／名稱／收盤／漲跌幅%／成交金額）。
+
+    market: 'TW'（上市）或 'TWO'（上櫃）。
+    TWSE STOCK_DAY_ALL 有欄位「漲跌價差」但沒有百分比，要自己用
+    (收盤-開盤價差) / 昨收 換算——其實 STOCK_DAY_ALL 給的是當日
+    開高低收，昨收要另抓，成本高；改用「漲跌價差 / (收盤 - 漲跌價差)」
+    近似昨收（收盤 = 昨收 + 漲跌），數學上等價且只靠單一端點。
+    抓不到回傳空 DataFrame（fail-open）。
+    """
+    if market == "TW":
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        code_keys = ["Code", "證券代號"]
+        name_keys = ["Name", "證券名稱"]
+        close_keys = ["ClosingPrice", "收盤價"]
+        change_keys = ["Change", "漲跌價差"]
+        amount_keys = ["TradeValue", "成交金額"]
+    else:
+        url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+        code_keys = ["SecuritiesCompanyCode", "Code", "股票代號"]
+        name_keys = ["CompanyName", "Name", "名稱"]
+        close_keys = ["Close", "ClosingPrice", "收盤"]
+        change_keys = ["Change", "漲跌", "漲跌價差"]
+        amount_keys = ["TradeAmount", "TradeValue", "成交金額"]
+
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=(3, 8), verify=False)
+        if r.status_code != 200 or not r.text.strip():
+            return pd.DataFrame()
+        rows = r.json()
+    except Exception:
+        return pd.DataFrame()
+
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(_mp_pick(row, code_keys, "")).strip()
+        if len(code) != 4 or not code.isdigit():
+            continue
+        close = _mp_to_float(_mp_pick(row, close_keys))
+        change = _mp_to_float(_mp_pick(row, change_keys))
+        if pd.isna(close) or pd.isna(change):
+            continue
+        prev = close - change            # 昨收 = 收盤 − 漲跌價差
+        pct = (change / prev * 100) if prev > 0 else np.nan
+        out.append({
+            "code": code,
+            "name": normalize_stock_name(str(_mp_pick(row, name_keys, ""))),
+            "收盤": close,
+            "漲跌幅(%)": pct,
+            "成交金額": _mp_to_float(_mp_pick(row, amount_keys)),
+        })
+    return pd.DataFrame(out)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def build_market_pulse(market: str) -> dict:
+    """把當日全市場行情彙總成產業表現與漲跌分布。
+
+    回傳 {
+      "industry": DataFrame[產業, 平均漲跌幅, 家數, 成交金額],
+      "distribution": {"漲停":n, "5%":n, "2-5%":n, "0-2%":n, "平盤":n,
+                        "跌0-2%":n, "跌2-5%":n, "跌5%":n, "跌停":n},
+      "total": 有效個股數, "up": 上漲家數, "down": 下跌家數, "flat": 平盤家數,
+    }
+    抓不到資料時回傳 {}。
+    """
+    quotes = fetch_market_daily_quotes(market)
+    if quotes.empty:
+        return {}
+
+    # 併上產業別（來自既有的全市場清單，已含 industry 欄位）
+    universe = pd.DataFrame(get_stock_market_list())
+    suffix = market
+    uni = universe[universe["ticker"].str.endswith(f".{suffix}")][["code", "industry"]]
+    merged = quotes.merge(uni, on="code", how="left")
+    merged["industry"] = merged["industry"].fillna("未分類")
+
+    valid = merged.dropna(subset=["漲跌幅(%)"])
+    if valid.empty:
+        return {}
+
+    # ── 產業平均漲跌幅 ──
+    grp = valid.groupby("industry").agg(
+        平均漲跌幅=("漲跌幅(%)", "mean"),
+        家數=("漲跌幅(%)", "size"),
+        成交金額=("成交金額", "sum"),
+    ).reset_index()
+    grp = grp[grp["家數"] >= 3]         # 家數太少的產業平均值不具代表性
+    grp = grp.sort_values("平均漲跌幅", ascending=False).reset_index(drop=True)
+
+    # ── 八段漲跌分布（跟玩股網一致的級距）──
+    def _bucket(p):
+        if p >= 9.8:
+            return "漲停"
+        if p >= 5:
+            return "5%"
+        if p >= 2:
+            return "2-5%"
+        if p > 0:
+            return "0-2%"
+        if p == 0:
+            return "平盤"
+        if p > -2:
+            return "跌0-2%"
+        if p > -5:
+            return "跌2-5%"
+        if p > -9.8:
+            return "跌5%"
+        return "跌停"
+
+    order = ["漲停", "5%", "2-5%", "0-2%", "平盤", "跌0-2%", "跌2-5%", "跌5%", "跌停"]
+    counts = {k: 0 for k in order}
+    for p in valid["漲跌幅(%)"]:
+        counts[_bucket(float(p))] += 1
+
+    up = sum(counts[k] for k in ("漲停", "5%", "2-5%", "0-2%"))
+    down = sum(counts[k] for k in ("跌0-2%", "跌2-5%", "跌5%", "跌停"))
+
+    return {
+        "industry": grp,
+        "distribution": counts,
+        "total": int(len(valid)),
+        "up": int(up),
+        "down": int(down),
+        "flat": int(counts["平盤"]),
+    }
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_long_price_history(ticker: str, period: str = "3y") -> pd.DataFrame:
     """個股長期日收盤價，供本益比河流圖使用。用 yfinance，抓不到回傳空 DataFrame（fail-open）。"""
@@ -4768,12 +4927,13 @@ def wb_bar_row(label, pct, color="#36c99a"):
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
-tab_scan, tab_workspace, tab_portfolio, tab_watchlist, tab_report = st.tabs([
+tab_scan, tab_workspace, tab_portfolio, tab_watchlist, tab_report, tab_market = st.tabs([
     "市場掃描",
     "個股工作台",
     "持倉中心",
     "追蹤清單",
     "研究報告",
+    "市場觀察",
 ])
 
 # ------------------------------------------------------------
@@ -7065,3 +7225,163 @@ with tab_report:
                         st.caption(f"{sentiment} {title}")
 
             st.markdown('<div class="tv-caption" style="margin-top:24px;">本報告由系統自動整理公開資料與統計方法產生，僅供研究參考，不構成投資建議，投資請自行判斷並留意風險。</div>', unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------
+# TAB 6：市場觀察（產業類股表現 ＋ 個股漲跌分布）
+# ------------------------------------------------------------
+with tab_market:
+    st.markdown(
+        '<div class="section-head"><div>'
+        '<div class="section-title">市場觀察</div>'
+        '<div class="section-help">當日全市場的產業資金流向與個股漲跌結構，'
+        '資料來源 TWSE／TPEx 當日行情，約每 10 分鐘更新一次。</div>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    mp_market_label = st.radio(
+        "資料範圍", ["上市", "上櫃"], horizontal=True, key="market_pulse_scope",
+        label_visibility="collapsed",
+    )
+    mp_market = "TW" if mp_market_label == "上市" else "TWO"
+
+    mp_sub = st.radio(
+        "檢視", ["📊 產業類股表現", "📈 個股漲跌分布"], horizontal=True,
+        key="market_pulse_view", label_visibility="collapsed",
+    )
+
+    with st.spinner("正在彙整全市場當日行情…"):
+        pulse = build_market_pulse(mp_market)
+
+    if not pulse:
+        st.warning(
+            f"目前無法取得{mp_market_label}當日行情，可能是收盤前資料尚未產生、"
+            "假日無交易，或來源暫時無回應。稍後重新整理即可再試。"
+        )
+    elif mp_sub == "📊 產業類股表現":
+        ind = pulse["industry"]
+
+        pm_mode = st.radio(
+            "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
+            key="market_pulse_ind_mode", label_visibility="collapsed",
+        )
+        if pm_mode == "漲幅":
+            view = ind.sort_values("平均漲跌幅", ascending=False).head(12)
+            _val_col, _asc = "平均漲跌幅", False
+        elif pm_mode == "跌幅":
+            view = ind.sort_values("平均漲跌幅", ascending=True).head(12)
+            _val_col, _asc = "平均漲跌幅", True
+        else:
+            _total_amt = ind["成交金額"].sum()
+            ind = ind.assign(成交比重=lambda d: d["成交金額"] / _total_amt * 100 if _total_amt else 0)
+            view = ind.sort_values("成交比重", ascending=False).head(12)
+            _val_col, _asc = "成交比重", False
+
+        # 長條圖：紅漲綠跌（台股慣例）；成交比重一律用中性藍
+        if _val_col == "平均漲跌幅":
+            colors = ["#e0505a" if v >= 0 else "#3fae7a" for v in view[_val_col]]
+            fmt = "%{text:+.2f}%"
+            texts = [f"{v:+.2f}%" for v in view[_val_col]]
+        else:
+            colors = ["#6ea8fe"] * len(view)
+            texts = [f"{v:.2f}%" for v in view[_val_col]]
+
+        fig = go.Figure(go.Bar(
+            x=view["industry"], y=view[_val_col],
+            marker_color=colors, text=texts, textposition="outside",
+            hovertemplate="%{x}<br>%{y:.2f}<br>家數 %{customdata} 檔<extra></extra>",
+            customdata=view["家數"],
+        ))
+        fig.update_layout(
+            height=420, template="plotly_dark",
+            paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(tickangle=-30, tickfont=dict(size=13)),
+            yaxis=dict(gridcolor="rgba(148,163,184,0.10)",
+                       title="平均漲跌幅 (%)" if _val_col == "平均漲跌幅" else "成交金額比重 (%)"),
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"mp_ind_{mp_market}_{pm_mode}")
+
+        st.caption(
+            f"共納入 {int(ind['家數'].sum()):,} 檔{mp_market_label}個股、"
+            f"{len(pulse['industry'])} 個產業（每個產業至少 3 檔才列入）。"
+            "產業平均為等權平均，不是市值加權，僅供觀察資金流向。"
+        )
+
+        with st.expander("完整產業列表", expanded=False):
+            show = ind.sort_values(_val_col, ascending=_asc).copy()
+            show_cols = ["industry", "平均漲跌幅", "家數"]
+            if "成交比重" in show.columns:
+                show_cols.append("成交比重")
+            st.dataframe(
+                show[show_cols].style.map(
+                    color_tw_style, subset=["平均漲跌幅"]),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "industry": st.column_config.TextColumn("產業別"),
+                    "平均漲跌幅": st.column_config.NumberColumn("平均漲跌", format="%.2f%%"),
+                    "家數": st.column_config.NumberColumn("家數", format="%d"),
+                    "成交比重": st.column_config.NumberColumn("成交比重", format="%.2f%%"),
+                },
+            )
+
+    else:  # 個股漲跌分布
+        dist = pulse["distribution"]
+        order = ["漲停", "5%", "2-5%", "0-2%", "平盤", "跌0-2%", "跌2-5%", "跌5%", "跌停"]
+        labels = ["漲停", "5%以上", "2-5%", "0-2%", "平盤", "0-2%", "2-5%", "5%以上", "跌停"]
+        # 紅=漲、綠=跌（台股慣例），越極端顏色越深
+        bar_colors = ["#c0392b", "#e0505a", "#ec7a82", "#f2a9ae", "#8a94a6",
+                      "#a9dcc3", "#7fcda6", "#54bd88", "#2f9d68"]
+        values = [dist[k] for k in order]
+
+        fig = go.Figure(go.Bar(
+            x=labels, y=values, marker_color=bar_colors,
+            text=[f"{v}" for v in values], textposition="outside",
+            hovertemplate="%{x}<br>%{y} 檔<extra></extra>",
+        ))
+        fig.update_layout(
+            height=420, template="plotly_dark",
+            paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(tickfont=dict(size=13)),
+            yaxis=dict(gridcolor="rgba(148,163,184,0.10)", title="家數"),
+            showlegend=False,
+        )
+        # 用底部色帶標出紅（漲）／灰（平）／綠（跌）三段占比
+        _tot = max(pulse["total"], 1)
+        fig.add_annotation(
+            x=1.5, y=-0.16, xref="x", yref="paper", showarrow=False,
+            text=f'<span style="color:#e0505a;">上漲 {pulse["up"]}</span>　'
+                 f'<span style="color:#8a94a6;">平盤 {pulse["flat"]}</span>　'
+                 f'<span style="color:#54bd88;">下跌 {pulse["down"]}</span>',
+            font=dict(size=13),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"mp_dist_{mp_market}")
+
+        c1, c2, c3 = st.columns(3)
+        _tot = pulse["total"]
+        with c1:
+            st.markdown(
+                f'<div class="tv-card"><div class="tv-label">上漲家數</div>'
+                f'<div class="tv-value" style="color:#e0505a;">{pulse["up"]:,}</div>'
+                f'<div class="tv-caption">占 {pulse["up"] / _tot * 100:.1f}%</div></div>',
+                unsafe_allow_html=True)
+        with c2:
+            st.markdown(
+                f'<div class="tv-card"><div class="tv-label">平盤家數</div>'
+                f'<div class="tv-value" style="color:#8a94a6;">{pulse["flat"]:,}</div>'
+                f'<div class="tv-caption">占 {pulse["flat"] / _tot * 100:.1f}%</div></div>',
+                unsafe_allow_html=True)
+        with c3:
+            st.markdown(
+                f'<div class="tv-card"><div class="tv-label">下跌家數</div>'
+                f'<div class="tv-value" style="color:#54bd88;">{pulse["down"]:,}</div>'
+                f'<div class="tv-caption">占 {pulse["down"] / _tot * 100:.1f}%</div></div>',
+                unsafe_allow_html=True)
+
+        st.caption(
+            f"共統計 {_tot:,} 檔{mp_market_label}個股。級距以當日漲跌幅劃分，"
+            "紅為上漲、綠為下跌（台股慣例）；漲停／跌停以 ±9.8% 為界近似認定。"
+        )
