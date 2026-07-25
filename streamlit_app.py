@@ -528,6 +528,17 @@ def refresh_watchlist_quotes(watchlist: list) -> pd.DataFrame:
 # 2. 數據抓取
 # ============================================================
 
+def normalize_stock_name(value):
+    """上櫃 OpenAPI 有時只提供公司全名，這裡轉成較適合表格的股票簡稱。
+    （模組層級版本，供市場觀察等在 get_stock_market_list 外部的程式碼使用；
+    get_stock_market_list 內另有一份同名區域函式，行為一致。）"""
+    name = str(value or '').strip().replace(' ', '')
+    for suffix in ['股份有限公司', '有限公司']:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    return name
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_market_list():
     """快速載入台股清單。
