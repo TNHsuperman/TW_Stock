@@ -1477,7 +1477,7 @@ def fetch_financial_health_score(code: str) -> float:
 
 MARKET_PULSE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
-    'market_pulse_cache_v4.json',
+    'market_pulse_cache_v5.json',
 )
 MARKET_PROFILE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
@@ -1583,17 +1583,20 @@ def _mp_apply_change_sign(change, sign_value):
 
 
 def _mp_api_headers(url: str) -> dict:
-    """官方站台專用標頭；避免沿用 Yahoo Referer 造成部分 TPEx API 拒絕請求。"""
+    """官方站台專用標頭；依資料端點帶入正確 Referer，並避免 CDN 舊快取。"""
     if "tpex.org.tw" in url:
-        referer = "https://www.tpex.org.tw/zh-tw/"
+        referer = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/indices-pricing.html"
+    elif "www.twse.com.tw" in url or "wwwc.twse.com.tw" in url:
+        referer = "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
     else:
         referer = "https://openapi.twse.com.tw/"
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json, text/plain, text/html, */*",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
         "Referer": referer,
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "Pragma": "no-cache",
     }
 
 
@@ -1889,6 +1892,227 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+
+# 證交所 MI_INDEX 與櫃買中心 indexSummary 使用「官方類股價格指數」。
+# 玩股網的上市／上櫃類股漲跌表也是以類股指數為基礎，不是把成分股漲跌幅做算術平均。
+# 下列名稱統一層可把「水泥類指數」「水泥工業」等不同寫法合併到同一產業鍵。
+_MP_CANONICAL_INDUSTRY_ALIASES = {
+    "水泥": "水泥工業", "水泥類": "水泥工業", "水泥工業": "水泥工業",
+    "食品": "食品工業", "食品類": "食品工業", "食品工業": "食品工業",
+    "塑膠": "塑膠工業", "塑膠類": "塑膠工業", "塑膠工業": "塑膠工業",
+    "紡織": "紡織纖維", "紡織類": "紡織纖維", "紡織纖維": "紡織纖維",
+    "電機": "電機機械", "電機類": "電機機械", "電機機械": "電機機械",
+    "電器電纜": "電器電纜", "電器電纜類": "電器電纜",
+    "化學生技醫療": "化學生技醫療", "化學生技": "化學生技醫療",
+    "玻璃陶瓷": "玻璃陶瓷", "玻璃陶瓷類": "玻璃陶瓷",
+    "造紙": "造紙工業", "造紙類": "造紙工業", "造紙工業": "造紙工業",
+    "鋼鐵": "鋼鐵工業", "鋼鐵類": "鋼鐵工業", "鋼鐵工業": "鋼鐵工業",
+    "橡膠": "橡膠工業", "橡膠類": "橡膠工業", "橡膠工業": "橡膠工業",
+    "汽車": "汽車工業", "汽車類": "汽車工業", "汽車工業": "汽車工業",
+    "電子": "電子工業", "電子類": "電子工業", "電子工業": "電子工業",
+    "建材營造": "建材營造", "建材營造類": "建材營造",
+    "航運": "航運業", "航運類": "航運業", "航運業": "航運業",
+    "觀光": "觀光餐旅", "觀光類": "觀光餐旅", "觀光餐旅": "觀光餐旅",
+    "金融保險": "金融保險業", "金融保險類": "金融保險業", "金融保險業": "金融保險業",
+    "貿易百貨": "貿易百貨業", "百貨貿易": "貿易百貨業", "貿易百貨類": "貿易百貨業", "貿易百貨業": "貿易百貨業",
+    "油電燃氣": "油電燃氣業", "油電燃氣類": "油電燃氣業", "油電燃氣業": "油電燃氣業",
+    "其他": "其他業", "其他類": "其他業", "其他業": "其他業",
+    "化學": "化學工業", "化學類": "化學工業", "化學工業": "化學工業",
+    "生技醫療": "生技醫療業", "生技醫療類": "生技醫療業", "生技醫療業": "生技醫療業",
+    "半導體": "半導體業", "半導體類": "半導體業", "半導體業": "半導體業",
+    "電腦及週邊設備": "電腦及週邊設備業", "電腦及週邊設備類": "電腦及週邊設備業", "電腦及週邊設備業": "電腦及週邊設備業",
+    "光電": "光電業", "光電類": "光電業", "光電業": "光電業",
+    "通信網路": "通信網路業", "通信網路類": "通信網路業", "通信網路業": "通信網路業",
+    "電子零組件": "電子零組件業", "電子零組件類": "電子零組件業", "電子零組件業": "電子零組件業",
+    "電子通路": "電子通路業", "電子通路類": "電子通路業", "電子通路業": "電子通路業",
+    "資訊服務": "資訊服務業", "資訊服務類": "資訊服務業", "資訊服務業": "資訊服務業",
+    "其他電子": "其他電子業", "其他電子類": "其他電子業", "其他電子業": "其他電子業",
+    "文化創意": "文化創意業", "文化創意類": "文化創意業", "文化創意業": "文化創意業",
+    "綠能環保": "綠能環保", "綠能環保類": "綠能環保",
+    "數位雲端": "數位雲端", "數位雲端類": "數位雲端",
+    "運動休閒": "運動休閒", "運動休閒類": "運動休閒",
+    "居家生活": "居家生活", "居家生活類": "居家生活",
+}
+
+_MP_TWSE_INDUSTRY_KEYS = {
+    "水泥工業", "食品工業", "塑膠工業", "紡織纖維", "電機機械", "電器電纜",
+    "化學生技醫療", "玻璃陶瓷", "造紙工業", "鋼鐵工業", "橡膠工業", "汽車工業",
+    "電子工業", "建材營造", "航運業", "觀光餐旅", "金融保險業", "貿易百貨業",
+    "油電燃氣業", "其他業", "化學工業", "生技醫療業", "半導體業",
+    "電腦及週邊設備業", "光電業", "通信網路業", "電子零組件業", "電子通路業",
+    "資訊服務業", "其他電子業", "文化創意業", "綠能環保", "數位雲端", "運動休閒", "居家生活",
+}
+
+_MP_TPEX_INDUSTRY_KEYS = {
+    "紡織纖維", "電機機械", "鋼鐵工業", "電子工業", "建材營造", "航運業",
+    "觀光餐旅", "其他業", "化學工業", "生技醫療業", "半導體業",
+    "電腦及週邊設備業", "光電業", "通信網路業", "電子零組件業", "電子通路業",
+    "資訊服務業", "其他電子業", "文化創意業", "綠能環保", "數位雲端", "居家生活",
+}
+
+_MP_WANTGOO_LABELS = {
+    "水泥工業": "水泥類", "食品工業": "食品類", "塑膠工業": "塑膠類",
+    "紡織纖維": "紡織類", "電機機械": "電機類", "電器電纜": "電器電纜",
+    "化學生技醫療": "化學生技", "玻璃陶瓷": "玻璃陶瓷類", "造紙工業": "造紙類",
+    "鋼鐵工業": "鋼鐵類", "橡膠工業": "橡膠類", "汽車工業": "汽車類",
+    "電子工業": "電子類", "建材營造": "建材營造", "航運業": "航運類",
+    "觀光餐旅": "觀光餐旅", "金融保險業": "金融保險", "貿易百貨業": "百貨貿易",
+    "油電燃氣業": "油電燃氣類", "其他業": "其他類", "化學工業": "化學工業",
+    "生技醫療業": "生技醫療", "半導體業": "半導體", "電腦及週邊設備業": "電腦及週邊設備",
+    "光電業": "光電業", "通信網路業": "通信網路業", "電子零組件業": "電子零組件",
+    "電子通路業": "電子通路", "資訊服務業": "資訊服務類", "其他電子業": "其他電子",
+    "文化創意業": "文化創意", "綠能環保": "綠能環保", "數位雲端": "數位雲端",
+    "運動休閒": "運動休閒", "居家生活": "居家生活",
+}
+
+
+def _mp_canonical_industry(value) -> str:
+    """把公司產業別與官方指數名稱轉為可合併的同一產業鍵。"""
+    text = BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
+    text = text.replace("臺灣", "").replace("上櫃", "").replace("價格", "").strip()
+    # 報酬指數不是玩股網「類股漲跌表」所使用的價格指數，先保留字樣供上層排除。
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"(類)?報酬指數$", "", text)
+    text = re.sub(r"類指數$", "", text)
+    text = re.sub(r"指數$", "", text)
+    return _MP_CANONICAL_INDUSTRY_ALIASES.get(text, _MP_CANONICAL_INDUSTRY_ALIASES.get(_mp_normalize_industry(text), text))
+
+
+def _mp_index_table_rows(payload) -> list:
+    """把 TWSE／TPEx 的 list 或 tables/fields/data 結構展平成 dict rows。"""
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    flattened = []
+    tables = payload.get("tables")
+    if isinstance(tables, list):
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            title = str(table.get("title", "") or "")
+            # TPEx 同頁也有報酬指數表；只採第一組價格指數，避免同產業重複。
+            if "報酬指數" in title:
+                continue
+            fields = table.get("fields") or table.get("columns") or []
+            data = table.get("data") or table.get("rows") or []
+            if isinstance(fields, list) and isinstance(data, list):
+                for row in data:
+                    if isinstance(row, dict):
+                        item = dict(row)
+                    elif isinstance(row, (list, tuple)):
+                        item = dict(zip(fields, row))
+                    else:
+                        continue
+                    item["_table_title"] = title
+                    flattened.append(item)
+        if flattened:
+            return flattened
+
+    # 兼容 aaData/data/records 等常見包裝。
+    rows = _mp_payload_rows(payload)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _mp_parse_industry_indices(payload, market: str) -> pd.DataFrame:
+    """從官方指數回應擷取產業價格指數的當日漲跌幅。"""
+    allowed = _MP_TWSE_INDUSTRY_KEYS if market == "TW" else _MP_TPEX_INDUSTRY_KEYS
+    parsed = []
+    seen = set()
+
+    for row in _mp_index_table_rows(payload):
+        raw_name = _mp_pick(row, [
+            "指數", "指數名稱", "名稱", "Index", "IndexName", "name",
+        ], "")
+        raw_name_text = BeautifulSoup(str(raw_name or ""), "html.parser").get_text(" ", strip=True)
+        if not raw_name_text or "報酬" in raw_name_text:
+            continue
+        key = _mp_canonical_industry(raw_name_text)
+        if key not in allowed or key in seen:
+            continue
+
+        pct = _mp_to_float(_mp_pick(row, [
+            "漲跌百分比", "漲跌百分比(%)", "漲跌幅度 (%)", "漲跌幅度(%)",
+            "漲跌幅", "漲跌%", "ChangePercent", "ChangeRate",
+        ]))
+        direction = _mp_pick(row, ["漲跌", "漲跌(+/-)", "漲跌符號", "Direction"], "")
+        pct = _mp_apply_change_sign(pct, direction)
+        if pd.isna(pct):
+            continue
+
+        close_index = _mp_to_float(_mp_pick(row, [
+            "收盤指數", "收市指數", "指數值", "Close", "ClosingIndex",
+        ]))
+        parsed.append({
+            "industry_key": key,
+            "類股": _MP_WANTGOO_LABELS.get(key, key),
+            "漲跌%": round(float(pct), 3),
+            "指數值": close_index,
+        })
+        seen.add(key)
+
+    return pd.DataFrame(parsed)
+
+
+def _mp_fetch_json_no_store(url: str):
+    """指數端點加時間戳避免中介快取；Streamlit 本身仍以 10 分鐘 TTL 控制更新頻率。"""
+    separator = "&" if "?" in url else "?"
+    return _mp_fetch_json(f"{url}{separator}_={int(time.time())}")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_official_industry_indices(market: str) -> pd.DataFrame:
+    """取得官方類股價格指數漲跌幅；這才是玩股網類股行情可對照的口徑。"""
+    if market == "TW":
+        urls = [
+            "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=&type=ALLBUT0999&response=json",
+        ]
+    else:
+        urls = [
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/indexSummary?date=&response=json",
+        ]
+
+    for url in urls:
+        payload = _mp_fetch_json_no_store(url)
+        result = _mp_parse_industry_indices(payload, market)
+        minimum = 20 if market == "TW" else 12
+        if len(result) >= minimum:
+            return result
+
+    # TPEx JSON 偶爾因站台切版或防護回傳非 JSON，官方 HTML 表格作為第二層備援。
+    if market == "TWO":
+        url = f"https://www.tpex.org.tw/www/zh-tw/afterTrading/indexSummary?date=&response=html&_={int(time.time())}"
+        try:
+            response = requests.get(
+                url, headers=_mp_api_headers(url), timeout=(4, 15), verify=False,
+            )
+            if response.status_code == 200 and response.text:
+                tables = pd.read_html(StringIO(response.text))
+                for df in tables:
+                    if df is None or df.empty:
+                        continue
+                    df.columns = [str(c).strip() for c in df.columns]
+                    name_col = next((c for c in df.columns if str(c).strip() in ("指數", "指數名稱")), None)
+                    pct_col = next((c for c in df.columns if "漲跌幅" in str(c)), None)
+                    if not name_col or not pct_col:
+                        continue
+                    rows = []
+                    for _, record in df.iterrows():
+                        rows.append({
+                            "指數": record.get(name_col),
+                            "漲跌幅度 (%)": record.get(pct_col),
+                            "收市指數": record.get(next((c for c in df.columns if "收市指數" in str(c)), ""), np.nan),
+                        })
+                    result = _mp_parse_industry_indices(rows, market)
+                    if len(result) >= 12:
+                        return result
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
 def _mp_json_records(df: pd.DataFrame) -> list:
     if df is None or df.empty:
         return []
@@ -1920,6 +2144,8 @@ def _mp_load_disk_cache(market: str) -> dict:
             "saved_at": item.get("saved_at", ""),
             "source": item.get("source", "TWSE／TPEx 官方 OpenAPI"),
             "industry_coverage": float(item.get("industry_coverage", 0) or 0),
+            "industry_method": item.get("industry_method", "official_index"),
+            "index_source": item.get("index_source", ""),
             "is_cached": True,
         }
     except Exception:
@@ -1946,6 +2172,8 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
             "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
             "source": "TWSE／TPEx 官方 OpenAPI",
             "industry_coverage": float(pulse.get("industry_coverage", 0) or 0),
+            "industry_method": pulse.get("industry_method", "official_index"),
+            "index_source": pulse.get("index_source", ""),
         }
         temp_file = MARKET_PULSE_CACHE_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as file:
@@ -1973,44 +2201,89 @@ def _mp_build_change_distribution(pct: pd.Series) -> dict:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def build_market_pulse(market: str) -> dict:
-    """彙整官方個股行情為產業表現與漲跌家數。market: 'TW' 或 'TWO'。"""
+    """彙整官方行情。類股漲跌採官方價格指數；成交比重與漲跌家數採個股行情。"""
     quotes = fetch_official_market_quotes(market)
     if quotes.empty:
         return _mp_load_disk_cache(market)
 
-    valid_industry_mask = (
-        quotes["industry"].notna()
-        & ~quotes["industry"].isin(["", "未分類", "ETF", "ETN", "認購售權證", "受益證券", "存託憑證"])
-    )
+    quote_dates = [
+        _mp_format_quote_date(v) for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist()
+        if str(v).strip()
+    ]
+    quote_date = max(quote_dates) if quote_dates else ""
+
+    quotes = quotes.copy()
+    quotes["industry_key"] = quotes["industry"].map(_mp_canonical_industry)
+    allowed = _MP_TWSE_INDUSTRY_KEYS if market == "TW" else _MP_TPEX_INDUSTRY_KEYS
+    valid_industry_mask = quotes["industry_key"].isin(allowed)
     industry_base = quotes[valid_industry_mask].copy()
     industry_coverage = float(valid_industry_mask.mean()) if len(quotes) else 0.0
 
+    # 個股資料只負責成交額、成交比重與家數；漲跌幅不再採等權平均。
     if industry_base.empty:
-        industry = pd.DataFrame()
+        industry_stats = pd.DataFrame()
     else:
-        industry = (
-            industry_base.groupby("industry", as_index=False)
+        industry_stats = (
+            industry_base.groupby("industry_key", as_index=False)
             .agg(
                 **{
-                    "漲跌%": ("change_pct", "mean"),
+                    "等權平均漲跌%": ("change_pct", "mean"),
                     "成交額_元": ("trade_value", "sum"),
                     "股票數": ("code", "nunique"),
                     "上漲家數": ("change_pct", lambda s: int((s > 0).sum())),
                     "下跌家數": ("change_pct", lambda s: int((s < 0).sum())),
                 }
             )
-            .rename(columns={"industry": "類股"})
         )
-        total_trade_value = float(industry["成交額_元"].sum(skipna=True))
-        industry["成交額"] = industry["成交額_元"] / 1e8
-        industry["成交比重%"] = (
-            industry["成交額_元"] / total_trade_value * 100
+        total_trade_value = float(industry_stats["成交額_元"].sum(skipna=True))
+        industry_stats["成交額"] = industry_stats["成交額_元"] / 1e8
+        industry_stats["成交比重%"] = (
+            industry_stats["成交額_元"] / total_trade_value * 100
             if total_trade_value > 0 else np.nan
         )
-        industry["漲跌%"] = industry["漲跌%"].round(3)
-        industry["成交額"] = industry["成交額"].round(2)
-        industry["成交比重%"] = industry["成交比重%"].round(3)
-        industry = industry.drop(columns=["成交額_元"]).sort_values("漲跌%", ascending=False)
+        industry_stats["成交額"] = industry_stats["成交額"].round(2)
+        industry_stats["成交比重%"] = industry_stats["成交比重%"].round(3)
+        industry_stats["等權平均漲跌%"] = industry_stats["等權平均漲跌%"].round(3)
+        industry_stats = industry_stats.drop(columns=["成交額_元"])
+
+    official_indices = fetch_official_industry_indices(market)
+    industry_method = "official_index"
+    index_source = "證交所 MI_INDEX" if market == "TW" else "櫃買中心 indexSummary"
+
+    if not official_indices.empty:
+        industry = official_indices.copy()
+        if not industry_stats.empty:
+            industry = industry.merge(industry_stats, on="industry_key", how="left")
+        industry = industry.sort_values("漲跌%", ascending=False)
+    else:
+        # 官方指數端點暫時失敗時，優先沿用同日已成功快取的官方類股指數。
+        cached = _mp_load_disk_cache(market)
+        cached_industry = cached.get("industry", pd.DataFrame()) if cached else pd.DataFrame()
+        if (
+            cached
+            and cached.get("industry_method") == "official_index"
+            and not cached_industry.empty
+            and (not quote_date or cached.get("quote_date") == quote_date)
+        ):
+            industry = cached_industry.copy()
+            industry_method = "official_index_cache"
+            index_source = cached.get("index_source", index_source)
+        elif not industry_stats.empty:
+            # 最後保底才顯示等權平均，UI 會明確提示此口徑無法與玩股網直接比較。
+            industry = industry_stats.copy()
+            industry["類股"] = industry["industry_key"].map(lambda x: _MP_WANTGOO_LABELS.get(x, x))
+            industry["漲跌%"] = industry["等權平均漲跌%"]
+            industry = industry.sort_values("漲跌%", ascending=False)
+            industry_method = "equal_weight_fallback"
+            index_source = "成分股等權平均備援"
+        else:
+            industry = pd.DataFrame()
+            industry_method = "unavailable"
+            index_source = ""
+
+    if not industry.empty:
+        industry = industry.drop(columns=["industry_key", "等權平均漲跌%"], errors="ignore")
+        industry["漲跌%"] = pd.to_numeric(industry["漲跌%"], errors="coerce").round(3)
 
     pct = pd.to_numeric(quotes["change_pct"], errors="coerce")
     open_price = pd.to_numeric(quotes["open"], errors="coerce")
@@ -2029,11 +2302,6 @@ def build_market_pulse(market: str) -> dict:
     }
     distribution = _mp_build_change_distribution(pct)
 
-    quote_dates = [
-        _mp_format_quote_date(v) for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist()
-        if str(v).strip()
-    ]
-    quote_date = max(quote_dates) if quote_dates else ""
     pulse = {
         "industry": industry,
         "breadth": breadth,
@@ -2046,6 +2314,8 @@ def build_market_pulse(market: str) -> dict:
         "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "TWSE／TPEx 官方 OpenAPI",
         "industry_coverage": industry_coverage,
+        "industry_method": industry_method,
+        "index_source": index_source,
         "is_cached": False,
     }
     _mp_save_disk_cache(market, pulse)
@@ -7708,7 +7978,7 @@ with tab_market:
         '<div class="section-head"><div>'
         '<div class="section-title">市場觀察</div>'
         '<div class="section-help">當日產業資金流向與個股漲跌結構，'
-        '資料來源：證交所／櫃買中心官方 OpenAPI；每 10 分鐘更新，連線失敗時自動顯示最近成功快取。</div>'
+        '資料來源：證交所／櫃買中心官方類股指數與個股 OpenAPI；每 10 分鐘更新，連線失敗時自動顯示最近成功快取。</div>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -7749,6 +8019,15 @@ with tab_market:
                 f"目前產業覆蓋率為 {coverage:.0%}；可先切換至「個股漲跌分布」，系統也會持續使用最近成功快取。"
             )
         else:
+            _industry_method = pulse.get("industry_method", "official_index")
+            if _industry_method == "equal_weight_fallback":
+                st.warning(
+                    "官方類股指數端點目前暫時無法取得，以下漲跌幅為成分股等權平均備援；"
+                    "此口徑不會與玩股網完全一致。官方指數恢復後會自動切回正確口徑。"
+                )
+            elif _industry_method == "official_index_cache":
+                st.info("目前類股漲跌幅沿用同一交易日最近成功取得的官方指數快取。")
+
             pm_mode = st.radio(
                 "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
                 key="market_pulse_ind_mode", label_visibility="collapsed",
@@ -7789,10 +8068,17 @@ with tab_market:
                 )
                 st.plotly_chart(fig, use_container_width=True, key=f"mp_ind_{mp_market}_{pm_mode}")
 
-            st.caption(
-                f"資料來源：證交所／櫃買中心官方 OpenAPI。"
-                f"{mp_market_label}類股漲跌幅為成分個股等權平均；成交比重依成交額計算。"
-            )
+            if pulse.get("industry_method") in ("official_index", "official_index_cache"):
+                st.caption(
+                    f"資料來源：{pulse.get('index_source', '證交所／櫃買中心官方類股指數')}。"
+                    f"{mp_market_label}類股漲跌幅直接採官方價格指數，與玩股網類股行情屬相同計算口徑；"
+                    "成交比重則依官方個股成交額彙總。"
+                )
+            else:
+                st.caption(
+                    "資料來源：證交所／櫃買中心官方個股行情。"
+                    "目前為成分股等權平均備援，不能直接拿來與玩股網的類股價格指數比較。"
+                )
 
             with st.expander("完整產業列表", expanded=False):
                 _asc = pm_mode == "跌幅"
