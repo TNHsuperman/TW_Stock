@@ -1477,7 +1477,7 @@ def fetch_financial_health_score(code: str) -> float:
 
 MARKET_PULSE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
-    'market_pulse_cache_v3.json',
+    'market_pulse_cache_v4.json',
 )
 MARKET_PROFILE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
@@ -1911,6 +1911,7 @@ def _mp_load_disk_cache(market: str) -> dict:
         return {
             "industry": pd.DataFrame(industry_rows),
             "breadth": item.get("breadth", {}),
+            "distribution": item.get("distribution", {}),
             "total": int(item.get("total", 0) or 0),
             "up": int(item.get("up", 0) or 0),
             "down": int(item.get("down", 0) or 0),
@@ -1936,6 +1937,7 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
         payload[market] = {
             "industry": _mp_json_records(pulse.get("industry", pd.DataFrame())),
             "breadth": pulse.get("breadth", {}),
+            "distribution": pulse.get("distribution", {}),
             "total": int(pulse.get("total", 0) or 0),
             "up": int(pulse.get("up", 0) or 0),
             "down": int(pulse.get("down", 0) or 0),
@@ -1951,6 +1953,22 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
         os.replace(temp_file, MARKET_PULSE_CACHE_FILE)
     except Exception:
         pass
+
+
+def _mp_build_change_distribution(pct: pd.Series) -> dict:
+    """依圖示門檻把個股漲跌幅切成 9 個互斥區間；所有有效個股只會落入一格。"""
+    values = pd.to_numeric(pct, errors="coerce").dropna()
+    return {
+        "漲停": int((values >= 9.5).sum()),
+        "5%": int(((values >= 5.0) & (values < 9.5)).sum()),
+        "2.5%": int(((values >= 2.5) & (values < 5.0)).sum()),
+        "0.2%": int(((values > 0.2) & (values < 2.5)).sum()),
+        "平盤": int(((values >= -0.2) & (values <= 0.2)).sum()),
+        "-0.2%": int(((values > -2.5) & (values < -0.2)).sum()),
+        "-2.5%": int(((values > -5.0) & (values <= -2.5)).sum()),
+        "-5%": int(((values > -9.5) & (values <= -5.0)).sum()),
+        "跌停": int((values <= -9.5).sum()),
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -2009,6 +2027,7 @@ def build_market_pulse(market: str) -> dict:
         "黑K": int((close_price < open_price).sum()),
         "平盤": flat,
     }
+    distribution = _mp_build_change_distribution(pct)
 
     quote_dates = [
         _mp_format_quote_date(v) for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist()
@@ -2018,6 +2037,7 @@ def build_market_pulse(market: str) -> dict:
     pulse = {
         "industry": industry,
         "breadth": breadth,
+        "distribution": distribution,
         "total": int(len(quotes)),
         "up": up,
         "down": down,
@@ -7803,27 +7823,47 @@ with tab_market:
 
     else:  # 個股漲跌分布
         breadth = pulse.get("breadth", {})
-        if not breadth:
+        distribution = pulse.get("distribution", {})
+        if not breadth or not distribution:
             st.warning("無法取得漲跌家數分布，請稍後再試。")
         else:
-            labels = ["上漲", "漲停", "紅K", "下跌", "跌停", "黑K"]
-            values = [breadth.get(k, 0) for k in labels]
-            bar_colors = ["#e0505a", "#c0392b", "#f2a9ae", "#3fae7a", "#2f9d68", "#a9dcc3"]
+            # 依使用者指定的圖二順序：漲停 → 5% → 2.5% → 0.2% → 平盤 → 負向區間 → 跌停。
+            labels = ["漲停", "5%", "2.5%", "0.2%", "平盤", "-0.2%", "-2.5%", "-5%", "跌停"]
+            values = [int(distribution.get(k, 0) or 0) for k in labels]
+            ranges = [
+                "≥ +9.5%", "+5.0% ～ < +9.5%", "+2.5% ～ < +5.0%",
+                "> +0.2% ～ < +2.5%", "-0.2% ～ +0.2%",
+                "> -2.5% ～ < -0.2%", "> -5.0% ～ ≤ -2.5%",
+                "> -9.5% ～ ≤ -5.0%", "≤ -9.5%",
+            ]
+            bar_colors = [
+                "#b8323e", "#cf4653", "#df6973", "#efa0a7", "#94a3b8",
+                "#b4ddc9", "#82cba9", "#4eb282", "#2f8f68",
+            ]
 
             fig = go.Figure(go.Bar(
                 x=labels, y=values, marker_color=bar_colors,
+                customdata=ranges,
                 text=[f"{v:,}" for v in values], textposition="outside",
-                hovertemplate="%{x}<br>%{y:,} 檔<extra></extra>",
+                hovertemplate="%{x}<br>區間：%{customdata}<br>%{y:,} 檔<extra></extra>",
             ))
             fig.update_layout(
-                height=420, template="plotly_dark",
+                height=440, template="plotly_dark",
                 paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
-                margin=dict(l=10, r=10, t=30, b=10),
-                xaxis=dict(tickfont=dict(size=14)),
-                yaxis=dict(gridcolor="rgba(148,163,184,0.10)", title="家數"),
+                margin=dict(l=10, r=10, t=30, b=55),
+                xaxis=dict(
+                    categoryorder="array", categoryarray=labels,
+                    tickangle=-35, tickfont=dict(size=13),
+                ),
+                yaxis=dict(gridcolor="rgba(148,163,184,0.10)", title="家數", rangemode="tozero"),
                 showlegend=False,
             )
-            st.plotly_chart(fig, use_container_width=True, key=f"mp_dist_{mp_market}")
+            st.plotly_chart(fig, use_container_width=True, key=f"mp_dist_v2_{mp_market}")
+
+            st.caption(
+                "分類門檻：漲停 ≥ 9.5%；5% 為 5～未滿 9.5%；2.5% 為 2.5～未滿 5%；"
+                "0.2% 為大於 0.2～未滿 2.5%；平盤為 -0.2～+0.2%；負向區間採對稱門檻。"
+            )
 
             c1, c2, c3 = st.columns(3)
             with c1:
