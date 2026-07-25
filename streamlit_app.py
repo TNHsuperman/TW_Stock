@@ -1532,11 +1532,41 @@ def build_market_pulse(market: str) -> dict:
     if quotes.empty:
         return {}
 
-    # 併上產業別（來自既有的全市場清單，已含 industry 欄位）
+    # 併上產業別。get_stock_market_list 的快取可能沒命中或只有單一市場，
+    # 不能假設一定有資料，所以 merge 失敗時退回直接抓基本資料端點。
     universe = pd.DataFrame(get_stock_market_list())
-    suffix = market
-    uni = universe[universe["ticker"].str.endswith(f".{suffix}")][["code", "industry"]]
-    merged = quotes.merge(uni, on="code", how="left")
+    if not universe.empty:
+        uni = universe[universe["ticker"].str.endswith(f".{market}")][["code", "industry"]]
+        merged = quotes.merge(uni, on="code", how="left")
+    else:
+        merged = quotes.copy()
+        merged["industry"] = np.nan
+
+    # 退路：merge 後大部分都是「未分類」，代表 universe 裡這個市場的資料不齊。
+    # 直接抓該市場的基本資料端點補上產業別。
+    _missing_pct = merged["industry"].isna().mean() if "industry" in merged.columns else 1.0
+    if _missing_pct > 0.3:
+        _ind_url = ("https://openapi.twse.com.tw/v1/opendata/t187ap03_L" if market == "TW"
+                    else "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O")
+        try:
+            _r = requests.get(_ind_url, headers=get_headers(), timeout=(3, 8), verify=False)
+            if _r.status_code == 200 and _r.text.strip():
+                _ind_rows = _r.json()
+                _ind_map = {}
+                for _ir in (_ind_rows or []):
+                    if not isinstance(_ir, dict):
+                        continue
+                    _ic = str(_mp_pick(_ir, ['Code', '證券代號', '公司代號', '有價證券代號',
+                                             'SecuritiesCompanyCode', '股票代號'], '')).strip()
+                    _im = re.search(r'\d{4}', _ic)
+                    if _im:
+                        _ind_map[_im.group(0)] = str(_mp_pick(_ir, ['產業別', '產業類別',
+                                                                     'Industry', 'industry'], '未分類'))
+                if _ind_map:
+                    merged["industry"] = merged["code"].map(_ind_map)
+        except Exception:
+            pass
+
     merged["industry"] = merged["industry"].fillna("未分類")
 
     valid = merged.dropna(subset=["漲跌幅(%)"])
