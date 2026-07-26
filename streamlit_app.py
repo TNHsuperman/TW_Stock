@@ -5397,15 +5397,29 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 /* ── 報價主卡 ── */
 .quote-panel{padding:22px 24px;margin:12px 0 18px;position:relative;overflow:hidden;}
 .quote-panel:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
-.quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
+.quote-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .quote-title{font-size:23px;font-weight:800;letter-spacing:-.015em;}
-.quote-tag,.bias-chip{border:1px solid var(--border);background:#121e2f;border-radius:999px;padding:5px 11px;color:#aebdd0;font-size:12.5px;font-weight:700;}
+/* L2 狀態標籤：可掃視、不過度搶主價 */
+.quote-tag,.bias-chip{
+  border:1px solid var(--border);background:#121e2f;border-radius:999px;
+  padding:5px 11px;color:#c5d2e3;font-size:12.5px;font-weight:700;
+  line-height:1.25;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.quote-tag.earn-tag{max-width:none;font-size:13px;font-weight:800;letter-spacing:.01em;}
+.quote-tag.earn-soon{
+  background:rgba(242,169,0,.16)!important;border-color:rgba(242,169,0,.38)!important;color:#f5c84a!important;
+}
+.quote-tag.earn-later{
+  background:rgba(76,141,255,.12)!important;border-color:rgba(76,141,255,.30)!important;color:#8eb6ff!important;
+}
 .quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;color:var(--green);line-height:1.2;letter-spacing:-.04em;}
 .quote-change{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-left:9px;}
 .quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-top:15px;max-width:720px;}
 .quote-metrics>div{padding:10px 12px;background:rgba(255,255,255,.022);border:1px solid rgba(148,163,184,.10);border-radius:11px;}
-.metric-k{color:var(--muted);font-size:10px;font-weight:700;}.metric-v{font-family:'Roboto Mono',monospace;font-size:14px;font-weight:700;margin-top:4px;}
-.hot-tag{background:rgba(248,145,75,.12)!important;border-color:rgba(248,145,75,.32)!important;color:#ffb17a!important;}.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
+.metric-k{color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.02em;}
+.metric-v{font-family:'Roboto Mono',monospace;font-size:14.5px;font-weight:700;margin-top:4px;}
+.hot-tag{background:rgba(248,145,75,.12)!important;border-color:rgba(248,145,75,.32)!important;color:#ffb17a!important;}
+.hot-badge-inline{display:inline-block;margin-left:4px;font-size:12px;}
 .detail-nav-title{font-size:11px;font-weight:800;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;margin:4px 0 7px;}
 
 /* ── 工作台 ── */
@@ -5461,24 +5475,24 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .wb-foot{font-size:clamp(11.5px,.62vw,14px);color:var(--muted);margin-top:9px;padding-top:8px;
   border-top:1px solid rgba(148,163,184,.09);}
 
-/* 報價主卡 */
+/* 報價主卡（L1 現價最大、L2 標籤可掃、L3 指標等寬灰階） */
 .wb-quote{background:var(--surface);border:1px solid var(--border);border-radius:14px;
-  padding:15px 18px;position:relative;overflow:hidden;}
+  padding:14px 16px 15px;position:relative;overflow:hidden;}
 .wb-quote:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
-.wb-quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:6px;}
-.wb-quote-name{font-size:clamp(25px,1.5vw,38px);font-weight:800;letter-spacing:-.02em;color:#f4f8ff;}
-.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:clamp(21px,1.25vw,31px);font-weight:700;color:var(--muted);}
-.wb-quote-body{display:flex;align-items:flex-start;gap:26px;flex-wrap:wrap;}
-.wb-quote-left{flex:0 0 auto;}
-.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:clamp(42px,2.55vw,66px);font-weight:700;
+.wb-quote-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;}
+.wb-quote-name{font-size:clamp(24px,1.45vw,36px);font-weight:800;letter-spacing:-.02em;color:#f4f8ff;line-height:1.15;}
+.wb-quote-code{font-family:'Roboto Mono',monospace;font-size:clamp(18px,1.1vw,26px);font-weight:700;color:#8b9bb0;}
+.wb-quote-body{display:flex;align-items:flex-start;gap:22px;flex-wrap:wrap;}
+.wb-quote-left{flex:0 0 auto;min-width:0;}
+.wb-quote-price{font-family:'Roboto Mono',monospace;font-size:clamp(40px,2.5vw,62px);font-weight:700;
   line-height:1.05;letter-spacing:-.04em;}
-.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:clamp(16.5px,1vw,24px);font-weight:700;margin-left:9px;}
-.wb-mgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px 10px;flex:1 1 430px;
-  align-content:start;padding-top:4px;}
+.wb-quote-chg{font-family:'Roboto Mono',monospace;font-size:clamp(15.5px,.95vw,22px);font-weight:700;margin-left:8px;}
+.wb-mgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px 10px;flex:1 1 430px;
+  align-content:start;padding-top:2px;}
 .wb-mgrid>div{min-width:0;}
-.wb-mk{font-size:clamp(11.5px,.62vw,14px);font-weight:700;color:var(--muted);white-space:nowrap;}
-.wb-mv{font-family:'Roboto Mono',monospace;font-size:clamp(14.5px,.8vw,18px);font-weight:700;color:#e9f0fa;
-  margin-top:3px;white-space:nowrap;}
+.wb-mk{font-size:clamp(11px,.6vw,13px);font-weight:700;color:#8b9bb0;white-space:nowrap;letter-spacing:.02em;}
+.wb-mv{font-family:'Roboto Mono',monospace;font-size:clamp(14px,.78vw,17.5px);font-weight:700;color:#e9f0fa;
+  margin-top:2px;white-space:nowrap;}
 
 /* 迷你表格（三大法人逐日） */
 .wb-tbl{width:100%;border-collapse:collapse;font-family:'Roboto Mono',monospace;font-size:clamp(12px,.66vw,15px);}
@@ -6415,11 +6429,11 @@ with tab_workspace:
                 _d = int(_next_earn["距離天數"])
                 _evt = _next_earn.get("事件", "")
                 if _d == 0:
-                    _earn_tag = f'<div class="quote-tag" style="background:rgba(242,169,0,0.18);color:var(--yellow);border-color:rgba(242,169,0,0.35);">📅 {_evt} 今天</div>'
+                    _earn_tag = f'<div class="quote-tag earn-tag earn-soon" title="今日有{_evt}">📅 {_evt} 今天</div>'
                 elif _d <= 14:
-                    _earn_tag = f'<div class="quote-tag" style="background:rgba(242,169,0,0.14);color:var(--yellow);border-color:rgba(242,169,0,0.3);">📅 {_evt} {_d}天</div>'
+                    _earn_tag = f'<div class="quote-tag earn-tag earn-soon" title="{_d} 天後{_evt}">📅 {_evt} {_d}天</div>'
                 else:
-                    _earn_tag = f'<div class="quote-tag" style="background:rgba(76,141,255,0.12);color:#8eb6ff;border-color:rgba(76,141,255,0.28);">📅 {_evt} {_d}天</div>'
+                    _earn_tag = f'<div class="quote-tag earn-tag earn-later" title="{_d} 天後{_evt}">📅 {_evt} {_d}天</div>'
 
             # ══════════════ 第一列：報價主卡 ／ 動作區＋候選 chips ══════════════
             head_l, head_r = st.columns([3.05, 1.95], gap="medium")
@@ -6450,7 +6464,7 @@ with tab_workspace:
                     <span class="wb-quote-name">{current_stock['name']}</span>
                     <span class="wb-quote-code">{current_stock['code']}</span>
                     <div class="quote-tag">{current_stock.get('市場別', '')}</div>
-                    <div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{_hot_tag}{_earn_tag}
+                    <div class="quote-tag" title="{current_stock.get('industry', '未分類')}">{current_stock.get('industry', '未分類')}</div>{_hot_tag}{_earn_tag}
                   </div>
                   <div class="wb-quote-body">
                     <div class="wb-quote-left">
