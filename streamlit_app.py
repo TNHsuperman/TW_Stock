@@ -7100,17 +7100,37 @@ with tab_workspace:
             # 上方六格模組是「一眼看完」的摘要；這裡完整保留原本的
             # K線／多空／公司／財務／股利／法人／資券／目標價／新聞九個檢視，
             # 內容一行未改，只是收進來不佔畫面。
-            with st.expander("🔍 完整分析明細（K線・多空・公司・財務・股利・法人・資券・目標價・新聞）",
-                             expanded=False):
-                # [新版面] 使用單一分析選單，避免九個膠囊按鈕同時擠在畫面上。
-                # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
-                st.markdown('<div class="detail-nav-title">分析內容</div>', unsafe_allow_html=True)
-                view_options = ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "📅 重要行事曆", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"]
-                view_mode = st.selectbox(
-                    "分析內容", view_options,
-                    key="detail_view_mode",
-                    label_visibility="collapsed",
-                )
+            #
+            # 切換個股時：分析內容選項要保留（不要每次回到 K線圖）。
+            # 原因：selectbox 若只放在 collapsed expander 內，部分 Streamlit 版本
+            # 在 widget 未渲染的 run 會丢掉狀態；因此用獨立的 detail_view_pref 保存。
+            view_options = [
+                "📈 K線圖", "📐 多空指標", "🏢 公司資訊", "📅 重要行事曆",
+                "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化",
+                "🎯 法人目標價", "📰 個股新聞",
+            ]
+            if "detail_view_pref" not in st.session_state:
+                st.session_state.detail_view_pref = view_options[0]
+            if st.session_state.detail_view_pref not in view_options:
+                st.session_state.detail_view_pref = view_options[0]
+
+            # 分析內容選單放在 expander 外，確保切換個股時 widget 仍會渲染、選項不會被重置
+            st.markdown('<div class="detail-nav-title">分析內容</div>', unsafe_allow_html=True)
+            if "detail_view_mode" not in st.session_state:
+                st.session_state.detail_view_mode = st.session_state.detail_view_pref
+            if st.session_state.detail_view_mode not in view_options:
+                st.session_state.detail_view_mode = st.session_state.detail_view_pref
+            view_mode = st.selectbox(
+                "分析內容", view_options,
+                key="detail_view_mode",
+                label_visibility="collapsed",
+            )
+            st.session_state.detail_view_pref = view_mode
+
+            with st.expander(
+                f"🔍 完整分析明細 · 目前：{view_mode}",
+                expanded=True,
+            ):
 
                 # ---------- K 線圖 ----------
                 if view_mode == "📈 K線圖":
