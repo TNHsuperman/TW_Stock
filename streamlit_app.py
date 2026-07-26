@@ -5399,7 +5399,7 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .quote-panel:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
 .quote-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
 .quote-title{font-size:23px;font-weight:800;letter-spacing:-.015em;}
-.quote-tag,.bias-chip{border:1px solid var(--border);background:#121e2f;border-radius:999px;padding:4px 9px;color:#aebdd0;font-size:10.5px;font-weight:700;}
+.quote-tag,.bias-chip{border:1px solid var(--border);background:#121e2f;border-radius:999px;padding:5px 11px;color:#aebdd0;font-size:12.5px;font-weight:700;}
 .quote-price{font-family:'Roboto Mono',monospace;font-size:42px;font-weight:700;color:var(--green);line-height:1.2;letter-spacing:-.04em;}
 .quote-change{font-family:'Roboto Mono',monospace;font-size:15px;font-weight:700;margin-left:9px;}
 .quote-metrics{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-top:15px;max-width:720px;}
