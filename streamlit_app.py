@@ -1256,6 +1256,186 @@ def fetch_dividend_history(code: str, market_suffix: str) -> dict:
 
 
 # ============================================================
+# [新功能] 個股／市場重要行事曆（法說會、除權息、股東會）
+# ============================================================
+# 個股：Yahoo 個股行事曆頁面
+# 市場：Yahoo 台股行事曆（法說會 / 除權息 專頁）
+# 抓不到時回傳空 list，UI 端顯示「暫無資料」，不影響其他功能（fail-open）。
+
+def _extract_stock_calendar_from_html(html: str) -> list:
+    """從 Yahoo 台股個股「行事曆」頁面解析近期重要事件。"""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    this_year = get_tw_now().year
+    year_candidates = [this_year, this_year + 1, this_year - 1]
+    pattern = r"(\d{2})/(\d{2})\s*週[一二三四五六日]\s*(法說會|除權息|股東會|董事會|停券|全額交割|暫停交易)"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        mm, dd, event = m.groups()
+        best_date = None
+        for y in year_candidates:
+            try:
+                d = datetime(y, int(mm), int(dd)).date()
+                delta = (d - get_tw_now().date()).days
+                if -60 <= delta <= 180:
+                    if best_date is None or abs(delta) < abs((best_date - get_tw_now().date()).days):
+                        best_date = d
+            except ValueError:
+                continue
+        if best_date is None:
+            continue
+        key = (best_date.isoformat(), event)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "日期": best_date.strftime("%Y-%m-%d"),
+            "事件": event,
+            "距離天數": (best_date - get_tw_now().date()).days,
+        })
+        if len(rows) >= 30:
+            break
+    rows.sort(key=lambda x: x["日期"])
+    return rows
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_stock_calendar(code: str, market_suffix: str) -> list:
+    """個股重要行事曆（法說會、除權息、股東會等）。"""
+    ticker = f"{code}.{market_suffix}"
+    try:
+        r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/calendar",
+                         headers=get_headers(), timeout=8, verify=False)
+        if r.status_code == 200 and r.text:
+            rows = _extract_stock_calendar_from_html(r.text)
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return []
+
+
+def get_next_earnings_related_event(calendar_rows: list) -> dict:
+    """優先找未來法說會，其次股東會、除權息。"""
+    if not calendar_rows:
+        return {}
+    for row in calendar_rows:
+        if row.get("距離天數", -999) >= 0 and row.get("事件") == "法說會":
+            return row
+    for row in calendar_rows:
+        if row.get("距離天數", -999) >= 0 and row.get("事件") == "股東會":
+            return row
+    for row in calendar_rows:
+        if row.get("距離天數", -999) >= 0 and row.get("事件") == "除權息":
+            return row
+    return {}
+
+
+def _extract_market_earnings_call_from_html(html: str) -> list:
+    """從 Yahoo 台股「法說會」行事曆頁面解析近期法說會。"""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    pattern = r"([^\s]{2,12})\s+(\d{4}(?:\.TW|\.TWO)?)\s+(20\d{2}/\d{2}/\d{2})\s+(\d{1,2}:\d{2})"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        name, code_raw, date_s, time_s = m.groups()
+        code = re.sub(r"\.(TW|TWO)$", "", code_raw)
+        if not re.match(r"^\d{4}", code):
+            continue
+        key = (date_s, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            d = datetime.strptime(date_s, "%Y/%m/%d").date()
+            days = (d - get_tw_now().date()).days
+        except Exception:
+            continue
+        if days < -1 or days > 60:
+            continue
+        rows.append({
+            "日期": d.strftime("%Y-%m-%d"),
+            "時間": time_s,
+            "代碼": code,
+            "名稱": name.strip(),
+            "事件": "法說會",
+            "距離天數": days,
+        })
+        if len(rows) >= 80:
+            break
+    rows.sort(key=lambda x: (x["日期"], x["時間"]))
+    return rows
+
+
+def _extract_market_dividend_from_html(html: str) -> list:
+    """從 Yahoo 台股「除權息」行事曆頁面解析近期除權息。"""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    pattern = r"([^\s]{2,16})\s+(\d{4}[A-Z]?(?:\.TW|\.TWO)?)\s+(20\d{2}/\d{2}/\d{2})\s+(20\d{2}/\d{2}/\d{2}|—|-)\s+([\d.]+)"
+    rows = []
+    seen = set()
+    for m in re.finditer(pattern, text):
+        name, code_raw, ex_date, pay_date, cash = m.groups()
+        code = re.sub(r"\.(TW|TWO)$", "", code_raw)
+        if not re.match(r"^\d{4}", code):
+            continue
+        key = (ex_date, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            d = datetime.strptime(ex_date, "%Y/%m/%d").date()
+            days = (d - get_tw_now().date()).days
+        except Exception:
+            continue
+        if days < -3 or days > 45:
+            continue
+        rows.append({
+            "日期": d.strftime("%Y-%m-%d"),
+            "代碼": code,
+            "名稱": name.strip(),
+            "事件": "除權息",
+            "現金股利": _to_float_or_nan(cash),
+            "距離天數": days,
+        })
+        if len(rows) >= 100:
+            break
+    rows.sort(key=lambda x: x["日期"])
+    return rows
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_market_calendar_events() -> dict:
+    """全市場近期重要事件：法說會 + 除權息。
+    回傳 {"法說會": [...], "除權息": [...]}。
+    """
+    result = {"法說會": [], "除權息": []}
+    try:
+        r = requests.get("https://tw.stock.yahoo.com/calendar/earnings-call",
+                         headers=get_headers(), timeout=10, verify=False)
+        if r.status_code == 200 and r.text:
+            result["法說會"] = _extract_market_earnings_call_from_html(r.text)
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://tw.stock.yahoo.com/calendar/dividend",
+                         headers=get_headers(), timeout=10, verify=False)
+        if r.status_code == 200 and r.text:
+            result["除權息"] = _extract_market_dividend_from_html(r.text)
+    except Exception:
+        pass
+    return result
+
+
+# ============================================================
 # [新功能] 個股融資融券／資券變化
 # ============================================================
 # 跟三大法人一樣，官方 TWSE/TPEx 開放資料只提供「最新一天、全市場」的融資融券，
@@ -6226,6 +6406,21 @@ with tab_workspace:
             _score_val = current_stock.get('AI評分', np.nan)
             _hot_tag = '<div class="quote-tag hot-tag">🔥 熱門股</div>' if bool(current_stock.get('熱門股', False)) else ''
 
+            # [新功能] 距離下次法說會／財報相關事件天數
+            _cal_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+            _cal_rows = fetch_stock_calendar(current_stock['code'], _cal_suffix)
+            _next_earn = get_next_earnings_related_event(_cal_rows)
+            _earn_tag = ""
+            if _next_earn and pd.notna(_next_earn.get("距離天數")) and _next_earn["距離天數"] >= 0:
+                _d = int(_next_earn["距離天數"])
+                _evt = _next_earn.get("事件", "")
+                if _d == 0:
+                    _earn_tag = f'<div class="quote-tag" style="background:rgba(242,169,0,0.18);color:var(--yellow);border-color:rgba(242,169,0,0.35);">📅 {_evt} 今天</div>'
+                elif _d <= 14:
+                    _earn_tag = f'<div class="quote-tag" style="background:rgba(242,169,0,0.14);color:var(--yellow);border-color:rgba(242,169,0,0.3);">📅 {_evt} {_d}天</div>'
+                else:
+                    _earn_tag = f'<div class="quote-tag" style="background:rgba(76,141,255,0.12);color:#8eb6ff;border-color:rgba(76,141,255,0.28);">📅 {_evt} {_d}天</div>'
+
             # ══════════════ 第一列：報價主卡 ／ 動作區＋候選 chips ══════════════
             head_l, head_r = st.columns([3.05, 1.95], gap="medium")
 
@@ -6255,7 +6450,7 @@ with tab_workspace:
                     <span class="wb-quote-name">{current_stock['name']}</span>
                     <span class="wb-quote-code">{current_stock['code']}</span>
                     <div class="quote-tag">{current_stock.get('市場別', '')}</div>
-                    <div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{_hot_tag}
+                    <div class="quote-tag">{current_stock.get('industry', '未分類')}</div>{_hot_tag}{_earn_tag}
                   </div>
                   <div class="wb-quote-body">
                     <div class="wb-quote-left">
@@ -6808,7 +7003,7 @@ with tab_workspace:
                 # [新版面] 使用單一分析選單，避免九個膠囊按鈕同時擠在畫面上。
                 # 選一次股票、切換這裡即可，不會重新觸發選股、也不會弄丟左側清單。
                 st.markdown('<div class="detail-nav-title">分析內容</div>', unsafe_allow_html=True)
-                view_options = ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"]
+                view_options = ["📈 K線圖", "📐 多空指標", "🏢 公司資訊", "📅 重要行事曆", "🩺 財務體質", "💵 股利政策", "💰 三大法人", "📊 資券變化", "🎯 法人目標價", "📰 個股新聞"]
                 view_mode = st.selectbox(
                     "分析內容", view_options,
                     key="detail_view_mode",
@@ -6881,6 +7076,51 @@ with tab_workspace:
                         st.caption("多空各項指標為市場常見的獨立技術分析工具，彼此可能出現不一致的訊號（例如趨勢指標偏多、短線震盪指標偏空），這是正常現象；綜合判讀僅是「多空指標數量對比」，不代表保證漲跌，仍請自行評估風險。")
                     else:
                         st.info("目前無法取得足夠的歷史 K 線資料計算多空指標（需至少 60 個交易日），可能是新股或資料來源暫時無回應，請稍後再試。")
+
+                # ---------- 重要行事曆（法說會／除權息／股東會）----------
+                elif view_mode == "📅 重要行事曆":
+                    market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 重要行事曆</div><div class="section-help">資料來源：Yahoo 股市個股「行事曆」頁面；法說會通常與財報公布高度相關，僅供參考，實際日期以公司公告為準。</div></div></div>', unsafe_allow_html=True)
+
+                    cal_rows = fetch_stock_calendar(current_stock['code'], market_suffix)
+                    next_event = get_next_earnings_related_event(cal_rows)
+
+                    if next_event:
+                        days = next_event.get("距離天數", np.nan)
+                        if pd.notna(days) and days >= 0:
+                            if days == 0:
+                                days_txt, days_color = "今天", "var(--yellow)"
+                            elif days <= 7:
+                                days_txt, days_color = f"{int(days)} 天", "var(--yellow)"
+                            else:
+                                days_txt, days_color = f"{int(days)} 天", "#8eb6ff"
+                        else:
+                            days_txt, days_color = "N/A", "#8f9bad"
+                        st.markdown(f"""
+                        <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px;">
+                          <div class="tv-card"><div class="tv-label">下次重要事件</div><div class="tv-value" style="font-size:18px;">{next_event.get('事件', 'N/A')}</div><div class="tv-caption">{next_event.get('日期', '')}</div></div>
+                          <div class="tv-card"><div class="tv-label">距離天數</div><div class="tv-value" style="color:{days_color};">{days_txt}</div><div class="tv-caption">以今日為基準</div></div>
+                          <div class="tv-card"><div class="tv-label">說明</div><div class="tv-value" style="font-size:15px;">{"法說會 ≈ 財報時點" if next_event.get('事件') == '法說會' else next_event.get('事件', '')}</div><div class="tv-caption">優先顯示法說會</div></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.info("目前無法取得近期重要事件，可能是資料來源暫時無回應，或近期沒有已公告的法說會／除權息／股東會。")
+
+                    if cal_rows:
+                        future_rows = [r for r in cal_rows if r.get("距離天數", -999) >= -7]
+                        if future_rows:
+                            cal_df = pd.DataFrame(future_rows)
+                            st.dataframe(
+                                cal_df, hide_index=True, use_container_width=True,
+                                column_config={
+                                    "日期": st.column_config.TextColumn("日期", width=100),
+                                    "事件": st.column_config.TextColumn("事件類型", width=100),
+                                    "距離天數": st.column_config.NumberColumn("距離（天）", width=90, format="%+d"),
+                                }
+                            )
+                            st.caption("正數＝未來天數，0＝今天，負數＝已過。")
+                    else:
+                        st.caption("若持續無法取得資料，可直接到 Yahoo 股市個股頁面查看最新行事曆。")
 
                 # ---------- 公司資訊：公司簡介 + 季度 EPS 列表（ETF 改顯示成分股占比）----------
                 elif view_mode == "🏢 公司資訊":
@@ -7990,189 +8230,263 @@ with tab_market:
     mp_market = "TW" if mp_market_label == "上市" else "TWO"
 
     mp_sub = st.radio(
-        "檢視", ["📊 產業類股表現", "📈 個股漲跌分布"], horizontal=True,
+        "檢視", ["📊 產業類股表現", "📈 個股漲跌分布", "📅 市場行事曆"], horizontal=True,
         key="market_pulse_view", label_visibility="collapsed",
     )
 
-    with st.spinner("正在從證交所／櫃買中心取得市場資料…"):
-        pulse = build_market_pulse(mp_market)
-
-    if pulse and pulse.get("is_cached"):
-        cached_at = pulse.get("saved_at", "")
-        st.info(f"官方 API 暫時無法連線，現顯示最近一次成功快取{f'（{cached_at}）' if cached_at else ''}。")
-    elif pulse:
-        quote_date = pulse.get("quote_date", "")
-        if quote_date:
-            st.caption(f"官方最新資料日期：{quote_date}")
-
-    if not pulse:
-        st.warning(
-            f"目前無法取得{mp_market_label}官方行情，且尚無可用快取。"
-            "請稍後重新整理；首次部署若遇休市日，待下一個交易日成功抓取後便會建立快取。"
+    if mp_sub == "📅 市場行事曆":
+        st.markdown(
+            '<div class="section-head" style="margin-top:8px;"><div>'
+            '<div class="section-title" style="font-size:16px;">市場重要行事曆</div>'
+            '<div class="section-help">近期法說會與除權息一覽，資料來源：Yahoo 股市台股行事曆；'
+            '法說會通常與財報公布高度相關，僅供參考，實際日期以公司公告為準。</div>'
+            '</div></div>',
+            unsafe_allow_html=True,
         )
-    elif mp_sub == "📊 產業類股表現":
-        ind = pulse.get("industry", pd.DataFrame())
-        if ind.empty:
-            coverage = float(pulse.get("industry_coverage", 0) or 0)
-            st.warning(
-                "個股行情已取得，但公司產業對照資料暫時不可用。"
-                f"目前產業覆蓋率為 {coverage:.0%}；可先切換至「個股漲跌分布」，系統也會持續使用最近成功快取。"
-            )
-        else:
-            _industry_method = pulse.get("industry_method", "official_index")
-            if _industry_method == "equal_weight_fallback":
-                st.warning(
-                    "官方類股指數端點目前暫時無法取得，以下漲跌幅為成分股等權平均備援；"
-                    "此口徑不會與玩股網完全一致。官方指數恢復後會自動切回正確口徑。"
-                )
-            elif _industry_method == "official_index_cache":
-                st.info("目前類股漲跌幅沿用同一交易日最近成功取得的官方指數快取。")
+        with st.spinner("正在載入市場行事曆…"):
+            cal_data = fetch_market_calendar_events()
 
-            pm_mode = st.radio(
-                "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
-                key="market_pulse_ind_mode", label_visibility="collapsed",
-            )
-            _val_col = "漲跌%" if pm_mode != "成交比重" else "成交比重%"
-            if pm_mode == "漲幅":
-                view = ind.sort_values("漲跌%", ascending=False).head(15)
-            elif pm_mode == "跌幅":
-                view = ind.sort_values("漲跌%", ascending=True).head(15)
-            else:
-                if "成交比重%" not in ind.columns:
-                    st.info("此市場的資料未包含成交比重欄位。")
-                    view = ind.head(0)
-                else:
-                    view = ind.sort_values("成交比重%", ascending=False).head(15)
+        earn_rows = cal_data.get("法說會", [])
+        div_rows = cal_data.get("除權息", [])
 
-            if not view.empty:
-                if _val_col == "漲跌%":
-                    colors = ["#e0505a" if v >= 0 else "#3fae7a" for v in view[_val_col]]
-                    texts = [f"{v:+.2f}%" for v in view[_val_col]]
-                else:
-                    colors = ["#6ea8fe"] * len(view)
-                    texts = [f"{v:.2f}%" for v in view[_val_col]]
+        cal_type = st.radio(
+            "事件類型", ["法說會（財報相關）", "除權息"], horizontal=True,
+            key="market_cal_type", label_visibility="collapsed",
+        )
 
-                fig = go.Figure(go.Bar(
-                    x=view["類股"], y=view[_val_col],
-                    marker_color=colors, text=texts, textposition="outside",
-                    hovertemplate="%{x}<br>%{y:.2f}%<extra></extra>",
-                ))
-                fig.update_layout(
-                    height=420, template="plotly_dark",
-                    paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
-                    margin=dict(l=10, r=10, t=30, b=10),
-                    xaxis=dict(tickangle=-30, tickfont=dict(size=13)),
-                    yaxis=dict(gridcolor="rgba(148,163,184,0.10)",
-                               title="漲跌幅 (%)" if _val_col == "漲跌%" else "成交比重 (%)"),
-                    showlegend=False,
-                )
-                st.plotly_chart(fig, use_container_width=True, key=f"mp_ind_{mp_market}_{pm_mode}")
-
-            if pulse.get("industry_method") in ("official_index", "official_index_cache"):
-                st.caption(
-                    f"資料來源：{pulse.get('index_source', '證交所／櫃買中心官方類股指數')}。"
-                    f"{mp_market_label}類股漲跌幅直接採官方價格指數，與玩股網類股行情屬相同計算口徑；"
-                    "成交比重則依官方個股成交額彙總。"
-                )
-            else:
-                st.caption(
-                    "資料來源：證交所／櫃買中心官方個股行情。"
-                    "目前為成分股等權平均備援，不能直接拿來與玩股網的類股價格指數比較。"
-                )
-
-            with st.expander("完整產業列表", expanded=False):
-                _asc = pm_mode == "跌幅"
-                show = ind.sort_values(_val_col if _val_col in ind.columns else "漲跌%",
-                                       ascending=_asc).copy()
-                show_cols = ["類股", "漲跌%"]
-                if "成交比重%" in show.columns:
-                    show_cols.append("成交比重%")
-                if "成交額" in show.columns:
-                    show_cols.append("成交額")
-
-                def _mp_color_tw(val):
-                    if pd.isna(val): return ''
-                    c = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
-                    return f'color: {c}; font-weight: bold'
-
+        if cal_type.startswith("法說會"):
+            if earn_rows:
+                near = [r for r in earn_rows if 0 <= r.get("距離天數", 999) <= 14]
+                st.markdown(f"""
+                <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px;">
+                  <div class="tv-card"><div class="tv-label">近期法說會</div><div class="tv-value">{len(earn_rows)}</div><div class="tv-caption">已公告場次</div></div>
+                  <div class="tv-card"><div class="tv-label">14 天內</div><div class="tv-value" style="color:var(--yellow);">{len(near)}</div><div class="tv-caption">需特別留意</div></div>
+                  <div class="tv-card"><div class="tv-label">最近一場</div><div class="tv-value" style="font-size:16px;">{earn_rows[0].get('名稱','')} ({earn_rows[0].get('代碼','')})</div><div class="tv-caption">{earn_rows[0].get('日期','')} {earn_rows[0].get('時間','')}</div></div>
+                </div>
+                """, unsafe_allow_html=True)
+                earn_df = pd.DataFrame(earn_rows)
                 st.dataframe(
-                    show[show_cols].style.map(
-                        _mp_color_tw, subset=["漲跌%"]),
-                    use_container_width=True, hide_index=True,
+                    earn_df, hide_index=True, use_container_width=True,
                     column_config={
-                        "類股": st.column_config.TextColumn("類股"),
-                        "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
-                        "成交比重%": st.column_config.NumberColumn("成交比重", format="%.2f%%"),
-                        "成交額": st.column_config.NumberColumn("成交額(億)", format="%.1f"),
+                        "日期": st.column_config.TextColumn("日期", width=95),
+                        "時間": st.column_config.TextColumn("時間", width=70),
+                        "代碼": st.column_config.TextColumn("代碼", width=70),
+                        "名稱": st.column_config.TextColumn("名稱", width=100),
+                        "事件": st.column_config.TextColumn("事件", width=70),
+                        "距離天數": st.column_config.NumberColumn("距離(天)", width=80, format="%+d"),
                     },
                 )
-
-    else:  # 個股漲跌分布
-        breadth = pulse.get("breadth", {})
-        distribution = pulse.get("distribution", {})
-        if not breadth or not distribution:
-            st.warning("無法取得漲跌家數分布，請稍後再試。")
+                st.caption("法說會通常會同步公布或討論最新季度財報與營運展望，是重要觀察時點。資料來源：Yahoo 股市。")
+            else:
+                st.info("目前無法取得法說會行事曆，可能是資料來源暫時無回應，請稍後再試。")
+                st.link_button("開啟 Yahoo 法說會行事曆", "https://tw.stock.yahoo.com/calendar/earnings-call")
         else:
-            # 依使用者指定的圖二順序：漲停 → 5% → 2.5% → 0.2% → 平盤 → 負向區間 → 跌停。
-            labels = ["漲停", "5%", "2.5%", "0.2%", "平盤", "-0.2%", "-2.5%", "-5%", "跌停"]
-            values = [int(distribution.get(k, 0) or 0) for k in labels]
-            ranges = [
-                "≥ +9.5%", "+5.0% ～ < +9.5%", "+2.5% ～ < +5.0%",
-                "> +0.2% ～ < +2.5%", "-0.2% ～ +0.2%",
-                "> -2.5% ～ < -0.2%", "> -5.0% ～ ≤ -2.5%",
-                "> -9.5% ～ ≤ -5.0%", "≤ -9.5%",
-            ]
-            bar_colors = [
-                "#b8323e", "#cf4653", "#df6973", "#efa0a7", "#94a3b8",
-                "#b4ddc9", "#82cba9", "#4eb282", "#2f8f68",
-            ]
+            if div_rows:
+                near_div = [r for r in div_rows if 0 <= r.get("距離天數", 999) <= 7]
+                st.markdown(f"""
+                <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px;">
+                  <div class="tv-card"><div class="tv-label">近期除權息</div><div class="tv-value">{len(div_rows)}</div><div class="tv-caption">已公告</div></div>
+                  <div class="tv-card"><div class="tv-label">7 天內</div><div class="tv-value" style="color:var(--yellow);">{len(near_div)}</div><div class="tv-caption">即將除權息</div></div>
+                  <div class="tv-card"><div class="tv-label">最近一檔</div><div class="tv-value" style="font-size:16px;">{div_rows[0].get('名稱','')} ({div_rows[0].get('代碼','')})</div><div class="tv-caption">{div_rows[0].get('日期','')}・現金 {fmt_num(div_rows[0].get('現金股利'), '{:.2f}')}</div></div>
+                </div>
+                """, unsafe_allow_html=True)
+                div_df = pd.DataFrame(div_rows)
+                st.dataframe(
+                    div_df, hide_index=True, use_container_width=True,
+                    column_config={
+                        "日期": st.column_config.TextColumn("除權息日", width=95),
+                        "代碼": st.column_config.TextColumn("代碼", width=70),
+                        "名稱": st.column_config.TextColumn("名稱", width=100),
+                        "事件": st.column_config.TextColumn("事件", width=70),
+                        "現金股利": st.column_config.NumberColumn("現金股利", width=90, format="%.2f"),
+                        "距離天數": st.column_config.NumberColumn("距離(天)", width=80, format="%+d"),
+                    },
+                )
+                st.caption("除權息當日股價通常會調整，填息速度與殖利率可作為參考；實際發放與除權息日以公司公告為準。")
+            else:
+                st.info("目前無法取得除權息行事曆，可能是資料來源暫時無回應，請稍後再試。")
+                st.link_button("開啟 Yahoo 除權息行事曆", "https://tw.stock.yahoo.com/calendar/dividend")
 
-            fig = go.Figure(go.Bar(
-                x=labels, y=values, marker_color=bar_colors,
-                customdata=ranges,
-                text=[f"{v:,}" for v in values], textposition="outside",
-                hovertemplate="%{x}<br>區間：%{customdata}<br>%{y:,} 檔<extra></extra>",
-            ))
-            fig.update_layout(
-                height=440, template="plotly_dark",
-                paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
-                margin=dict(l=10, r=10, t=30, b=55),
-                xaxis=dict(
-                    categoryorder="array", categoryarray=labels,
-                    tickangle=-35, tickfont=dict(size=13),
-                ),
-                yaxis=dict(gridcolor="rgba(148,163,184,0.10)", title="家數", rangemode="tozero"),
-                showlegend=False,
+    else:
+        with st.spinner("正在從證交所／櫃買中心取得市場資料…"):
+            pulse = build_market_pulse(mp_market)
+
+        if pulse and pulse.get("is_cached"):
+            cached_at = pulse.get("saved_at", "")
+            st.info(f"官方 API 暫時無法連線，現顯示最近一次成功快取{f'（{cached_at}）' if cached_at else ''}。")
+        elif pulse:
+            quote_date = pulse.get("quote_date", "")
+            if quote_date:
+                st.caption(f"官方最新資料日期：{quote_date}")
+
+        if not pulse:
+            st.warning(
+                f"目前無法取得{mp_market_label}官方行情，且尚無可用快取。"
+                "請稍後重新整理；首次部署若遇休市日，待下一個交易日成功抓取後便會建立快取。"
             )
-            st.plotly_chart(fig, use_container_width=True, key=f"mp_dist_v2_{mp_market}")
+        elif mp_sub == "📊 產業類股表現":
+            ind = pulse.get("industry", pd.DataFrame())
+            if ind.empty:
+                coverage = float(pulse.get("industry_coverage", 0) or 0)
+                st.warning(
+                    "個股行情已取得，但公司產業對照資料暫時不可用。"
+                    f"目前產業覆蓋率為 {coverage:.0%}；可先切換至「個股漲跌分布」，系統也會持續使用最近成功快取。"
+                )
+            else:
+                _industry_method = pulse.get("industry_method", "official_index")
+                if _industry_method == "equal_weight_fallback":
+                    st.warning(
+                        "官方類股指數端點目前暫時無法取得，以下漲跌幅為成分股等權平均備援；"
+                        "此口徑不會與玩股網完全一致。官方指數恢復後會自動切回正確口徑。"
+                    )
+                elif _industry_method == "official_index_cache":
+                    st.info("目前類股漲跌幅沿用同一交易日最近成功取得的官方指數快取。")
 
-            st.caption(
-                "分類門檻：漲停 ≥ 9.5%；5% 為 5～未滿 9.5%；2.5% 為 2.5～未滿 5%；"
-                "0.2% 為大於 0.2～未滿 2.5%；平盤為 -0.2～+0.2%；負向區間採對稱門檻。"
-            )
+                pm_mode = st.radio(
+                    "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
+                    key="market_pulse_ind_mode", label_visibility="collapsed",
+                )
+                _val_col = "漲跌%" if pm_mode != "成交比重" else "成交比重%"
+                if pm_mode == "漲幅":
+                    view = ind.sort_values("漲跌%", ascending=False).head(15)
+                elif pm_mode == "跌幅":
+                    view = ind.sort_values("漲跌%", ascending=True).head(15)
+                else:
+                    if "成交比重%" not in ind.columns:
+                        st.info("此市場的資料未包含成交比重欄位。")
+                        view = ind.head(0)
+                    else:
+                        view = ind.sort_values("成交比重%", ascending=False).head(15)
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(
-                    f'<div class="tv-card"><div class="tv-label">上漲家數</div>'
-                    f'<div class="tv-value" style="color:#e0505a;">{breadth.get("上漲", 0):,}</div>'
-                    f'<div class="tv-caption">含漲停 {breadth.get("漲停", 0):,} 檔</div></div>',
-                    unsafe_allow_html=True)
-            with c2:
-                st.markdown(
-                    f'<div class="tv-card"><div class="tv-label">紅K / 黑K</div>'
-                    f'<div class="tv-value" style="color:#e6edf3;">'
-                    f'{breadth.get("紅K", 0):,} / {breadth.get("黑K", 0):,}</div>'
-                    f'<div class="tv-caption">收盤高於開盤為紅K</div></div>',
-                    unsafe_allow_html=True)
-            with c3:
-                st.markdown(
-                    f'<div class="tv-card"><div class="tv-label">下跌家數</div>'
-                    f'<div class="tv-value" style="color:#3fae7a;">{breadth.get("下跌", 0):,}</div>'
-                    f'<div class="tv-caption">含跌停 {breadth.get("跌停", 0):,} 檔</div></div>',
-                    unsafe_allow_html=True)
+                if not view.empty:
+                    if _val_col == "漲跌%":
+                        colors = ["#e0505a" if v >= 0 else "#3fae7a" for v in view[_val_col]]
+                        texts = [f"{v:+.2f}%" for v in view[_val_col]]
+                    else:
+                        colors = ["#6ea8fe"] * len(view)
+                        texts = [f"{v:.2f}%" for v in view[_val_col]]
 
-            st.caption(
-                f"資料來源：證交所／櫃買中心官方 OpenAPI。"
-                f"漲跌家數為{mp_market_label}一般股票最新收盤行情統計。"
-            )
+                    fig = go.Figure(go.Bar(
+                        x=view["類股"], y=view[_val_col],
+                        marker_color=colors, text=texts, textposition="outside",
+                        hovertemplate="%{x}<br>%{y:.2f}%<extra></extra>",
+                    ))
+                    fig.update_layout(
+                        height=420, template="plotly_dark",
+                        paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        xaxis=dict(tickangle=-30, tickfont=dict(size=13)),
+                        yaxis=dict(gridcolor="rgba(148,163,184,0.10)",
+                                   title="漲跌幅 (%)" if _val_col == "漲跌%" else "成交比重 (%)"),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"mp_ind_{mp_market}_{pm_mode}")
+
+                if pulse.get("industry_method") in ("official_index", "official_index_cache"):
+                    st.caption(
+                        f"資料來源：{pulse.get('index_source', '證交所／櫃買中心官方類股指數')}。"
+                        f"{mp_market_label}類股漲跌幅直接採官方價格指數，與玩股網類股行情屬相同計算口徑；"
+                        "成交比重則依官方個股成交額彙總。"
+                    )
+                else:
+                    st.caption(
+                        "資料來源：證交所／櫃買中心官方個股行情。"
+                        "目前為成分股等權平均備援，不能直接拿來與玩股網的類股價格指數比較。"
+                    )
+
+                with st.expander("完整產業列表", expanded=False):
+                    _asc = pm_mode == "跌幅"
+                    show = ind.sort_values(_val_col if _val_col in ind.columns else "漲跌%",
+                                           ascending=_asc).copy()
+                    show_cols = ["類股", "漲跌%"]
+                    if "成交比重%" in show.columns:
+                        show_cols.append("成交比重%")
+                    if "成交額" in show.columns:
+                        show_cols.append("成交額")
+
+                    def _mp_color_tw(val):
+                        if pd.isna(val): return ''
+                        c = '#22ab94' if val > 0 else '#f23645' if val < 0 else '#e6edf3'
+                        return f'color: {c}; font-weight: bold'
+
+                    st.dataframe(
+                        show[show_cols].style.map(
+                            _mp_color_tw, subset=["漲跌%"]),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "類股": st.column_config.TextColumn("類股"),
+                            "漲跌%": st.column_config.NumberColumn("漲跌%", format="%.2f%%"),
+                            "成交比重%": st.column_config.NumberColumn("成交比重", format="%.2f%%"),
+                            "成交額": st.column_config.NumberColumn("成交額(億)", format="%.1f"),
+                        },
+                    )
+
+        elif mp_sub == "📈 個股漲跌分布":
+            breadth = pulse.get("breadth", {})
+            distribution = pulse.get("distribution", {})
+            if not breadth or not distribution:
+                st.warning("無法取得漲跌家數分布，請稍後再試。")
+            else:
+                # 依使用者指定的圖二順序：漲停 → 5% → 2.5% → 0.2% → 平盤 → 負向區間 → 跌停。
+                labels = ["漲停", "5%", "2.5%", "0.2%", "平盤", "-0.2%", "-2.5%", "-5%", "跌停"]
+                values = [int(distribution.get(k, 0) or 0) for k in labels]
+                ranges = [
+                    "≥ +9.5%", "+5.0% ～ < +9.5%", "+2.5% ～ < +5.0%",
+                    "> +0.2% ～ < +2.5%", "-0.2% ～ +0.2%",
+                    "> -2.5% ～ < -0.2%", "> -5.0% ～ ≤ -2.5%",
+                    "> -9.5% ～ ≤ -5.0%", "≤ -9.5%",
+                ]
+                bar_colors = [
+                    "#b8323e", "#cf4653", "#df6973", "#efa0a7", "#94a3b8",
+                    "#b4ddc9", "#82cba9", "#4eb282", "#2f8f68",
+                ]
+
+                fig = go.Figure(go.Bar(
+                    x=labels, y=values, marker_color=bar_colors,
+                    customdata=ranges,
+                    text=[f"{v:,}" for v in values], textposition="outside",
+                    hovertemplate="%{x}<br>區間：%{customdata}<br>%{y:,} 檔<extra></extra>",
+                ))
+                fig.update_layout(
+                    height=440, template="plotly_dark",
+                    paper_bgcolor="#0d1624", plot_bgcolor="#0d1624",
+                    margin=dict(l=10, r=10, t=30, b=55),
+                    xaxis=dict(
+                        categoryorder="array", categoryarray=labels,
+                        tickangle=-35, tickfont=dict(size=13),
+                    ),
+                    yaxis=dict(gridcolor="rgba(148,163,184,0.10)", title="家數", rangemode="tozero"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"mp_dist_v2_{mp_market}")
+
+                st.caption(
+                    "分類門檻：漲停 ≥ 9.5%；5% 為 5～未滿 9.5%；2.5% 為 2.5～未滿 5%；"
+                    "0.2% 為大於 0.2～未滿 2.5%；平盤為 -0.2～+0.2%；負向區間採對稱門檻。"
+                )
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown(
+                        f'<div class="tv-card"><div class="tv-label">上漲家數</div>'
+                        f'<div class="tv-value" style="color:#e0505a;">{breadth.get("上漲", 0):,}</div>'
+                        f'<div class="tv-caption">含漲停 {breadth.get("漲停", 0):,} 檔</div></div>',
+                        unsafe_allow_html=True)
+                with c2:
+                    st.markdown(
+                        f'<div class="tv-card"><div class="tv-label">紅K / 黑K</div>'
+                        f'<div class="tv-value" style="color:#e6edf3;">'
+                        f'{breadth.get("紅K", 0):,} / {breadth.get("黑K", 0):,}</div>'
+                        f'<div class="tv-caption">收盤高於開盤為紅K</div></div>',
+                        unsafe_allow_html=True)
+                with c3:
+                    st.markdown(
+                        f'<div class="tv-card"><div class="tv-label">下跌家數</div>'
+                        f'<div class="tv-value" style="color:#3fae7a;">{breadth.get("下跌", 0):,}</div>'
+                        f'<div class="tv-caption">含跌停 {breadth.get("跌停", 0):,} 檔</div></div>',
+                        unsafe_allow_html=True)
+
+                st.caption(
+                    f"資料來源：證交所／櫃買中心官方 OpenAPI。"
+                    f"漲跌家數為{mp_market_label}一般股票最新收盤行情統計。"
+                )
