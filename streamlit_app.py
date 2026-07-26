@@ -1069,6 +1069,8 @@ def _fetch_analyst_from_anue(code: str) -> list:
         target_price = _to_float_or_nan(row.get("目標價"))
         if pd.isna(target_price) or target_price <= 0:
             continue
+        # Anue 表格的「現價」是頁面當下報價、每一列都相同，
+        # 並非該評等日期的歷史收盤，若當成「當時股價」會誤導，故不採用。
         rows.append({
             "評等日期": date_txt,
             "券商": _clean_rating_txt(row.get("券商"), "N/A"),
@@ -1076,7 +1078,7 @@ def _fetch_analyst_from_anue(code: str) -> list:
             "升降": _clean_rating_txt(row.get("升/降")),
             "財測EPS": _clean_rating_txt(row.get("財測EPS(年度)")),
             "目標價": target_price,
-            "現價": _to_float_or_nan(row.get("現價")),
+            "現價": np.nan,
             "來源": "Anue",
         })
         if len(rows) >= 30:
@@ -7787,11 +7789,11 @@ with tab_workspace:
                                 "升降": st.column_config.TextColumn("升降", width=60),
                                 "財測EPS": st.column_config.TextColumn("財測EPS(年度)", width=100),
                                 "目標價": st.column_config.NumberColumn("目標價", width=80, format="%.1f"),
-                                "現價": st.column_config.NumberColumn("當時股價", width=80, format="%.2f"),
+                                "現價": st.column_config.NumberColumn("參考現價", width=80, format="%.2f"),
                                 "來源": st.column_config.TextColumn("來源", width=70),
                             }
                         )
-                        st.caption("「近N筆平均目標價」取最近10筆評等平均（非近10天）。主來源 Anue 為券商逐筆歷史；備援 Yahoo 為分析師共識均價／高低價，覆蓋率較低。目標價僅供參考，非投資建議。")
+                        st.caption("「近N筆平均目標價」取最近10筆評等平均（非近10天）。Anue 不提供評等當日歷史股價，故「參考現價」欄僅在 Yahoo 備援時顯示共識當下價格。目標價僅供參考，非投資建議。")
                     else:
                         st.info("目前無法取得法人目標價資料，可能是這檔股票近期沒有外資／券商發布評等報告，或資料來源暫時無回應，請稍後再試。")
 
