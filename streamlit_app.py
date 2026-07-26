@@ -1027,17 +1027,21 @@ def _institutional_streak(rows: list, field: str) -> dict:
 # ============================================================
 # [新功能] 個股法人（外資／券商）目標價
 # ============================================================
-# 券商／外資評等報告本身是付費資訊，沒有官方免費 API；Anue鉅亨網「外資評等」頁面
-# 是公開網頁、不需登入即可查看，且用標準 HTML <table> 呈現（不像 Yahoo 河流圖需要
-# JS 動態渲染），適合用 pd.read_html 解析——這也是本檔案原本解析本益比表格時
-# 就在用的手法（見 _load_twse_pe 附近），維持同一套作法。
-# 抓不到資料一律回傳空 list／{}，UI 端顯示「暫無資料」，不影響其他功能（fail-open）。
+# 主來源：Anue鉅亨網「外資評等」公開表格（券商逐筆歷史）。
+# 備援來源：Yahoo Finance 分析師共識（targetMean/High/Low + 評等），
+#          Anue 抓不到或為空時自動啟用（fail-open）。
+# 券商報告本身多為付費資訊，沒有官方免費完整 API。
 
-@st.cache_data(ttl=21600, show_spinner=False)  # 評等不會逐分鐘變動，快取拉長到 6 小時
-def fetch_analyst_target_price(code: str) -> list:
-    """個股法人（外資／券商）評等與目標價紀錄，最新一筆在最前面。
-    來源：Anue鉅亨網「外資評等」頁面。
-    """
+def _clean_rating_txt(v, default="--"):
+    """把 pandas NaN 安全轉成預設字串，避免 str(np.nan) 變成字面上的 'nan'。"""
+    if pd.isna(v):
+        return default
+    s = str(v).strip()
+    return s if s else default
+
+
+def _fetch_analyst_from_anue(code: str) -> list:
+    """Anue 鉅亨「外資評等」表格。成功回傳列，失敗回傳 []。"""
     url = f"https://www.cnyes.com/twstock/foreignrating.aspx?code={code}"
     try:
         r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
@@ -1057,33 +1061,90 @@ def fetch_analyst_target_price(code: str) -> list:
         return []
 
     target_df = target_df.rename(columns=lambda c: str(c).strip())
-
-    def _clean_txt(v, default="--"):
-        """把 pandas NaN 安全轉成預設字串，避免 str(np.nan) 變成字面上的 'nan'。"""
-        if pd.isna(v):
-            return default
-        s = str(v).strip()
-        return s if s else default
-
     rows = []
     for _, row in target_df.iterrows():
         date_raw = re.sub(r"\D", "", str(row.get("評等日期", "")))
-        date_txt = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}" if len(date_raw) == 8 else str(row.get("評等日期", "")).strip()
+        date_txt = (f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+                    if len(date_raw) == 8 else str(row.get("評等日期", "")).strip())
         target_price = _to_float_or_nan(row.get("目標價"))
         if pd.isna(target_price) or target_price <= 0:
-            continue  # 目標價是「--」的列（例如只更新財測、沒更新目標價）先濾掉
+            continue
         rows.append({
             "評等日期": date_txt,
-            "券商": _clean_txt(row.get("券商"), "N/A"),
-            "新評等": _clean_txt(row.get("新評等")),
-            "升降": _clean_txt(row.get("升/降")),
-            "財測EPS": _clean_txt(row.get("財測EPS(年度)")),
+            "券商": _clean_rating_txt(row.get("券商"), "N/A"),
+            "新評等": _clean_rating_txt(row.get("新評等")),
+            "升降": _clean_rating_txt(row.get("升/降")),
+            "財測EPS": _clean_rating_txt(row.get("財測EPS(年度)")),
             "目標價": target_price,
             "現價": _to_float_or_nan(row.get("現價")),
+            "來源": "Anue",
         })
-        if len(rows) >= 30:  # 最多近 30 筆評等紀錄，避免表格太長
+        if len(rows) >= 30:
             break
     return rows
+
+
+def _fetch_analyst_from_yahoo(code: str, market_suffix: str = "TW") -> list:
+    """Yahoo Finance 分析師共識目標價（備援）。
+    只有共識均價／高低價與評等，沒有逐家券商歷史；成功時合成 1～3 筆列。
+    """
+    ticker = f"{code}.{market_suffix}"
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return []
+
+    mean_t = _to_float_or_nan(info.get("targetMeanPrice"))
+    high_t = _to_float_or_nan(info.get("targetHighPrice"))
+    low_t = _to_float_or_nan(info.get("targetLowPrice"))
+    cur = _to_float_or_nan(info.get("currentPrice") or info.get("regularMarketPrice"))
+    rec = _clean_rating_txt(info.get("recommendationKey"), "--")
+    rec_map = {
+        "strong_buy": "強力買進", "buy": "買進", "hold": "中立",
+        "underperform": "表現落後", "sell": "賣出", "none": "--",
+    }
+    rec_zh = rec_map.get(str(rec).lower(), rec if rec != "--" else "--")
+    n_analysts = info.get("numberOfAnalystOpinions")
+    n_txt = f"{int(n_analysts)} 家" if pd.notna(n_analysts) and n_analysts else "共識"
+
+    if pd.isna(mean_t) or mean_t <= 0:
+        return []
+
+    today = get_tw_now().strftime("%Y-%m-%d")
+    rows = [{
+        "評等日期": today,
+        "券商": f"Yahoo共識（{n_txt}）",
+        "新評等": rec_zh,
+        "升降": "--",
+        "財測EPS": "--",
+        "目標價": float(mean_t),
+        "現價": cur,
+        "來源": "Yahoo",
+    }]
+    if pd.notna(high_t) and high_t > 0 and abs(high_t - mean_t) / mean_t > 0.01:
+        rows.append({
+            "評等日期": today, "券商": "Yahoo共識高價", "新評等": rec_zh,
+            "升降": "--", "財測EPS": "--", "目標價": float(high_t),
+            "現價": cur, "來源": "Yahoo",
+        })
+    if pd.notna(low_t) and low_t > 0 and abs(low_t - mean_t) / mean_t > 0.01:
+        rows.append({
+            "評等日期": today, "券商": "Yahoo共識低價", "新評等": rec_zh,
+            "升降": "--", "財測EPS": "--", "目標價": float(low_t),
+            "現價": cur, "來源": "Yahoo",
+        })
+    return rows
+
+
+@st.cache_data(ttl=21600, show_spinner=False)  # 評等不會逐分鐘變動，快取 6 小時
+def fetch_analyst_target_price(code: str, market_suffix: str = "TW") -> list:
+    """個股法人目標價：主來源 Anue，失敗或空白時自動改抓 Yahoo 共識。
+    回傳列（最新在前）；每列含「來源」欄位（Anue / Yahoo）。
+    """
+    rows = _fetch_analyst_from_anue(str(code))
+    if rows:
+        return rows
+    return _fetch_analyst_from_yahoo(str(code), market_suffix or "TW")
 
 
 def summarize_target_price(rows: list, current_price: float) -> dict:
@@ -1095,12 +1156,13 @@ def summarize_target_price(rows: list, current_price: float) -> dict:
     prices = [r["目標價"] for r in rows if pd.notna(r["目標價"])]
     if not prices:
         return {}
-    recent = prices[:10]  # 近10筆評等紀錄（不是近10天），避免太舊的目標價拉低平均
+    recent = prices[:10]
     avg_target = float(np.mean(recent))
     upside = np.nan
     if pd.notna(current_price) and current_price > 0:
         upside = (avg_target - current_price) / current_price * 100
     latest = rows[0]
+    sources = sorted({str(r.get("來源", "Anue")) for r in rows})
     return {
         "latest_target": latest["目標價"],
         "latest_broker": latest["券商"],
@@ -1111,6 +1173,7 @@ def summarize_target_price(rows: list, current_price: float) -> dict:
         "min_target": float(np.min(recent)),
         "upside_pct": upside,
         "n_ratings": len(recent),
+        "source": " / ".join(sources),
     }
 
 
@@ -6839,7 +6902,7 @@ with tab_workspace:
                          f'<div class="wb-card-note">近30日</div></div>{_body}</div>')
 
             # ---------- ⑤ 法人目標價 ----------
-            _tgt = fetch_analyst_target_price(_code)
+            _tgt = fetch_analyst_target_price(_code, _mkt)
             _tsum = summarize_target_price(_tgt, price) if _tgt else {}
             if _tsum:
                 _up = _tsum.get('upside_pct', np.nan)
@@ -6867,7 +6930,7 @@ with tab_workspace:
                     f'{wb_bar_row("中立", _neu / _tot * 100, "#8796aa")}'
                     f'<div class="wb-row" style="margin-top:6px;"><span>最高／最低</span>'
                     f'<b>{fmt_num(_tsum["max_target"], "{:.1f}")} / {fmt_num(_tsum["min_target"], "{:.1f}")}</b></div>'
-                    f'<div class="wb-foot">最新 {_tsum["latest_broker"]}｜{_tsum["latest_date"]}</div>'
+                    f'<div class="wb-foot">最新 {_tsum["latest_broker"]}｜{_tsum["latest_date"]}｜來源 {_tsum.get("source", "Anue")}</div>'
                 )
             else:
                 _body = '<div class="wb-empty">近期無外資／券商評等紀錄，或來源暫時無回應。</div>'
@@ -7663,9 +7726,10 @@ with tab_workspace:
 
                 # ---------- 法人目標價 ----------
                 elif view_mode == "🎯 法人目標價":
-                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 法人目標價</div><div class="section-help">資料來源：Anue鉅亨網「外資評等」頁面，彙整外資／券商調整目標價與投資評等的歷史紀錄，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 法人目標價</div><div class="section-help">主來源：Anue鉅亨「外資評等」；若無資料則自動改用 Yahoo Finance 分析師共識目標價。僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
 
-                    target_rows = fetch_analyst_target_price(current_stock['code'])
+                    market_suffix = "TW" if str(current_stock.get('ticker', '')).endswith(".TW") else "TWO"
+                    target_rows = fetch_analyst_target_price(current_stock['code'], market_suffix)
                     if target_rows:
                         current_price = current_stock.get('收盤', np.nan)
                         summary = summarize_target_price(target_rows, current_price)
@@ -7724,9 +7788,10 @@ with tab_workspace:
                                 "財測EPS": st.column_config.TextColumn("財測EPS(年度)", width=100),
                                 "目標價": st.column_config.NumberColumn("目標價", width=80, format="%.1f"),
                                 "現價": st.column_config.NumberColumn("當時股價", width=80, format="%.2f"),
+                                "來源": st.column_config.TextColumn("來源", width=70),
                             }
                         )
-                        st.caption("「近N筆平均目標價」是取最近10筆評等紀錄的目標價平均，不是近10天；評等日期較久遠的紀錄僅供參考歷史趨勢，實際判斷請以最新評等為主。目標價是各券商／外資機構各自估算的數字，不代表官方保證，也不是投資建議。")
+                        st.caption("「近N筆平均目標價」取最近10筆評等平均（非近10天）。主來源 Anue 為券商逐筆歷史；備援 Yahoo 為分析師共識均價／高低價，覆蓋率較低。目標價僅供參考，非投資建議。")
                     else:
                         st.info("目前無法取得法人目標價資料，可能是這檔股票近期沒有外資／券商發布評等報告，或資料來源暫時無回應，請稍後再試。")
 
