@@ -5431,12 +5431,19 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
 .news-card{padding:16px 18px!important;margin-bottom:11px!important;}.news-title:hover{color:#9fc5ff!important;}
 
 /* ── 模組化資訊總覽（個股工作台新版面）── */
-.wb-topbar{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
-  padding:0 0 11px;margin:0 0 12px;border-bottom:1px solid var(--border);}
-.wb-topbar-title{font-size:clamp(19px,1.05vw,26px);font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
-.wb-topbar-sep{color:rgba(148,163,184,.4);margin:0 10px;font-weight:400;}
-.wb-topbar-sub{color:var(--muted);font-weight:700;font-size:clamp(17px,.95vw,23px);}
-.wb-topbar-note{font-size:clamp(12px,.62vw,15px);color:var(--muted);white-space:nowrap;}
+/* 垂直節奏：區塊之間固定節奏，避免「什麼都擠在一起」 */
+.wb-section{margin:0 0 14px;}
+.wb-section-gap{margin-top:18px;}
+.wb-divider{height:1px;background:rgba(148,163,184,.12);margin:16px 0 14px;border:0;}
+.wb-topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:0 0 10px;margin:0 0 10px;border-bottom:1px solid var(--border);}
+.wb-topbar-title{font-size:clamp(17px,.95vw,22px);font-weight:800;color:#f3f7fd;letter-spacing:-.015em;}
+.wb-topbar-sep{color:rgba(148,163,184,.35);margin:0 8px;font-weight:400;}
+.wb-topbar-sub{color:var(--muted);font-weight:600;font-size:clamp(13px,.72vw,15px);}
+.wb-topbar-note{font-size:clamp(11px,.58vw,13px);color:var(--muted);white-space:nowrap;}
+/* 動作列：報價下方的一條工具列，不與報價搶視線 */
+.wb-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;}
+.wb-toolbar-hint{font-size:11.5px;color:var(--muted);margin-left:auto;white-space:nowrap;}
 
 /* 卡片等高網格 ──
    st.columns 每一欄的高度是各自獨立的，內容多寡不同就會長短不齊。
@@ -6369,9 +6376,9 @@ with tab_workspace:
             st.markdown(
                 '<div class="wb-topbar">'
                 '<div class="wb-topbar-title">個股工作台'
-                '<span class="wb-topbar-sep">|</span>'
-                '<span class="wb-topbar-sub">模組化資訊總覽</span></div>'
-                '<div class="wb-topbar-note">TWSE／TPEx・Yahoo 股市・Anue鉅亨網</div>'
+                '<span class="wb-topbar-sep">·</span>'
+                '<span class="wb-topbar-sub">報價／圖表／計畫／分析</span></div>'
+                '<div class="wb-topbar-note">TWSE／TPEx · Yahoo · Anue</div>'
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -6445,121 +6452,114 @@ with tab_workspace:
                 else:
                     _earn_tag = f'<div class="quote-tag earn-tag earn-later" title="{_d} 天後{_evt}">📅 {_evt} {_d}天</div>'
 
-            # ══════════════ 第一列：報價主卡 ／ 動作區＋候選 chips ══════════════
-            head_l, head_r = st.columns([3.05, 1.95], gap="medium")
-
-            with head_l:
-                _metrics = [
-                    ("開盤", fmt_num(_k_at('open'), '{:.2f}'), ''),
-                    ("最高", fmt_num(_k_at('high'), '{:.2f}'), 'var(--green)'),
-                    ("最低", fmt_num(_k_at('low'), '{:.2f}'), 'var(--red)'),
-                    ("昨收", fmt_num(_prev_close, '{:.2f}'), ''),
-                    ("成交量", f"{fmt_num(_vol_lots, '{:,.0f}')} 張", ''),
-                    ("成交金額", _turnover_txt, ''),
-                    ("週漲跌", fmt_num(_wk_amt, '{:+.2f}'), _wk_color),
-                    ("週漲幅", fmt_num(_wk_pct, '{:+.2f}%'), _wk_color),
-                    ("量比20日", fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x'), ''),
-                    ("財務評分", 'N/A' if pd.isna(_score_val) else f"{int(_score_val)}", ''),
-                    ("ATR停損", fmt_num(_plan['停損價'], '{:.2f}'), 'var(--red)'),
-                    ("建議張數", _lots_txt, _lots_color),
-                ]
-                _mhtml = ''
-                for _mk, _mv, _mc in _metrics:
-                    _mstyle = f' style="color:{_mc};"' if _mc else ''
-                    _mhtml += (f'<div><div class="wb-mk">{_mk}</div>'
-                               f'<div class="wb-mv"{_mstyle}>{_mv}</div></div>')
-                st.markdown(f"""
-                <div class="wb-quote">
-                  <div class="wb-quote-head">
-                    <span class="wb-quote-name">{current_stock['name']}</span>
-                    <span class="wb-quote-code">{current_stock['code']}</span>
-                    <div class="quote-tag">{current_stock.get('市場別', '')}</div>
-                    <div class="quote-tag" title="{current_stock.get('industry', '未分類')}">{current_stock.get('industry', '未分類')}</div>{_hot_tag}{_earn_tag}
-                  </div>
-                  <div class="wb-quote-body">
-                    <div class="wb-quote-left">
-                      <div class="wb-quote-price" style="color:{chg_color};">{fmt_num(price, '{:.2f}')}
-                        <span class="wb-quote-chg">{_arrow} {_chg_amt_txt} ({chg_txt})</span></div>
-                      <div class="wb-sub">更新時間 {get_tw_now().strftime('%m/%d %H:%M')}</div>
-                    </div>
-                    <div class="wb-mgrid">{_mhtml}</div>
-                  </div>
+            # ══════════════ 區塊 A：報價主卡（全寬，視線焦點）══════════════
+            _metrics = [
+                ("開盤", fmt_num(_k_at('open'), '{:.2f}'), ''),
+                ("最高", fmt_num(_k_at('high'), '{:.2f}'), 'var(--green)'),
+                ("最低", fmt_num(_k_at('low'), '{:.2f}'), 'var(--red)'),
+                ("昨收", fmt_num(_prev_close, '{:.2f}'), ''),
+                ("成交量", f"{fmt_num(_vol_lots, '{:,.0f}')} 張", ''),
+                ("成交金額", _turnover_txt, ''),
+                ("週漲跌", fmt_num(_wk_amt, '{:+.2f}'), _wk_color),
+                ("週漲幅", fmt_num(_wk_pct, '{:+.2f}%'), _wk_color),
+                ("量比20日", fmt_num(current_stock.get('量比20日', np.nan), '{:.2f}x'), ''),
+                ("財務評分", 'N/A' if pd.isna(_score_val) else f"{int(_score_val)}", ''),
+                ("ATR停損", fmt_num(_plan['停損價'], '{:.2f}'), 'var(--red)'),
+                ("建議張數", _lots_txt, _lots_color),
+            ]
+            _mhtml = ''
+            for _mk, _mv, _mc in _metrics:
+                _mstyle = f' style="color:{_mc};"' if _mc else ''
+                _mhtml += (f'<div><div class="wb-mk">{_mk}</div>'
+                           f'<div class="wb-mv"{_mstyle}>{_mv}</div></div>')
+            st.markdown(f"""
+            <div class="wb-quote wb-section">
+              <div class="wb-quote-head">
+                <span class="wb-quote-name">{current_stock['name']}</span>
+                <span class="wb-quote-code">{current_stock['code']}</span>
+                <div class="quote-tag">{current_stock.get('市場別', '')}</div>
+                <div class="quote-tag" title="{current_stock.get('industry', '未分類')}">{current_stock.get('industry', '未分類')}</div>{_hot_tag}{_earn_tag}
+              </div>
+              <div class="wb-quote-body">
+                <div class="wb-quote-left">
+                  <div class="wb-quote-price" style="color:{chg_color};">{fmt_num(price, '{:.2f}')}
+                    <span class="wb-quote-chg">{_arrow} {_chg_amt_txt} ({chg_txt})</span></div>
+                  <div class="wb-sub">更新時間 {get_tw_now().strftime('%m/%d %H:%M')}</div>
                 </div>
-                """, unsafe_allow_html=True)
+                <div class="wb-mgrid">{_mhtml}</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-            with head_r:
-                _act1, _act2 = st.columns(2)
-                with _act1:
-                    # 自選股：星號切換加入／移除，重讀檔案即時反映目前狀態
-                    _wl_now = load_watchlist()
-                    _in_wl = is_in_watchlist(_code, _wl_now)
-                    if st.button("★ 已加自選" if _in_wl else "☆ 加入自選",
-                                 use_container_width=True, key="toggle_watchlist",
-                                 type="primary" if _in_wl else "secondary"):
-                        if _in_wl:
-                            remove_from_watchlist(_code)
-                        else:
-                            add_to_watchlist(current_stock.to_dict())
-                        st.session_state.watchlist_quotes = pd.DataFrame()
-                        st.rerun()
-                with _act2:
-                    if st.button("📋 交易計畫", use_container_width=True, key="wb_toggle_plan"):
-                        st.session_state.wb_open_plan = not bool(st.session_state.get('wb_open_plan', False))
-                        st.rerun()
+            # ══════════════ 區塊 B：動作工具列（固定四鍵，不與報價並排搶位）══════════════
+            _tb1, _tb2, _tb3, _tb4 = st.columns([1, 1, 1, 1], gap="small")
+            with _tb1:
+                _wl_now = load_watchlist()
+                _in_wl = is_in_watchlist(_code, _wl_now)
+                if st.button("★ 已加自選" if _in_wl else "☆ 加入自選",
+                             use_container_width=True, key="toggle_watchlist",
+                             type="primary" if _in_wl else "secondary"):
+                    if _in_wl:
+                        remove_from_watchlist(_code)
+                    else:
+                        add_to_watchlist(current_stock.to_dict())
+                    st.session_state.watchlist_quotes = pd.DataFrame()
+                    st.rerun()
+            with _tb2:
+                if st.button("📋 交易計畫", use_container_width=True, key="wb_toggle_plan"):
+                    st.session_state.wb_open_plan = not bool(st.session_state.get('wb_open_plan', False))
+                    st.rerun()
+            with _tb3:
+                if st.button("← 上一檔", use_container_width=True, key="chart_prev"):
+                    st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
+                    st.rerun()
+            with _tb4:
+                if st.button("下一檔 →", use_container_width=True, key="chart_next"):
+                    st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
+                    st.rerun()
 
-                _act3, _act4 = st.columns(2)
-                with _act3:
-                    if st.button("← 上一檔", use_container_width=True, key="chart_prev"):
-                        st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
-                        st.rerun()
-                with _act4:
-                    if st.button("下一檔 →", use_container_width=True, key="chart_next"):
-                        st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-                        st.rerun()
+            # ══════════════ 區塊 C：候選股橫向 chips（獨立一列，可捲動切股）══════════════
+            _max_chips = 150
+            _n_chips = min(total_found, _max_chips)
+            _more_txt = f'（僅列前 {_max_chips} 檔，其餘請用下方完整表格）' if total_found > _max_chips else ''
+            st.markdown(
+                f'<div class="wb-chip-label">候選股 {total_found} 檔 · 左右捲動切換{_more_txt}</div>',
+                unsafe_allow_html=True)
+            with st.container(key="wb_chip_row"):
+                _chip_cols = st.columns(_n_chips) if _n_chips > 0 else []
+                for _pos in range(_n_chips):
+                    _crow = df.iloc[_pos]
+                    _cchg = _crow.get('漲跌幅(%)', np.nan)
+                    _cname = str(_crow.get('name', '') or '')
+                    if len(_cname) > 5:
+                        _cname = _cname[:5] + '…'
+                    _clabel = f"{_cname} {_crow['code']}"
+                    _cprice = fmt_num(_crow.get("收盤", np.nan), "{:.2f}")
+                    _cpct = fmt_num(_cchg, "{:+.2f}%")
+                    if pd.isna(_cchg):
+                        _ccls = "flat"
+                    elif _cchg >= 0:
+                        _ccls = "up"
+                    else:
+                        _ccls = "down"
+                    with _chip_cols[_pos]:
+                        if st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
+                                     use_container_width=True,
+                                     type="primary" if _pos == st.session_state.current_idx else "secondary",
+                                     help=f"{_crow.get('name', '')} ({_crow['code']})"):
+                            st.session_state.current_idx = _pos
+                            st.rerun()
+                        st.markdown(
+                            f'<div class="wb-chip-sub {_ccls}" title="{_crow.get("name", "")} {_cprice} {_cpct}">'
+                            f'{_cprice}  {_cpct}</div>',
+                            unsafe_allow_html=True)
 
-                # 候選股橫向捲動列：取代原本常駐的左側清單，一次把所有候選股都排出來，
-                # 用捲軸左右瀏覽（CSS 在 .st-key-wb_chip_row 那段）。完整表格仍在
-                # 下方「候選股票清單」收合區，功能一項沒少。
-                _max_chips = 150      # 上限保護：候選過多時只排前 150 檔，避免一次產生上千個
-                _n_chips = min(total_found, _max_chips)  # widget 讓每次重跑都變慢
-                _more_txt = f'（僅列前 {_max_chips} 檔，其餘請用下方完整表格）' if total_found > _max_chips else ''
-                st.markdown(
-                    f'<div class="wb-chip-label">自選／候選股　{total_found} 檔・可左右捲動{_more_txt}</div>',
-                    unsafe_allow_html=True)
-                with st.container(key="wb_chip_row"):
-                    _chip_cols = st.columns(_n_chips) if _n_chips > 0 else []
-                    for _pos in range(_n_chips):
-                        _crow = df.iloc[_pos]
-                        _cchg = _crow.get('漲跌幅(%)', np.nan)
-                        # 長公司名截斷，避免按鈕文字擠成一團（保留代碼完整）
-                        _cname = str(_crow.get('name', '') or '')
-                        if len(_cname) > 5:
-                            _cname = _cname[:5] + '…'
-                        _clabel = f"{_cname} {_crow['code']}"
-                        _cprice = fmt_num(_crow.get("收盤", np.nan), "{:.2f}")
-                        _cpct = fmt_num(_cchg, "{:+.2f}%")
-                        if pd.isna(_cchg):
-                            _ccls = "flat"
-                        elif _cchg >= 0:
-                            _ccls = "up"
-                        else:
-                            _ccls = "down"
-                        with _chip_cols[_pos]:
-                            if st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
-                                         use_container_width=True,
-                                         type="primary" if _pos == st.session_state.current_idx else "secondary",
-                                         help=f"{_crow.get('name', '')} ({_crow['code']})"):
-                                st.session_state.current_idx = _pos
-                                st.rerun()
-                            st.markdown(
-                                f'<div class="wb-chip-sub {_ccls}" title="{_crow.get("name", "")} {_cprice} {_cpct}">'
-                                f'{_cprice}  {_cpct}</div>',
-                                unsafe_allow_html=True)
+            st.markdown('<div class="wb-divider"></div>', unsafe_allow_html=True)
 
-            # ══════════════ 第二列：K線走勢 ／ 交易計畫＋持倉摘要＋風險設定 ══════════════
-            # 右邊三張卡是純 HTML，塞進同一個 .wb-grid3 讓它們互相等高；
-            # 卡片 HTML 一律組成「不含換行」的單行字串，避免縮排被 Markdown
-            # 當成程式碼區塊。
+            # ══════════════ 區塊 D：K線 ＋ 本益比河流（主圖區）══════════════
+            st.markdown(
+                '<div class="wb-chip-label" style="margin-top:2px;">圖表區 · K線與評價</div>',
+                unsafe_allow_html=True)
             kl_col, river_col = st.columns([3.0, 2.2], gap="small")
 
             with kl_col:
@@ -6722,9 +6722,11 @@ with tab_workspace:
                         '<br><br>可改用右上角的 Goodinfo 官方河流圖。</div></div>',
                         unsafe_allow_html=True)
 
-            # ══════════════ 第三列：六格模組（交易計畫＋五項分析，同一個 grid 自動等高）══════════════
-            # 交易計畫排在最前面（最需要立即行動的資訊），最新新聞移除——
-            # 它天生最長會把整列撐高，完整清單在「完整分析明細 → 個股新聞」。
+            # ══════════════ 區塊 E：資訊模組（交易計畫＋多空／財務／法人等）══════════════
+            st.markdown(
+                '<div class="wb-divider"></div>'
+                '<div class="wb-chip-label">資訊模組 · 計畫與籌碼面摘要</div>',
+                unsafe_allow_html=True)
             _mods = [_plan_card]
 
             # ---------- ① 多空指標 ----------
