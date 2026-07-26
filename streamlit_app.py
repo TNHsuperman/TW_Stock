@@ -5543,23 +5543,33 @@ label,[data-testid='stWidgetLabel'] p{color:#aab8ca!important;font-size:12px!imp
    欄數再多也只是往右延伸、用捲軸瀏覽，不會互相擠壓。 */
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']{
   flex-wrap:nowrap!important;overflow-x:auto!important;overflow-y:hidden!important;
-  gap:6px!important;padding:2px 2px 6px;
-  scrollbar-width:thin;scrollbar-color:rgba(110,168,254,.5) rgba(148,163,184,.10);
+  gap:8px!important;padding:4px 2px 10px;
+  scrollbar-width:thin;scrollbar-color:rgba(110,168,254,.55) rgba(148,163,184,.12);
   overscroll-behavior-x:contain;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']>div{
-  flex:0 0 clamp(134px,8vw,180px)!important;width:clamp(134px,8vw,180px)!important;min-width:clamp(134px,8vw,180px)!important;}
-.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar{height:9px;}
+  flex:0 0 148px!important;width:148px!important;min-width:148px!important;max-width:148px!important;
+  overflow:hidden!important;}
+.st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar{height:8px;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-track{
-  background:rgba(148,163,184,.10);border-radius:999px;}
+  background:rgba(148,163,184,.12);border-radius:999px;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb{
-  background:rgba(110,168,254,.5);border-radius:999px;}
+  background:rgba(110,168,254,.55);border-radius:999px;}
 .st-key-wb_chip_row [data-testid='stHorizontalBlock']::-webkit-scrollbar-thumb:hover{
-  background:rgba(110,168,254,.78);}
+  background:rgba(110,168,254,.8);}
 .st-key-wb_chip_row [data-testid='stButton']>button{
-  min-height:38px!important;font-size:clamp(12.5px,.66vw,15px)!important;padding:2px 6px!important;
+  min-height:40px!important;height:40px!important;font-size:13px!important;font-weight:700!important;
+  padding:4px 8px!important;line-height:1.25!important;
   white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
-.wb-chip-label{font-size:clamp(11px,.58vw,13px);font-weight:800;letter-spacing:.1em;color:var(--muted);
-  text-transform:uppercase;margin:6px 0 4px;}
+/* 下方價位列：固定高度、不溢出、對比足夠 */
+.wb-chip-sub{
+  text-align:center;font-size:11.5px;line-height:1.3;margin:4px 0 2px;padding:0 2px;
+  font-family:'Roboto Mono',monospace;font-weight:700;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.wb-chip-sub.up{color:#35c48d;}
+.wb-chip-sub.down{color:#f23645;}
+.wb-chip-sub.flat{color:#8b9bb0;}
+.wb-chip-label{font-size:12px;font-weight:800;letter-spacing:.06em;color:var(--muted);
+  margin:4px 0 6px;}
 
 /* 窄螢幕：報價卡指標與六格模組一起收欄，維持等高不變 */
 @media (max-width:1400px){.wb-grid6{grid-template-columns:repeat(3,minmax(0,1fr));}}
@@ -6521,18 +6531,29 @@ with tab_workspace:
                     for _pos in range(_n_chips):
                         _crow = df.iloc[_pos]
                         _cchg = _crow.get('漲跌幅(%)', np.nan)
-                        _clabel = f"{_crow['name']} {_crow['code']}"
+                        # 長公司名截斷，避免按鈕文字擠成一團（保留代碼完整）
+                        _cname = str(_crow.get('name', '') or '')
+                        if len(_cname) > 5:
+                            _cname = _cname[:5] + '…'
+                        _clabel = f"{_cname} {_crow['code']}"
+                        _cprice = fmt_num(_crow.get("收盤", np.nan), "{:.2f}")
+                        _cpct = fmt_num(_cchg, "{:+.2f}%")
+                        if pd.isna(_cchg):
+                            _ccls = "flat"
+                        elif _cchg >= 0:
+                            _ccls = "up"
+                        else:
+                            _ccls = "down"
                         with _chip_cols[_pos]:
                             if st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
                                          use_container_width=True,
-                                         type="primary" if _pos == st.session_state.current_idx else "secondary"):
+                                         type="primary" if _pos == st.session_state.current_idx else "secondary",
+                                         help=f"{_crow.get('name', '')} ({_crow['code']})"):
                                 st.session_state.current_idx = _pos
                                 st.rerun()
                             st.markdown(
-                                f'<div style="text-align:center;font-size:10px;margin:-6px 0 4px;'
-                                f'font-family:Roboto Mono,monospace;'
-                                f'color:{"var(--green)" if (pd.notna(_cchg) and _cchg >= 0) else "var(--red)"};">'
-                                f'{fmt_num(_crow.get("收盤", np.nan), "{:.2f}")}　{fmt_num(_cchg, "{:+.2f}%")}</div>',
+                                f'<div class="wb-chip-sub {_ccls}" title="{_crow.get("name", "")} {_cprice} {_cpct}">'
+                                f'{_cprice}  {_cpct}</div>',
                                 unsafe_allow_html=True)
 
             # ══════════════ 第二列：K線走勢 ／ 交易計畫＋持倉摘要＋風險設定 ══════════════
