@@ -2104,30 +2104,42 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
     }
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_official_market_quotes(market: str) -> pd.DataFrame:
-    """取得上市／上櫃最新收盤行情，並統一欄位格式。"""
+    """取得上市／上櫃最新收盤行情，並統一欄位格式。
+    加上時間戳防 CDN／代理舊快取；OpenAPI 失敗時改打證交所 open_data 備援。
+    """
     profiles = _mp_stock_profiles(market)
+    bust = int(time.time())
 
     if market == "TW":
         urls = [
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL?_={bust}",
+            f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data&_={bust}",
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&_={bust}",
         ]
     else:
         urls = [
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?l=zh-tw",
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+            f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?_={bust}",
+            f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?l=zh-tw&_={bust}",
+            f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes?_={bust}",
         ]
 
     for url in urls:
-        payload = _mp_fetch_json(url)
+        # 個股日行情必須打到最新檔，避免沿用瀏覽器／CDN 舊回應
+        payload = _mp_fetch_json_no_store(url) if "_=" in url else _mp_fetch_json(url)
+        if payload is None:
+            payload = _mp_fetch_json(url)
         rows_payload = _mp_payload_rows(payload)
+        if not rows_payload and isinstance(payload, list):
+            rows_payload = payload
         if not rows_payload:
             continue
 
         rows = []
         for item in rows_payload:
+            if not isinstance(item, dict):
+                continue
             normalized = _mp_normalize_quote(item, market, profiles)
             if normalized:
                 rows.append(normalized)
@@ -2306,7 +2318,7 @@ def _mp_fetch_json_no_store(url: str):
     return _mp_fetch_json(f"{url}{separator}_={int(time.time())}")
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_official_industry_indices(market: str) -> pd.DataFrame:
     """取得官方類股價格指數漲跌幅；這才是玩股網類股行情可對照的口徑。"""
     if market == "TW":
@@ -2444,7 +2456,7 @@ def _mp_build_change_distribution(pct: pd.Series) -> dict:
     }
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def build_market_pulse(market: str) -> dict:
     """彙整官方行情。類股漲跌採官方價格指數；成交比重與漲跌家數採個股行情。"""
     quotes = fetch_official_market_quotes(market)
@@ -8342,7 +8354,7 @@ with tab_market:
         '<div class="section-head"><div>'
         '<div class="section-title">市場觀察</div>'
         '<div class="section-help">當日產業資金流向與個股漲跌結構，'
-        '資料來源：證交所／櫃買中心官方類股指數與個股 OpenAPI；每 10 分鐘更新，連線失敗時自動顯示最近成功快取。</div>'
+        '資料來源：證交所／櫃買中心官方類股指數與個股 OpenAPI；約 5 分鐘自動更新，連線失敗時顯示最近成功快取。</div>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -8353,10 +8365,34 @@ with tab_market:
     )
     mp_market = "TW" if mp_market_label == "上市" else "TWO"
 
-    mp_sub = st.radio(
-        "檢視", ["📊 產業類股表現", "📈 個股漲跌分布", "📅 市場行事曆"], horizontal=True,
-        key="market_pulse_view", label_visibility="collapsed",
-    )
+    _mp_head_l, _mp_head_r = st.columns([4, 1])
+    with _mp_head_l:
+        mp_sub = st.radio(
+            "檢視", ["📊 產業類股表現", "📈 個股漲跌分布", "📅 市場行事曆"], horizontal=True,
+            key="market_pulse_view", label_visibility="collapsed",
+        )
+    with _mp_head_r:
+        if st.button("🔄 重新整理行情", use_container_width=True, key="mp_force_refresh"):
+            try:
+                fetch_official_market_quotes.clear()
+            except Exception:
+                pass
+            try:
+                fetch_official_industry_indices.clear()
+            except Exception:
+                pass
+            try:
+                build_market_pulse.clear()
+            except Exception:
+                pass
+            # 刪除過舊磁碟快取，避免一直顯示數日前資料
+            try:
+                if os.path.exists(MARKET_PULSE_CACHE_FILE):
+                    os.remove(MARKET_PULSE_CACHE_FILE)
+            except Exception:
+                pass
+            st.session_state.pop("mp_last_refresh_note", None)
+            st.rerun()
 
     if mp_sub == "📅 市場行事曆":
         st.markdown(
@@ -8437,11 +8473,30 @@ with tab_market:
 
         if pulse and pulse.get("is_cached"):
             cached_at = pulse.get("saved_at", "")
-            st.info(f"官方 API 暫時無法連線，現顯示最近一次成功快取{f'（{cached_at}）' if cached_at else ''}。")
+            qd = pulse.get("quote_date", "")
+            st.warning(
+                f"官方 API 暫時無法連線，現顯示快取資料"
+                f"{f'（行情日 {qd}）' if qd else ''}"
+                f"{f'・快取於 {cached_at}' if cached_at else ''}。"
+                "請按右上「🔄 重新整理行情」強制重抓。"
+            )
         elif pulse:
             quote_date = pulse.get("quote_date", "")
             if quote_date:
-                st.caption(f"官方最新資料日期：{quote_date}")
+                try:
+                    _qd = datetime.strptime(quote_date, "%Y-%m-%d").date()
+                    _today = get_tw_now().date()
+                    _age = (_today - _qd).days
+                except Exception:
+                    _age = 0
+                if _age >= 2:
+                    st.warning(
+                        f"官方最新資料日期：{quote_date}（距今 {_age} 天）。"
+                        "若今日已收盤仍顯示舊日期，請按「🔄 重新整理行情」；"
+                        "週末／休市則會停留在上一交易日，屬正常現象。"
+                    )
+                else:
+                    st.caption(f"官方最新資料日期：{quote_date}")
 
         if not pulse:
             st.warning(
