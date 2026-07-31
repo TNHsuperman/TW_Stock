@@ -2113,10 +2113,16 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
     bust = int(time.time())
 
     if market == "TW":
+        # 端點按「資料新鮮度」排序：
+        #   1. afterTrading JSON → 收盤後當天（約 15:30 後更新）
+        #   2. open_data 版      → 通常也是當天，但有時較慢
+        #   3. openapi.twse v1   → 永遠只有「前一個交易日」的盤後資料
+        # 只要前面成功就不打後面，所以 openapi v1 放最後當備援，
+        # 避免它搶先回前一天的資料。
         urls = [
-            f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL?_={bust}",
-            f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data&_={bust}",
             f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&_={bust}",
+            f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data&_={bust}",
+            f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL?_={bust}",
         ]
     else:
         urls = [
@@ -2322,9 +2328,10 @@ def _mp_fetch_json_no_store(url: str):
 def fetch_official_industry_indices(market: str) -> pd.DataFrame:
     """取得官方類股價格指數漲跌幅；這才是玩股網類股行情可對照的口徑。"""
     if market == "TW":
+        # afterTrading 排前面（當日資料），openapi v1 排後面（前一天備援）
         urls = [
-            "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
             "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=&type=ALLBUT0999&response=json",
+            "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
         ]
     else:
         urls = [
