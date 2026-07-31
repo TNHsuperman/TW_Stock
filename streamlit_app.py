@@ -2142,6 +2142,25 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
         if not rows_payload:
             continue
 
+        # afterTrading 端點回傳 {"data9": [[...], ...], "fields9": [...]}，
+        # 是二維陣列（list of list）而非 dict 列表。需要用 fields 欄位名
+        # 當 key 把每一列轉成 dict，後續 _mp_normalize_quote 才認得。
+        if rows_payload and isinstance(rows_payload[0], list):
+            fields = None
+            if isinstance(payload, dict):
+                for fk in ("fields9", "fields", "field"):
+                    if fk in payload and isinstance(payload[fk], list):
+                        fields = payload[fk]
+                        break
+            if fields and len(fields) >= 5:
+                rows_payload = [
+                    dict(zip(fields, row))
+                    for row in rows_payload
+                    if isinstance(row, list) and len(row) == len(fields)
+                ]
+            else:
+                continue  # 沒有欄位名就沒辦法轉換，換下一個 URL
+
         rows = []
         for item in rows_payload:
             if not isinstance(item, dict):
