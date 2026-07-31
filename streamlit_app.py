@@ -1887,6 +1887,159 @@ def _mp_payload_rows(payload) -> list:
     return []
 
 
+
+def _mp_payload_quote_date(payload, rows=None) -> str:
+    """從官方回應根節點、tables 或資料列找出最新交易日。"""
+    candidates = []
+
+    def add(value):
+        date_text = _mp_format_quote_date(value)
+        parsed = pd.to_datetime(date_text, errors="coerce")
+        if pd.notna(parsed):
+            candidates.append(parsed.normalize())
+
+    if isinstance(payload, dict):
+        for key in ("date", "Date", "日期", "TradeDate", "資料日期"):
+            add(payload.get(key))
+        tables = payload.get("tables")
+        if isinstance(tables, list):
+            for table in tables:
+                if not isinstance(table, dict):
+                    continue
+                for key in ("date", "Date", "日期", "TradeDate", "資料日期"):
+                    add(table.get(key))
+
+    for row in rows or []:
+        if isinstance(row, dict):
+            add(_mp_pick(row, ["Date", "日期", "TradeDate", "資料日期"], ""))
+
+    return max(candidates).strftime("%Y-%m-%d") if candidates else ""
+
+
+def _mp_market_table_rows(payload, market: str) -> list:
+    """展平全市場個股行情；特別支援 TWSE MI_INDEX 的 tables 結構。"""
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    flattened = []
+    tables = payload.get("tables")
+    if isinstance(tables, list):
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            fields = table.get("fields") or table.get("columns") or []
+            data = table.get("data") or table.get("rows") or []
+            field_text = "|".join(str(x) for x in fields)
+            # 只取包含「證券代號＋收盤價」的個股表，排除指數、統計與說明表。
+            has_code = any(name in field_text for name in ("證券代號", "股票代號", "Code"))
+            has_close = any(name in field_text for name in ("收盤價", "ClosingPrice", "Close"))
+            if not (has_code and has_close and isinstance(data, list)):
+                continue
+            table_date = _mp_payload_quote_date(table)
+            for row in data:
+                if isinstance(row, dict):
+                    item = dict(row)
+                elif isinstance(row, (list, tuple)) and isinstance(fields, list):
+                    item = dict(zip(fields, row))
+                else:
+                    continue
+                if table_date and not any(item.get(k) for k in ("Date", "日期", "TradeDate", "資料日期")):
+                    item["資料日期"] = table_date
+                flattened.append(item)
+        if flattened:
+            return flattened
+
+    rows = _mp_payload_rows(payload)
+    if rows and isinstance(rows[0], (list, tuple)):
+        fields = payload.get("fields") or payload.get("columns") or []
+        if isinstance(fields, list):
+            rows = [dict(zip(fields, row)) for row in rows if isinstance(row, (list, tuple))]
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _mp_result_latest_date(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "quote_date" not in df.columns:
+        return ""
+    dates = pd.to_datetime(df["quote_date"], errors="coerce").dropna()
+    return dates.max().strftime("%Y-%m-%d") if not dates.empty else ""
+
+
+def _mp_fetch_mis_snapshot(market: str, profiles: dict) -> pd.DataFrame:
+    """TWSE MIS 即時行情備援。
+
+    盤後 OpenAPI 的「latest」檔偶爾仍指向前一交易日；若今天確實有交易，MIS
+    通常已經有今日收盤快照。分批抓取，失敗直接回空，不影響原本官方盤後資料。
+    """
+    if not profiles:
+        return pd.DataFrame()
+
+    prefix = "tse" if market == "TW" else "otc"
+    codes = sorted(code for code in profiles if _mp_clean_code(code))
+    if not codes:
+        return pd.DataFrame()
+
+    rows = []
+    batch_size = 80
+    now_ms = int(time.time() * 1000)
+    for start in range(0, len(codes), batch_size):
+        batch = codes[start:start + batch_size]
+        channels = "|".join(f"{prefix}_{code}.tw" for code in batch)
+        url = (
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+            f"?ex_ch={channels}&json=1&delay=0&_={now_ms + start}"
+        )
+        payload = _mp_fetch_json(url, timeout=10)
+        messages = payload.get("msgArray", []) if isinstance(payload, dict) else []
+        if not isinstance(messages, list):
+            continue
+
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            code = _mp_clean_code(item.get("c") or item.get("ch"))
+            if code not in profiles:
+                continue
+            profile = profiles.get(code, {})
+            name = str(item.get("n") or profile.get("name") or "").strip()
+            upper_name = name.upper()
+            if "ETF" in upper_name or "ETN" in upper_name or "權證" in name:
+                continue
+
+            close = _mp_to_float(item.get("z"))
+            previous = _mp_to_float(item.get("y"))
+            # 無成交股票 z 可能為 '-'；以昨收表示平盤，但仍保留今日交易日。
+            if pd.isna(close) and pd.notna(previous):
+                close = previous
+            if pd.isna(close) or close <= 0 or pd.isna(previous) or previous <= 0:
+                continue
+
+            open_price = _mp_to_float(item.get("o"))
+            high = _mp_to_float(item.get("h"))
+            low = _mp_to_float(item.get("l"))
+            volume_lots = _mp_to_float(item.get("v"))
+            change = close - previous
+            quote_date = _mp_format_quote_date(item.get("d"))
+            rows.append({
+                "code": code,
+                "name": name,
+                "industry": _mp_normalize_industry(profile.get("industry", "未分類")),
+                "close": close,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "change": change,
+                "change_pct": change / previous * 100,
+                "trade_value": close * max(volume_lots, 0) * 1000 if pd.notna(volume_lots) else np.nan,
+                "trade_volume": max(volume_lots, 0) * 1000 if pd.notna(volume_lots) else np.nan,
+                "quote_date": quote_date,
+                "market": market,
+            })
+
+    return pd.DataFrame(rows) if len(rows) >= 50 else pd.DataFrame()
+
+
 def _mp_profile_is_valid(profile: dict) -> bool:
     return _mp_normalize_industry((profile or {}).get("industry")) != "未分類"
 
@@ -2062,6 +2215,12 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
     open_price = _mp_to_float(_mp_pick(row, [
         "OpeningPrice", "Open", "開盤價", "開盤", "TodayOpen",
     ]))
+    high_price = _mp_to_float(_mp_pick(row, [
+        "HighestPrice", "High", "最高價", "最高", "TodayHigh",
+    ]))
+    low_price = _mp_to_float(_mp_pick(row, [
+        "LowestPrice", "Low", "最低價", "最低", "TodayLow",
+    ]))
     change = _mp_to_float(_mp_pick(row, [
         "Change", "漲跌價差", "漲跌", "ChangeAmount", "漲跌金額",
     ]))
@@ -2095,6 +2254,8 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
         "industry": industry,
         "close": close,
         "open": open_price,
+        "high": high_price,
+        "low": low_price,
         "change": change,
         "change_pct": float(change_pct),
         "trade_value": trade_value,
@@ -2106,73 +2267,178 @@ def _mp_normalize_quote(row: dict, market: str, profiles: dict):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_official_market_quotes(market: str) -> pd.DataFrame:
-    """取得上市／上櫃最新收盤行情，並統一欄位格式。
-    加上時間戳防 CDN／代理舊快取；OpenAPI 失敗時改打證交所 open_data 備援。
+    """取得上市／上櫃最新行情，從所有官方候選來源選「交易日最新」的一份。
+
+    重要修正：舊版只要第一個 OpenAPI 成功就立即 return；但 TWSE OpenAPI 的
+    latest 檔偶爾比官網指定日期端點慢一天，因此上市永遠看起來只到昨天。
+    現在會查完候選來源、比較 quote_date，再選日期最新且筆數完整的資料。
     """
     profiles = _mp_stock_profiles(market)
     bust = int(time.time())
+    today_text = get_tw_now().strftime("%Y%m%d")
 
     if market == "TW":
-        # 端點按「資料新鮮度」排序：
-        #   1. afterTrading JSON → 收盤後當天（約 15:30 後更新）
-        #   2. open_data 版      → 通常也是當天，但有時較慢
-        #   3. openapi.twse v1   → 永遠只有「前一個交易日」的盤後資料
-        # afterTrading 回傳格式是 {"fields9":[...], "data9":[[...],...]}
-        # 跟 openapi v1 的 [{key:value},...] 不同，下面有轉換邏輯。
         urls = [
+            # 指定今天日期優先；MI_INDEX 的 tables 內含完整個股收盤行情。
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={today_text}&type=ALLBUT0999&response=json&_={bust}",
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?date={today_text}&response=json&_={bust}",
             f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&_={bust}",
             f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data&_={bust}",
+            # OpenAPI latest 放最後，避免它更新較慢時先攔截掉今天資料。
             f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL?_={bust}",
         ]
     else:
+        roc_today = f"{get_tw_now().year - 1911}/{get_tw_now().month:02d}/{get_tw_now().day:02d}"
         urls = [
+            f"https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?date={roc_today}&id=&response=json&_={bust}",
             f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?_={bust}",
             f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes?l=zh-tw&_={bust}",
             f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes?_={bust}",
         ]
 
-    for url in urls:
-        # 個股日行情必須打到最新檔，避免沿用瀏覽器／CDN 舊回應
-        payload = _mp_fetch_json_no_store(url) if "_=" in url else _mp_fetch_json(url)
+    candidates = []
+    for source_order, url in enumerate(urls):
+        payload = _mp_fetch_json_no_store(url) if "_=" not in url else _mp_fetch_json(url)
         if payload is None:
-            payload = _mp_fetch_json(url)
-        rows_payload = _mp_payload_rows(payload)
-        if not rows_payload and isinstance(payload, list):
-            rows_payload = payload
-        if not rows_payload:
             continue
 
-        # afterTrading 端點回傳 {"data9": [[...], ...], "fields9": [...]}，
-        # 是二維陣列（list of list）而非 dict 列表。需要用 fields 欄位名
-        # 當 key 把每一列 zip 成 dict，後續 _mp_normalize_quote 才認得。
-        if rows_payload and isinstance(rows_payload[0], (list, tuple)):
-            fields = None
-            if isinstance(payload, dict):
-                for fk in ("fields9", "fields", "field", "columns"):
-                    if fk in payload and isinstance(payload[fk], list):
-                        fields = [str(f).strip() for f in payload[fk]]
-                        break
-            if fields and len(fields) >= 5:
-                rows_payload = [
-                    dict(zip(fields, row))
-                    for row in rows_payload
-                    if isinstance(row, (list, tuple)) and len(row) == len(fields)
-                ]
-            else:
-                continue  # 沒有欄位名就沒辦法轉換，換下一個 URL
+        rows_payload = _mp_market_table_rows(payload, market)
+        if not rows_payload:
+            continue
+        payload_date = _mp_payload_quote_date(payload, rows_payload)
 
         rows = []
         for item in rows_payload:
             if not isinstance(item, dict):
                 continue
+            if payload_date and not any(item.get(key) for key in ("Date", "日期", "TradeDate", "資料日期")):
+                item = dict(item)
+                item["資料日期"] = payload_date
             normalized = _mp_normalize_quote(item, market, profiles)
             if normalized:
                 rows.append(normalized)
-        if len(rows) >= 50:
-            return pd.DataFrame(rows)
+        if len(rows) < 50:
+            continue
 
-    return pd.DataFrame()
+        frame = pd.DataFrame(rows)
+        latest_date = _mp_result_latest_date(frame) or payload_date
+        candidates.append((latest_date, len(frame), -source_order, frame))
 
+    # 若盤後檔仍停在昨天，再以 MIS 今日收盤快照補救；只有其日期較新才採用。
+    official_best_date = max((c[0] for c in candidates if c[0]), default="")
+    now = get_tw_now()
+    should_try_mis = (
+        now.weekday() < 5 and (now.hour > 13 or (now.hour == 13 and now.minute >= 35))
+        and official_best_date < now.strftime("%Y-%m-%d")
+    )
+    if should_try_mis:
+        mis_frame = _mp_fetch_mis_snapshot(market, profiles)
+        mis_date = _mp_result_latest_date(mis_frame)
+        if not mis_frame.empty and mis_date:
+            candidates.append((mis_date, len(mis_frame), 1, mis_frame))
+
+    if not candidates:
+        return pd.DataFrame()
+
+    # ISO 日期可直接字串比較；同日優先筆數較多，再依來源順序決定。
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    best = candidates[0][3].copy()
+    best.attrs["quote_date"] = candidates[0][0]
+    best.attrs["source_kind"] = "MIS" if candidates[0][2] == 1 else "official_close"
+    return best.reset_index(drop=True)
+
+
+def _official_quote_map_for_tickers(tickers: tuple) -> dict:
+    """依 ticker 取得最新官方收盤行情。
+
+    yfinance 的台股日線有時會晚一個交易日，尤其 .TW 上市股票較明顯；
+    這裡一次抓全市場官方行情，再只保留本批次需要的股票。
+    """
+    wanted = set(str(t) for t in (tickers or ()))
+    if not wanted:
+        return {}
+
+    result = {}
+    for market, suffix in (("TW", "TW"), ("TWO", "TWO")):
+        market_wanted = {t for t in wanted if t.endswith(f".{suffix}")}
+        if not market_wanted:
+            continue
+        try:
+            quotes = fetch_official_market_quotes(market)
+        except Exception:
+            quotes = pd.DataFrame()
+        if quotes is None or quotes.empty:
+            continue
+        for _, quote in quotes.iterrows():
+            ticker = f"{str(quote.get('code', '')).strip()}.{suffix}"
+            if ticker in market_wanted:
+                result[ticker] = quote.to_dict()
+    return result
+
+
+def _merge_latest_official_quote(history: pd.DataFrame, quote: dict) -> pd.DataFrame:
+    """把官方最新一日 OHLCV 補進歷史資料；同日則覆蓋，不重複新增。"""
+    if history is None or history.empty or not isinstance(quote, dict):
+        return history
+
+    close = _safe_number(quote.get("close"))
+    if pd.isna(close) or close <= 0:
+        return history
+
+    open_price = _safe_number(quote.get("open"), close)
+    high = _safe_number(quote.get("high"), max(open_price, close))
+    low = _safe_number(quote.get("low"), min(open_price, close))
+    if pd.isna(open_price) or open_price <= 0:
+        open_price = close
+    if pd.isna(high) or high <= 0:
+        high = max(open_price, close)
+    if pd.isna(low) or low <= 0:
+        low = min(open_price, close)
+
+    volume_raw = _safe_number(quote.get("trade_volume"), 0)
+    volume_lots = int(max(volume_raw, 0) // 1000) if pd.notna(volume_raw) else 0
+    quote_date_text = _mp_format_quote_date(quote.get("quote_date", ""))
+    quote_date = pd.to_datetime(quote_date_text, errors="coerce")
+
+    result = history.copy()
+    if "date" not in result.columns:
+        # 舊快取資料沒有日期時，不冒險新增重複 K 棒；仍可覆蓋最後價格。
+        last_idx = result.index[-1]
+        for key, value in (("close", close), ("high", high), ("low", low), ("volume", volume_lots)):
+            if key in result.columns:
+                result.at[last_idx, key] = value
+        if "open" in result.columns:
+            result.at[last_idx, "open"] = open_price
+        return result
+
+    history_dates = pd.to_datetime(result["date"], errors="coerce")
+    last_valid_dates = history_dates.dropna()
+    last_date = last_valid_dates.iloc[-1].normalize() if not last_valid_dates.empty else pd.NaT
+    if pd.isna(quote_date):
+        return result
+    quote_date = quote_date.normalize()
+
+    row_values = {
+        "date": quote_date.strftime("%Y-%m-%d"),
+        "open": float(open_price),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "volume": volume_lots,
+    }
+
+    if pd.notna(last_date) and quote_date < last_date:
+        return result
+    if pd.notna(last_date) and quote_date == last_date:
+        target_idx = last_valid_dates.index[-1]
+        for key, value in row_values.items():
+            if key in result.columns:
+                result.at[target_idx, key] = value
+        return result.reset_index(drop=True)
+
+    new_row = {column: row_values.get(column, np.nan) for column in result.columns}
+    result = pd.concat([result, pd.DataFrame([new_row])], ignore_index=True)
+    return result.reset_index(drop=True)
 
 
 # 證交所 MI_INDEX 與櫃買中心 indexSummary 使用「官方類股價格指數」。
@@ -2345,24 +2611,37 @@ def _mp_fetch_json_no_store(url: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_official_industry_indices(market: str) -> pd.DataFrame:
-    """取得官方類股價格指數漲跌幅；這才是玩股網類股行情可對照的口徑。"""
+    """取得官方類股價格指數，並從候選端點選交易日最新的一份。"""
+    now = get_tw_now()
+    today_text = now.strftime("%Y%m%d")
     if market == "TW":
-        # afterTrading 排前面（當日資料），openapi v1 排後面（前一天備援）
         urls = [
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={today_text}&type=ALLBUT0999&response=json",
             "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=&type=ALLBUT0999&response=json",
             "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX",
         ]
     else:
+        roc_today = f"{now.year - 1911}/{now.month:02d}/{now.day:02d}"
         urls = [
+            f"https://www.tpex.org.tw/www/zh-tw/afterTrading/indexSummary?date={roc_today}&response=json",
             "https://www.tpex.org.tw/www/zh-tw/afterTrading/indexSummary?date=&response=json",
         ]
 
-    for url in urls:
+    candidates = []
+    minimum = 20 if market == "TW" else 12
+    for source_order, url in enumerate(urls):
         payload = _mp_fetch_json_no_store(url)
         result = _mp_parse_industry_indices(payload, market)
-        minimum = 20 if market == "TW" else 12
-        if len(result) >= minimum:
-            return result
+        if len(result) < minimum:
+            continue
+        quote_date = _mp_payload_quote_date(payload, _mp_index_table_rows(payload))
+        result = result.copy()
+        result.attrs["quote_date"] = quote_date
+        candidates.append((quote_date, len(result), -source_order, result))
+
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return candidates[0][3]
 
     # TPEx JSON 偶爾因站台切版或防護回傳非 JSON，官方 HTML 表格作為第二層備援。
     if market == "TWO":
@@ -2395,6 +2674,7 @@ def fetch_official_industry_indices(market: str) -> pd.DataFrame:
             pass
 
     return pd.DataFrame()
+
 
 def _mp_json_records(df: pd.DataFrame) -> list:
     if df is None or df.empty:
@@ -2429,6 +2709,7 @@ def _mp_load_disk_cache(market: str) -> dict:
             "industry_coverage": float(item.get("industry_coverage", 0) or 0),
             "industry_method": item.get("industry_method", "official_index"),
             "index_source": item.get("index_source", ""),
+            "index_quote_date": _mp_format_quote_date(item.get("index_quote_date", "")),
             "is_cached": True,
         }
     except Exception:
@@ -2457,6 +2738,7 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
             "industry_coverage": float(pulse.get("industry_coverage", 0) or 0),
             "industry_method": pulse.get("industry_method", "official_index"),
             "index_source": pulse.get("index_source", ""),
+            "index_quote_date": pulse.get("index_quote_date", ""),
         }
         temp_file = MARKET_PULSE_CACHE_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as file:
@@ -2530,8 +2812,17 @@ def build_market_pulse(market: str) -> dict:
         industry_stats = industry_stats.drop(columns=["成交額_元"])
 
     official_indices = fetch_official_industry_indices(market)
+    index_quote_date = str(getattr(official_indices, "attrs", {}).get("quote_date", "") or "")
     industry_method = "official_index"
     index_source = "證交所 MI_INDEX" if market == "TW" else "櫃買中心 indexSummary"
+
+    # 個股行情已是今天、但類股指數端點仍停在昨天時，不混用兩個交易日。
+    # 先以同日個股等權平均呈現，下一次官方指數更新後會自動切回。
+    if (not official_indices.empty and quote_date and index_quote_date
+            and index_quote_date < quote_date):
+        official_indices = pd.DataFrame()
+        industry_method = "stale_index_fallback"
+        index_source = f"官方指數尚停於 {index_quote_date}，改用同日成分股"
 
     if not official_indices.empty:
         industry = official_indices.copy()
@@ -2557,8 +2848,9 @@ def build_market_pulse(market: str) -> dict:
             industry["類股"] = industry["industry_key"].map(lambda x: _MP_WANTGOO_LABELS.get(x, x))
             industry["漲跌%"] = industry["等權平均漲跌%"]
             industry = industry.sort_values("漲跌%", ascending=False)
-            industry_method = "equal_weight_fallback"
-            index_source = "成分股等權平均備援"
+            if industry_method != "stale_index_fallback":
+                industry_method = "equal_weight_fallback"
+                index_source = "成分股等權平均備援"
         else:
             industry = pd.DataFrame()
             industry_method = "unavailable"
@@ -2599,6 +2891,7 @@ def build_market_pulse(market: str) -> dict:
         "industry_coverage": industry_coverage,
         "industry_method": industry_method,
         "index_source": index_source,
+        "index_quote_date": index_quote_date,
         "is_cached": False,
     }
     _mp_save_disk_cache(market, pulse)
@@ -2758,6 +3051,13 @@ def _extract_ohlcv(frame) -> pd.DataFrame:
     try:
         df["volume"] = (df["volume"] / 1000).astype(int)
         df = _trim_stale_trailing_days(df)
+        # 保留每根 K 棒的日期，才能知道官方行情是「同日覆蓋」還是「新增今日」。
+        date_index = pd.to_datetime(df.index, errors="coerce")
+        try:
+            date_index = date_index.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+        df["date"] = date_index.strftime("%Y-%m-%d")
         return df.reset_index(drop=True)
     except Exception:
         return None
@@ -2786,7 +3086,7 @@ def _trim_stale_trailing_days(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:last_valid]
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def download_batch_history(tickers: tuple) -> dict:
     if not tickers:
         return {}
@@ -2818,6 +3118,16 @@ def download_batch_history(tickers: tuple) -> dict:
                 continue
             if df is not None:
                 result[tk] = df
+
+    # [修正] Yahoo/yfinance 對台股日線可能晚一個交易日（上市 .TW 特別常見）。
+    # 以交易所官方最新收盤行情補尾端：日期較新就新增，同一天則覆蓋 OHLCV。
+    try:
+        official_map = _official_quote_map_for_tickers(tickers)
+        for tk, quote in official_map.items():
+            if tk in result:
+                result[tk] = _merge_latest_official_quote(result[tk], quote)
+    except Exception:
+        pass
     return result
 
 # ============================================================
@@ -4432,7 +4742,7 @@ def render_hot_industries(df: pd.DataFrame):
 
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_kline_data(code: str, market: str) -> pd.DataFrame:
     rows = []
     now  = get_tw_now()
@@ -4444,9 +4754,11 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
             yyyymm = f"{year_offset}{month_val:02d}01"
-            url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm}&stockNo={code}"
+            # 加時間戳與 no-cache 標頭，避免上市月行情在收盤後仍拿到前一天的 CDN 快取。
+            url = (f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+                   f"?response=json&date={yyyymm}&stockNo={code}&_={int(time.time())}")
             try:
-                r = requests.get(url, headers=get_headers(), timeout=10)
+                r = requests.get(url, headers=_mp_api_headers(url), timeout=(4, 10), verify=False)
                 for row in r.json().get("data", []):
                     try:
                         yy, mm, dd = str(row[0]).split("/")
@@ -4468,9 +4780,10 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
             year_offset  = now.year + (month_offset - 1) // 12
             month_val    = (month_offset - 1) % 12 + 1
             roc_ym = f"{year_offset - 1911}/{month_val:02d}"
-            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_ym}&stkno={code}"
+            url = (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+                   f"?l=zh-tw&d={roc_ym}&stkno={code}&_={int(time.time())}")
             try:
-                r = requests.get(url, headers=get_headers(), timeout=10)
+                r = requests.get(url, headers=_mp_api_headers(url), timeout=(4, 10), verify=False)
                 for row in r.json().get("aaData", []):
                     try:
                         yy, mm, dd = str(row[0]).split("/")
@@ -4489,10 +4802,19 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+    # 月行情端點偶爾在收盤後仍停在前一日，再以全市場官方最新收盤行情補齊。
+    try:
+        suffix = "TW" if market == "TW" else "TWO"
+        official = _official_quote_map_for_tickers((f"{code}.{suffix}",)).get(f"{code}.{suffix}")
+        if official:
+            df = _merge_latest_official_quote(df, official)
+    except Exception:
+        pass
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
     """還原股價（除權息還原）K線資料，來源 yfinance auto_adjust=True。
 
@@ -4518,6 +4840,13 @@ def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
                                  "Low": "low", "Close": "close", "Volume": "volume"})
         df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
         df["volume"] = (df["volume"] / 1000).astype(int)
+        # 還原股價來源也可能慢一天；最新一根以官方 OHLCV 補齊。
+        try:
+            official = _official_quote_map_for_tickers((ticker,)).get(ticker)
+            if official:
+                df = _merge_latest_official_quote(df, official)
+        except Exception:
+            pass
         return df
     except Exception:
         return pd.DataFrame()
@@ -8539,7 +8868,12 @@ with tab_market:
                 )
             else:
                 _industry_method = pulse.get("industry_method", "official_index")
-                if _industry_method == "equal_weight_fallback":
+                if _industry_method == "stale_index_fallback":
+                    st.info(
+                        "今日個股收盤行情已更新，但證交所類股指數 latest 檔仍停在前一日；"
+                        "目前先用今日成分股等權平均，官方指數更新後會自動切回。"
+                    )
+                elif _industry_method == "equal_weight_fallback":
                     st.warning(
                         "官方類股指數端點目前暫時無法取得，以下漲跌幅為成分股等權平均備援；"
                         "此口徑不會與玩股網完全一致。官方指數恢復後會自動切回正確口徑。"
