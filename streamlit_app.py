@@ -2117,8 +2117,8 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
         #   1. afterTrading JSON → 收盤後當天（約 15:30 後更新）
         #   2. open_data 版      → 通常也是當天，但有時較慢
         #   3. openapi.twse v1   → 永遠只有「前一個交易日」的盤後資料
-        # 只要前面成功就不打後面，所以 openapi v1 放最後當備援，
-        # 避免它搶先回前一天的資料。
+        # afterTrading 回傳格式是 {"fields9":[...], "data9":[[...],...]}
+        # 跟 openapi v1 的 [{key:value},...] 不同，下面有轉換邏輯。
         urls = [
             f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&_={bust}",
             f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data&_={bust}",
@@ -2144,19 +2144,19 @@ def fetch_official_market_quotes(market: str) -> pd.DataFrame:
 
         # afterTrading 端點回傳 {"data9": [[...], ...], "fields9": [...]}，
         # 是二維陣列（list of list）而非 dict 列表。需要用 fields 欄位名
-        # 當 key 把每一列轉成 dict，後續 _mp_normalize_quote 才認得。
-        if rows_payload and isinstance(rows_payload[0], list):
+        # 當 key 把每一列 zip 成 dict，後續 _mp_normalize_quote 才認得。
+        if rows_payload and isinstance(rows_payload[0], (list, tuple)):
             fields = None
             if isinstance(payload, dict):
-                for fk in ("fields9", "fields", "field"):
+                for fk in ("fields9", "fields", "field", "columns"):
                     if fk in payload and isinstance(payload[fk], list):
-                        fields = payload[fk]
+                        fields = [str(f).strip() for f in payload[fk]]
                         break
             if fields and len(fields) >= 5:
                 rows_payload = [
                     dict(zip(fields, row))
                     for row in rows_payload
-                    if isinstance(row, list) and len(row) == len(fields)
+                    if isinstance(row, (list, tuple)) and len(row) == len(fields)
                 ]
             else:
                 continue  # 沒有欄位名就沒辦法轉換，換下一個 URL
