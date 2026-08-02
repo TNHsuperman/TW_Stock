@@ -29,7 +29,7 @@ st.set_page_config(
     page_title="台股智慧選股｜操作中心",
     layout="wide",
     page_icon="https://cdn-icons-png.flaticon.com/512/2953/2953423.png",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",  # 系統資訊在側邊欄，預設展開方便查看
 )
 
 USER_AGENTS = [
@@ -5926,8 +5926,24 @@ st.markdown("""
   --radius:16px;
 }
 
-[data-testid='stHeader'],[data-testid='stToolbar'],[data-testid='stSidebar'],
-[data-testid='collapsedControl'],[data-testid='stSidebarCollapseButton']{display:none!important;}
+/* 隱藏 Streamlit 預設的 header 與 toolbar，但保留側邊欄（系統資訊用）。
+   原本連 stSidebar / collapsedControl / stSidebarCollapseButton 一起隱藏，
+   會導致側邊欄與開關按鈕完全看不到。 */
+[data-testid='stHeader'],[data-testid='stToolbar']{display:none!important;}
+/* 側邊欄開關按鈕：header 被隱藏後要自己定位，否則會被蓋住或跑掉 */
+[data-testid='stSidebarCollapseButton'],[data-testid='collapsedControl']{
+  display:flex!important;visibility:visible!important;opacity:1!important;
+  position:fixed!important;top:10px!important;left:10px!important;z-index:999999!important;
+  background:rgba(110,168,254,.18)!important;border:1px solid rgba(110,168,254,.45)!important;
+  border-radius:8px!important;padding:4px 8px!important;}
+[data-testid='stSidebarCollapseButton'] svg,[data-testid='collapsedControl'] svg{
+  fill:#9fc5ff!important;color:#9fc5ff!important;}
+[data-testid='stSidebar']{display:block!important;visibility:visible!important;
+  background:var(--surface)!important;border-right:1px solid var(--border)!important;}
+[data-testid='stSidebar'] *{color:#e8eef8;}
+[data-testid='stSidebar'] .stMarkdown p,[data-testid='stSidebar'] .stMarkdown li{
+  color:#cbd6e4!important;font-size:13px;}
+[data-testid='stSidebar'] h3{color:#f3f7fd!important;font-size:16px!important;}
 
 html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
   background:
