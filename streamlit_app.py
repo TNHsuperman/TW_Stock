@@ -5926,20 +5926,69 @@ st.markdown("""
   --radius:16px;
 }
 
-/* 隱藏 Streamlit 預設的 header 與 toolbar，但保留側邊欄（系統資訊用）。
-   原本連 stSidebar / collapsedControl / stSidebarCollapseButton 一起隱藏，
-   會導致側邊欄與開關按鈕完全看不到。 */
-[data-testid='stHeader'],[data-testid='stToolbar']{display:none!important;}
-/* 側邊欄開關按鈕：header 被隱藏後要自己定位，否則會被蓋住或跑掉 */
-[data-testid='stSidebarCollapseButton'],[data-testid='collapsedControl']{
-  display:flex!important;visibility:visible!important;opacity:1!important;
-  position:fixed!important;top:10px!important;left:10px!important;z-index:999999!important;
-  background:rgba(110,168,254,.18)!important;border:1px solid rgba(110,168,254,.45)!important;
-  border-radius:8px!important;padding:4px 8px!important;}
-[data-testid='stSidebarCollapseButton'] svg,[data-testid='collapsedControl'] svg{
-  fill:#9fc5ff!important;color:#9fc5ff!important;}
-[data-testid='stSidebar']{display:block!important;visibility:visible!important;
-  background:var(--surface)!important;border-right:1px solid var(--border)!important;}
+/* ── Streamlit 側邊欄修正 ───────────────────────────────────
+   不可把整個 stHeader 設成 display:none：新版 Streamlit 的「展開側邊欄」
+   按鈕位於 Header 內，父層被隱藏後，子按鈕即使設 display:flex 也不會出現。
+   這裡保留透明 Header，只隱藏右上角工具列，確保側邊欄可正常收合／展開。 */
+[data-testid='stHeader']{
+  display:block!important;
+  visibility:visible!important;
+  background:transparent!important;
+  box-shadow:none!important;
+  pointer-events:none!important;
+}
+[data-testid='stToolbar']{display:none!important;}
+
+/* 相容不同 Streamlit 版本的側邊欄收合／展開按鈕 selector。 */
+[data-testid='stSidebarCollapseButton'],
+[data-testid='collapsedControl'],
+[data-testid='stSidebarCollapsedControl']{
+  display:flex!important;
+  visibility:visible!important;
+  opacity:1!important;
+  pointer-events:auto!important;
+  z-index:999999!important;
+}
+
+/* 側邊欄已收合時，展開按鈕固定在左上角，避免被主畫面蓋住。 */
+[data-testid='collapsedControl'],
+[data-testid='stSidebarCollapsedControl']{
+  position:fixed!important;
+  top:10px!important;
+  left:10px!important;
+  width:38px!important;
+  height:38px!important;
+  padding:0!important;
+  align-items:center!important;
+  justify-content:center!important;
+  background:rgba(13,22,36,.96)!important;
+  border:1px solid rgba(110,168,254,.45)!important;
+  border-radius:9px!important;
+  box-shadow:0 8px 22px rgba(0,0,0,.30)!important;
+}
+
+/* 展開後的收合按鈕維持可點擊，不強制 fixed，避免壓住側邊欄內容。 */
+[data-testid='stSidebarCollapseButton']{
+  pointer-events:auto!important;
+}
+[data-testid='stSidebarCollapseButton'] svg,
+[data-testid='collapsedControl'] svg,
+[data-testid='stSidebarCollapsedControl'] svg{
+  fill:#9fc5ff!important;
+  color:#9fc5ff!important;
+}
+
+[data-testid='stSidebar']{
+  display:block!important;
+  visibility:visible!important;
+  opacity:1!important;
+  background:var(--surface)!important;
+  border-right:1px solid var(--border)!important;
+  z-index:99999!important;
+}
+[data-testid='stSidebar'] > div:first-child{
+  padding-top:1.25rem!important;
+}
 [data-testid='stSidebar'] *{color:#e8eef8;}
 [data-testid='stSidebar'] .stMarkdown p,[data-testid='stSidebar'] .stMarkdown li{
   color:#cbd6e4!important;font-size:13px;}
