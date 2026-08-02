@@ -38,6 +38,281 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
+# ============================================================
+# TEJ API 整合層：每日同步 + 本地 SQLite 快取
+# ============================================================
+import sqlite3
+
+_TEJ_DB = "tej_cache.db"
+_TEJ_AVAILABLE = False
+
+try:
+    import tejapi
+    _tej_key = st.secrets.get("TEJ_API_KEY", "")
+    if _tej_key:
+        tejapi.ApiConfig.api_key = _tej_key
+        _TEJ_AVAILABLE = True
+except Exception:
+    pass
+
+
+def _tej_db_conn():
+    """取得 SQLite 連線，首次使用時自動建表。"""
+    conn = sqlite3.connect(_TEJ_DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS sync_log ("
+                 "table_name TEXT PRIMARY KEY, sync_date TEXT)")
+    return conn
+
+
+def _tej_today_synced(table: str) -> bool:
+    """檢查某張表今天有沒有同步過。"""
+    try:
+        conn = _tej_db_conn()
+        row = conn.execute(
+            "SELECT sync_date FROM sync_log WHERE table_name=?", (table,)
+        ).fetchone()
+        conn.close()
+        today = get_tw_now().strftime("%Y-%m-%d")
+        return row is not None and row[0] == today
+    except Exception:
+        return False
+
+
+def _tej_mark_synced(conn, table: str):
+    """標記某張表已完成今日同步。"""
+    today = get_tw_now().strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_log (table_name, sync_date) VALUES (?,?)",
+        (table, today)
+    )
+    conn.commit()
+
+
+def _tej_sync_table(table_name: str, tej_code: str, opts: dict = None,
+                    extra_filter: dict = None) -> bool:
+    """從 TEJ 抓一整張表存進 SQLite。回傳是否成功。
+
+    這是批次抓全市場的函式，一次 1~2 個 API call 就拿完全部。
+    """
+    if not _TEJ_AVAILABLE:
+        return False
+    if _tej_today_synced(table_name):
+        return True
+    try:
+        params = {"paginate": True, "chinese_column_name": True}
+        if opts:
+            params["opts"] = opts
+        if extra_filter:
+            params.update(extra_filter)
+        df = tejapi.get(tej_code, **params)
+        if df is None or df.empty:
+            return False
+        conn = _tej_db_conn()
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+        _tej_mark_synced(conn, table_name)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _tej_read_table(table_name: str, where: str = None,
+                    params: tuple = None) -> pd.DataFrame:
+    """從本地 SQLite 讀取資料。"""
+    try:
+        conn = _tej_db_conn()
+        sql = f"SELECT * FROM {table_name}"
+        if where:
+            sql += f" WHERE {where}"
+        df = pd.read_sql(sql, conn, params=params)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ── 每日同步函式（收盤後第一個人進來時觸發） ──────────────────
+
+def tej_sync_daily_quotes():
+    """同步全市場當日行情（上市＋上櫃）。"""
+    today = get_tw_now().strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        "tej_daily_quotes", "TWN/APRCD",
+        opts={"columns": ["coid", "mdate", "open_d", "high_d", "low_d",
+                          "close_d", "volume", "change_d", "return_d"]},
+        extra_filter={"mdate": {"gte": today, "lte": today}},
+    )
+
+
+def tej_sync_daily_quotes_history(days: int = 5):
+    """同步近 N 日全市場行情（給漲跌分布用的歷史比對）。"""
+    start = (get_tw_now() - timedelta(days=days + 5)).strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        "tej_daily_history", "TWN/APRCD",
+        opts={"columns": ["coid", "mdate", "open_d", "high_d", "low_d",
+                          "close_d", "volume", "change_d"]},
+        extra_filter={"mdate": {"gte": start}},
+    )
+
+
+def tej_sync_adjusted_prices():
+    """同步還原除權息股價（5 年），只在首次或每週一同步。"""
+    table = "tej_adjusted_prices"
+    # 每週一或首次才同步（還原股價不需要每天更新）
+    if _tej_today_synced(table):
+        return True
+    weekday = get_tw_now().weekday()
+    if weekday != 0:  # 不是週一
+        try:
+            conn = _tej_db_conn()
+            row = conn.execute(
+                "SELECT sync_date FROM sync_log WHERE table_name=?", (table,)
+            ).fetchone()
+            conn.close()
+            if row is not None:  # 之前同步過就不重複
+                return True
+        except Exception:
+            pass
+
+    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        table, "TWN/APRCD2",
+        opts={"columns": ["coid", "mdate", "close_adj"]},
+        extra_filter={"mdate": {"gte": start}},
+    )
+
+
+def tej_sync_financial_statements():
+    """同步合併財報（累計），每季同步一次。"""
+    table = "tej_financials"
+    if _tej_today_synced(table):
+        return True
+    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        table, "TWN/AIM1A",
+        opts={"columns": ["coid", "mdate", "R531", "R504", "R106",
+                          "R401", "R201", "R301", "R103", "R109"]},
+        extra_filter={"mdate": {"gte": start}},
+    )
+
+
+def tej_sync_eps():
+    """同步季度 EPS。"""
+    table = "tej_eps"
+    if _tej_today_synced(table):
+        return True
+    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        table, "TWN/AEPS",
+        extra_filter={"mdate": {"gte": start}},
+    )
+
+
+def tej_sync_industry_indices():
+    """同步產業指數日行情（達人方案才有 58 檔）。"""
+    today = get_tw_now().strftime("%Y-%m-%d")
+    return _tej_sync_table(
+        "tej_industry_idx", "TWN/AIND",
+        extra_filter={"mdate": {"gte": today, "lte": today}},
+    )
+
+
+# ── 讀取函式：從本地 SQLite 讀，格式轉成跟原本的函式一致 ──────
+
+def tej_get_stock_quote(code: str) -> dict:
+    """從本地快取讀取個股當日行情，格式同 _mp_normalize_quote 的輸出。"""
+    tej_sync_daily_quotes()
+    df = _tej_read_table("tej_daily_quotes", "coid=?", (code,))
+    if df.empty:
+        return {}
+    row = df.iloc[-1]
+    close = float(row.get("close_d", 0) or 0)
+    change = float(row.get("change_d", 0) or 0)
+    prev = close - change if close else 0
+    pct = (change / prev * 100) if prev > 0 else 0.0
+    return {
+        "code": code,
+        "收盤": close,
+        "開盤": float(row.get("open_d", 0) or 0),
+        "最高": float(row.get("high_d", 0) or 0),
+        "最低": float(row.get("low_d", 0) or 0),
+        "漲跌幅(%)": pct,
+        "成交量(張)": float(row.get("volume", 0) or 0) / 1000,
+        "日期": str(row.get("mdate", "")),
+    }
+
+
+def tej_get_financial_ratios(code: str) -> dict:
+    """從 TEJ 財報資料算出財務比率，格式同 fetch_financial_ratios 的輸出。"""
+    tej_sync_financial_statements()
+    df = _tej_read_table("tej_financials", "coid=?", (code,))
+    if df.empty:
+        return {}
+    latest = df.sort_values("mdate").iloc[-1]
+    year = str(latest.get("mdate", ""))[:4]
+    metrics = {}
+    # TEJ 欄位代碼對應
+    mapping = {
+        "負債占資產比率": "R201",     # 負債比率
+        "流動比率": "R301",           # 流動比率
+        "營業利益率": "R401",         # 營業利益率
+        "純益率": "R106",             # 稅後純益率
+        "總資產報酬率": "R109",       # ROA
+        "股東權益報酬率": "R531",     # ROE
+    }
+    for name, col in mapping.items():
+        v = latest.get(col)
+        if v is not None and pd.notna(v):
+            try:
+                metrics[name] = float(v)
+            except (ValueError, TypeError):
+                pass
+    if not metrics:
+        return {}
+    return {"year": f"{year}年", "metrics": metrics}
+
+
+def tej_get_quarterly_eps(code: str) -> list:
+    """從 TEJ 讀季度 EPS，格式同 fetch_quarterly_eps 的輸出。"""
+    tej_sync_eps()
+    df = _tej_read_table("tej_eps", "coid=?", (code,))
+    if df.empty:
+        return []
+    df = df.sort_values("mdate", ascending=False)
+    rows = []
+    for _, r in df.iterrows():
+        date_str = str(r.get("mdate", ""))
+        # 從日期推算年季
+        try:
+            dt = pd.to_datetime(date_str)
+            q = (dt.month - 1) // 3 + 1
+            year_q = f"{dt.year}Q{q}"
+        except Exception:
+            year_q = date_str
+        eps_val = r.get("eps", r.get("EPS", np.nan))
+        if pd.notna(eps_val):
+            rows.append({"年季": year_q, "EPS": float(eps_val)})
+    return rows
+
+
+def tej_get_adjusted_close(code: str) -> pd.DataFrame:
+    """從 TEJ 讀還原股價，回傳 DataFrame(date, close)。"""
+    tej_sync_adjusted_prices()
+    df = _tej_read_table("tej_adjusted_prices", "coid=?", (code,))
+    if df.empty:
+        return pd.DataFrame()
+    df = df.sort_values("mdate")
+    return pd.DataFrame({
+        "date": pd.to_datetime(df["mdate"]),
+        "close": df["close_adj"].astype(float),
+    }).reset_index(drop=True)
+
+
+def tej_is_available() -> bool:
+    """TEJ API 是否可用（有設 API Key 且套件已安裝）。"""
+    return _TEJ_AVAILABLE
+
+
 def get_headers():
     return {
         'User-Agent': random.choice(USER_AGENTS),
@@ -921,9 +1196,12 @@ def _extract_yahoo_eps_quarterly_from_html(html: str) -> list:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
-    """單季 EPS 列表（近期，依 Yahoo 股市頁面揭露筆數而定，通常近 8~20 季）。
-    台灣公司財報依法為季揭露，這裡的清單以「季」為單位，非每月更新。
-    """
+    """單季 EPS。優先用 TEJ，TEJ 不可用時退回 Yahoo 股市爬蟲。"""
+    if tej_is_available():
+        result = tej_get_quarterly_eps(code)
+        if result:
+            return result
+    # ── 退回原本的 Yahoo 爬蟲 ──
     ticker = f"{code}.{market_suffix}"
     try:
         r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/eps",
@@ -1573,10 +1851,12 @@ def fetch_margin_trading(code: str, market_suffix: str) -> list:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_financial_ratios(code: str) -> dict:
-    """個股年度財務比率（負債比率、流動比率、ROE、ROA、獲利能力等）。
-    來源：Anue鉅亨網「年度財務比率」頁面。回傳 {"year": "2025年", "metrics": {...}}，
-    抓不到時回傳 {}（fail-open）。
-    """
+    """個股年度財務比率。優先用 TEJ，TEJ 不可用時退回 Anue 爬蟲。"""
+    if tej_is_available():
+        result = tej_get_financial_ratios(code)
+        if result:
+            return result
+    # ── 退回原本的 Anue 爬蟲 ──
     url = f"https://www.cnyes.com/twstock/finratio2.aspx?code={code}"
     try:
         r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
@@ -4816,6 +5096,13 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
+    # 優先用 TEJ 還原股價（斜槓方案以上，資料更穩定）
+    if tej_is_available():
+        _adj_code = ticker.split(".")[0]
+        _adj_df = tej_get_adjusted_close(_adj_code)
+        if not _adj_df.empty:
+            return _adj_df
+    # ── 退回原本的 yfinance ──
     """還原股價（除權息還原）K線資料，來源 yfinance auto_adjust=True。
 
     get_kline_data() 抓的是 TWSE/TPEx 官方原始成交價，不會因除權息往回調整；
