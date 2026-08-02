@@ -5931,13 +5931,26 @@ st.markdown("""
    按鈕位於 Header 內，父層被隱藏後，子按鈕即使設 display:flex 也不會出現。
    這裡保留透明 Header，只隱藏右上角工具列，確保側邊欄可正常收合／展開。 */
 [data-testid='stHeader']{
-  display:block!important;
+  display:flex!important;
   visibility:visible!important;
+  opacity:1!important;
   background:transparent!important;
   box-shadow:none!important;
-  pointer-events:none!important;
+  pointer-events:auto!important;
 }
-[data-testid='stToolbar']{display:none!important;}
+/* 不再隱藏整個 Toolbar。部分 Streamlit 版本會把側邊欄開關放在這裡。 */
+[data-testid='stToolbar']{
+  display:flex!important;
+  visibility:visible!important;
+  opacity:1!important;
+  pointer-events:auto!important;
+}
+/* 只隱藏不必要的右上角功能，不影響側邊欄控制。 */
+[data-testid='stMainMenu'],
+[data-testid='stStatusWidget'],
+[data-testid='stDeployButton']{
+  display:none!important;
+}
 
 /* 相容不同 Streamlit 版本的側邊欄收合／展開按鈕 selector。 */
 [data-testid='stSidebarCollapseButton'],
@@ -5993,6 +6006,57 @@ st.markdown("""
 [data-testid='stSidebar'] .stMarkdown p,[data-testid='stSidebar'] .stMarkdown li{
   color:#cbd6e4!important;font-size:13px;}
 [data-testid='stSidebar'] h3{color:#f3f7fd!important;font-size:16px!important;}
+
+/* ── 桌面版保底：直接強制顯示側邊欄 ──────────────────────────
+   initial_sidebar_state 只決定初始狀態；若瀏覽器工作階段保留了收合狀態，
+   或新版前端改變控制按鈕位置，仍可能維持收合。因此桌面版直接固定展開。 */
+@media (min-width:901px){
+  section[data-testid='stSidebar'],
+  section[data-testid='stSidebar'][aria-expanded='false'],
+  section[data-testid='stSidebar'][aria-expanded='true']{
+    display:block!important;
+    visibility:visible!important;
+    opacity:1!important;
+    position:fixed!important;
+    inset:0 auto 0 0!important;
+    width:320px!important;
+    min-width:320px!important;
+    max-width:320px!important;
+    height:100vh!important;
+    margin:0!important;
+    transform:none!important;
+    translate:none!important;
+    overflow:visible!important;
+    z-index:100000!important;
+  }
+  section[data-testid='stSidebar'] > div:first-child{
+    display:block!important;
+    width:320px!important;
+    height:100vh!important;
+    overflow-y:auto!important;
+    padding-top:1.25rem!important;
+  }
+  /* 側邊欄改成 fixed 後，主畫面向右讓出 320px，避免互相遮住。 */
+  [data-testid='stAppViewContainer'] > [data-testid='stMain'],
+  [data-testid='stAppViewContainer'] > .main,
+  [data-testid='stMain']{
+    margin-left:320px!important;
+    width:calc(100% - 320px)!important;
+    max-width:calc(100% - 320px)!important;
+  }
+}
+
+/* 再相容沒有固定 data-testid、只提供 aria-label 的版本。 */
+button[aria-label*='sidebar' i],
+button[title*='sidebar' i],
+button[aria-label*='側邊欄'],
+button[title*='側邊欄']{
+  display:inline-flex!important;
+  visibility:visible!important;
+  opacity:1!important;
+  pointer-events:auto!important;
+  z-index:100001!important;
+}
 
 html,body,[data-testid='stAppViewContainer'],[data-testid='stMain']{
   background:
