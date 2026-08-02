@@ -6597,6 +6597,118 @@ def wb_bar_row(label, pct, color="#36c99a"):
 
 
 
+# ============================================================
+# 系統資訊（側邊欄）：TEJ 快取狀態 + 檔案系統
+# ============================================================
+with st.sidebar:
+    st.markdown("### 🔧 系統資訊")
+
+    # ── TEJ API 狀態 ──
+    if tej_is_available():
+        st.success("TEJ API：已連線", icon="✅")
+    else:
+        st.warning("TEJ API：未連線（使用免費來源）", icon="⚠️")
+        st.caption("到 Settings → Secrets 加入 TEJ_API_KEY 即可啟用。")
+
+    # ── SQLite 快取狀態 ──
+    _sys_db_path = os.path.join(os.getcwd(), _TEJ_DB)
+    if os.path.exists(_sys_db_path):
+        _sys_db_size = os.path.getsize(_sys_db_path)
+        if _sys_db_size < 1024:
+            _sys_size_txt = f"{_sys_db_size} B"
+        elif _sys_db_size < 1024 * 1024:
+            _sys_size_txt = f"{_sys_db_size / 1024:.1f} KB"
+        else:
+            _sys_size_txt = f"{_sys_db_size / (1024 * 1024):.1f} MB"
+
+        st.markdown(f"**快取檔案**：`{_TEJ_DB}`")
+        st.markdown(f"**檔案大小**：{_sys_size_txt}")
+
+        # 讀取同步紀錄
+        try:
+            _sys_conn = sqlite3.connect(_sys_db_path)
+            _sys_log = pd.read_sql("SELECT * FROM sync_log ORDER BY sync_date DESC", _sys_conn)
+
+            # 統計各表筆數
+            _sys_tables = pd.read_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sync_log'",
+                _sys_conn
+            )
+            _sys_counts = []
+            for _t in _sys_tables["name"]:
+                try:
+                    _cnt = _sys_conn.execute(f"SELECT COUNT(*) FROM [{_t}]").fetchone()[0]
+                    _sys_counts.append({"資料表": _t, "筆數": f"{_cnt:,}"})
+                except Exception:
+                    _sys_counts.append({"資料表": _t, "筆數": "讀取失敗"})
+            _sys_conn.close()
+
+            if not _sys_log.empty:
+                st.markdown("**同步紀錄**")
+                for _, _row in _sys_log.iterrows():
+                    st.markdown(
+                        f"- `{_row['table_name']}` → {_row['sync_date']}"
+                    )
+            else:
+                st.caption("尚無同步紀錄")
+
+            if _sys_counts:
+                st.markdown("**資料表統計**")
+                st.dataframe(
+                    pd.DataFrame(_sys_counts),
+                    hide_index=True, use_container_width=True,
+                )
+        except Exception as _e:
+            st.caption(f"讀取快取狀態失敗：{_e}")
+    else:
+        st.info(f"快取檔案 `{_TEJ_DB}` 尚未建立（首次使用 TEJ 時會自動建立）。")
+
+    # ── 檔案系統資訊 ──
+    with st.expander("📂 工作目錄檔案清單", expanded=False):
+        _sys_cwd = os.getcwd()
+        st.code(_sys_cwd, language=None)
+        try:
+            _sys_files = []
+            for _f in sorted(os.listdir(_sys_cwd)):
+                _fp = os.path.join(_sys_cwd, _f)
+                if os.path.isfile(_fp):
+                    _fs = os.path.getsize(_fp)
+                    if _fs < 1024:
+                        _fst = f"{_fs} B"
+                    elif _fs < 1024 * 1024:
+                        _fst = f"{_fs / 1024:.1f} KB"
+                    else:
+                        _fst = f"{_fs / (1024 * 1024):.1f} MB"
+                    _sys_files.append({"檔案": _f, "大小": _fst})
+                else:
+                    _sys_files.append({"檔案": f"📁 {_f}/", "大小": ""})
+            if _sys_files:
+                st.dataframe(pd.DataFrame(_sys_files), hide_index=True,
+                             use_container_width=True)
+        except Exception as _e:
+            st.caption(f"無法列出檔案：{_e}")
+
+    # ── 手動重新同步按鈕 ──
+    if tej_is_available():
+        if st.button("🔄 強制重新同步 TEJ", use_container_width=True,
+                     help="清除今日同步標記，下次讀取資料時會重新從 TEJ 抓取。"):
+            try:
+                _sys_conn = sqlite3.connect(_sys_db_path)
+                _sys_conn.execute("DELETE FROM sync_log")
+                _sys_conn.commit()
+                _sys_conn.close()
+                st.success("已清除同步標記，資料將在下次使用時重新同步。")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"清除失敗：{_e}")
+
+    st.divider()
+    st.caption(
+        f"工作目錄：`{os.getcwd()}`\n\n"
+        f"台灣時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
 
@@ -9318,113 +9430,3 @@ with tab_market:
                 )
 
 
-# ============================================================
-# 系統資訊（側邊欄）：TEJ 快取狀態 + 檔案系統
-# ============================================================
-with st.sidebar:
-    st.markdown("### 🔧 系統資訊")
-
-    # ── TEJ API 狀態 ──
-    if tej_is_available():
-        st.success("TEJ API：已連線", icon="✅")
-    else:
-        st.warning("TEJ API：未連線（使用免費來源）", icon="⚠️")
-        st.caption("到 Settings → Secrets 加入 TEJ_API_KEY 即可啟用。")
-
-    # ── SQLite 快取狀態 ──
-    _sys_db_path = os.path.join(os.getcwd(), _TEJ_DB)
-    if os.path.exists(_sys_db_path):
-        _sys_db_size = os.path.getsize(_sys_db_path)
-        if _sys_db_size < 1024:
-            _sys_size_txt = f"{_sys_db_size} B"
-        elif _sys_db_size < 1024 * 1024:
-            _sys_size_txt = f"{_sys_db_size / 1024:.1f} KB"
-        else:
-            _sys_size_txt = f"{_sys_db_size / (1024 * 1024):.1f} MB"
-
-        st.markdown(f"**快取檔案**：`{_TEJ_DB}`")
-        st.markdown(f"**檔案大小**：{_sys_size_txt}")
-
-        # 讀取同步紀錄
-        try:
-            _sys_conn = sqlite3.connect(_sys_db_path)
-            _sys_log = pd.read_sql("SELECT * FROM sync_log ORDER BY sync_date DESC", _sys_conn)
-
-            # 統計各表筆數
-            _sys_tables = pd.read_sql(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sync_log'",
-                _sys_conn
-            )
-            _sys_counts = []
-            for _t in _sys_tables["name"]:
-                try:
-                    _cnt = _sys_conn.execute(f"SELECT COUNT(*) FROM [{_t}]").fetchone()[0]
-                    _sys_counts.append({"資料表": _t, "筆數": f"{_cnt:,}"})
-                except Exception:
-                    _sys_counts.append({"資料表": _t, "筆數": "讀取失敗"})
-            _sys_conn.close()
-
-            if not _sys_log.empty:
-                st.markdown("**同步紀錄**")
-                for _, _row in _sys_log.iterrows():
-                    st.markdown(
-                        f"- `{_row['table_name']}` → {_row['sync_date']}"
-                    )
-            else:
-                st.caption("尚無同步紀錄")
-
-            if _sys_counts:
-                st.markdown("**資料表統計**")
-                st.dataframe(
-                    pd.DataFrame(_sys_counts),
-                    hide_index=True, use_container_width=True,
-                )
-        except Exception as _e:
-            st.caption(f"讀取快取狀態失敗：{_e}")
-    else:
-        st.info(f"快取檔案 `{_TEJ_DB}` 尚未建立（首次使用 TEJ 時會自動建立）。")
-
-    # ── 檔案系統資訊 ──
-    with st.expander("📂 工作目錄檔案清單", expanded=False):
-        _sys_cwd = os.getcwd()
-        st.code(_sys_cwd, language=None)
-        try:
-            _sys_files = []
-            for _f in sorted(os.listdir(_sys_cwd)):
-                _fp = os.path.join(_sys_cwd, _f)
-                if os.path.isfile(_fp):
-                    _fs = os.path.getsize(_fp)
-                    if _fs < 1024:
-                        _fst = f"{_fs} B"
-                    elif _fs < 1024 * 1024:
-                        _fst = f"{_fs / 1024:.1f} KB"
-                    else:
-                        _fst = f"{_fs / (1024 * 1024):.1f} MB"
-                    _sys_files.append({"檔案": _f, "大小": _fst})
-                else:
-                    _sys_files.append({"檔案": f"📁 {_f}/", "大小": ""})
-            if _sys_files:
-                st.dataframe(pd.DataFrame(_sys_files), hide_index=True,
-                             use_container_width=True)
-        except Exception as _e:
-            st.caption(f"無法列出檔案：{_e}")
-
-    # ── 手動重新同步按鈕 ──
-    if tej_is_available():
-        if st.button("🔄 強制重新同步 TEJ", use_container_width=True,
-                     help="清除今日同步標記，下次讀取資料時會重新從 TEJ 抓取。"):
-            try:
-                _sys_conn = sqlite3.connect(_sys_db_path)
-                _sys_conn.execute("DELETE FROM sync_log")
-                _sys_conn.commit()
-                _sys_conn.close()
-                st.success("已清除同步標記，資料將在下次使用時重新同步。")
-                st.rerun()
-            except Exception as _e:
-                st.error(f"清除失敗：{_e}")
-
-    st.divider()
-    st.caption(
-        f"工作目錄：`{os.getcwd()}`\n\n"
-        f"台灣時間：{get_tw_now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
