@@ -38,627 +38,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
-# ============================================================
-# TEJ API 整合層：每日同步 + 本地 SQLite 快取
-# ============================================================
-import sqlite3
-
-_TEJ_DB = os.path.join(
-    os.path.dirname(__file__) if '__file__' in globals() else '.',
-    'tej_cache.db',
-)
-_TEJ_AVAILABLE = False
-
-try:
-    import tejapi
-    _tej_key = str(st.secrets.get("TEJ_API_KEY", "") or "").strip()
-    if not _tej_key:
-        _tej_key = str(os.getenv("TEJ_API_KEY", "") or "").strip()
-    if _tej_key:
-        tejapi.ApiConfig.api_key = _tej_key
-        _TEJ_AVAILABLE = True
-except Exception:
-    pass
-
-
-def _tej_db_conn():
-    """取得 SQLite 連線，首次使用時自動建表。"""
-    db_dir = os.path.dirname(os.path.abspath(_TEJ_DB))
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(_TEJ_DB, timeout=30)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sync_log ("
-        "table_name TEXT PRIMARY KEY, sync_date TEXT)"
-    )
-    return conn
-
-
-def _tej_table_columns(table_name: str) -> set:
-    """讀取 SQLite 資料表欄位，用於偵測舊版快取結構。"""
-    try:
-        conn = _tej_db_conn()
-        rows = conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
-        conn.close()
-        return {str(row[1]).strip().lower() for row in rows}
-    except Exception:
-        return set()
-
-
-def _tej_table_has_rows(table_name: str) -> bool:
-    try:
-        conn = _tej_db_conn()
-        row = conn.execute(f'SELECT COUNT(1) FROM "{table_name}"').fetchone()
-        conn.close()
-        return bool(row and int(row[0] or 0) > 0)
-    except Exception:
-        return False
-
-
-def _tej_today_synced(table: str) -> bool:
-    """檢查某張表今天有沒有同步過。"""
-    try:
-        conn = _tej_db_conn()
-        row = conn.execute(
-            "SELECT sync_date FROM sync_log WHERE table_name=?", (table,)
-        ).fetchone()
-        conn.close()
-        today = get_tw_now().strftime("%Y-%m-%d")
-        return row is not None and row[0] == today
-    except Exception:
-        return False
-
-
-def _tej_cache_ready(table_name: str, required_columns=None) -> bool:
-    """今日已同步、資料不為空且欄位符合時，才視為可直接使用。"""
-    if not _tej_today_synced(table_name) or not _tej_table_has_rows(table_name):
-        return False
-    required = {str(c).strip().lower() for c in (required_columns or [])}
-    return not required or required.issubset(_tej_table_columns(table_name))
-
-
-def _tej_mark_synced(conn, table: str):
-    """標記某張表已完成今日同步。"""
-    today = get_tw_now().strftime("%Y-%m-%d")
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_log (table_name, sync_date) VALUES (?,?)",
-        (table, today),
-    )
-    conn.commit()
-
-
-def _tej_invalidate_tables(table_names):
-    """清除同步標記；下一次讀取時會重新向 TEJ 下載。"""
-    try:
-        conn = _tej_db_conn()
-        conn.executemany(
-            "DELETE FROM sync_log WHERE table_name=?",
-            [(str(name),) for name in table_names],
-        )
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
-def tej_invalidate_market_cache():
-    """供市場觀察的重新整理按鈕強制重抓 TEJ 行情與產業指數。"""
-    _tej_invalidate_tables(["tej_daily_quotes", "tej_industry_idx"])
-
-
-def _tej_find_column(columns, aliases):
-    """以不分大小寫方式尋找 TEJ 欄位。"""
-    lookup = {str(c).strip().lower(): c for c in columns}
-    for alias in aliases:
-        found = lookup.get(str(alias).strip().lower())
-        if found is not None:
-            return found
-    return None
-
-
-def _tej_get_value(record, aliases, default=np.nan):
-    """從 Series／dict 以多個可能欄名取值。"""
-    try:
-        keys = list(record.index) if hasattr(record, "index") else list(record.keys())
-    except Exception:
-        keys = []
-    col = _tej_find_column(keys, aliases)
-    if col is None:
-        return default
-    try:
-        value = record.get(col, default)
-    except Exception:
-        try:
-            value = record[col]
-        except Exception:
-            return default
-    return default if value is None else value
-
-
-def _tej_to_number(value, default=np.nan):
-    try:
-        number = float(str(value).replace(",", "").replace("%", "").strip())
-        return number if np.isfinite(number) else default
-    except Exception:
-        return default
-
-
-def _tej_keep_latest_mdate(df: pd.DataFrame) -> pd.DataFrame:
-    """TEJ 查近幾日後，只保留最新交易日，休市日也可取得上一交易日。"""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    date_col = _tej_find_column(df.columns, ["mdate", "date", "資料日期", "日期"])
-    if date_col is None:
-        return df
-    dates = pd.to_datetime(df[date_col], errors="coerce")
-    valid = dates.dropna()
-    if valid.empty:
-        return df
-    latest = valid.max().normalize()
-    return df.loc[dates.dt.normalize() == latest].copy()
-
-
-def _tej_sync_table(table_name: str, tej_code: str, opts: dict = None,
-                    extra_filter: dict = None, required_columns=None,
-                    postprocess=None, force: bool = False) -> bool:
-    """從 TEJ 抓取資料存進 SQLite；失敗時保留舊快取，不破壞既有功能。"""
-    if not _TEJ_AVAILABLE:
-        return False
-    if not force and _tej_cache_ready(table_name, required_columns):
-        return True
-
-    try:
-        params = {"paginate": True, "chinese_column_name": False}
-        if opts:
-            params["opts"] = opts
-        if extra_filter:
-            params.update(extra_filter)
-
-        df = tejapi.get(tej_code, **params)
-        if df is None or df.empty:
-            return False
-        df = pd.DataFrame(df).copy()
-        df.columns = [str(c).strip() for c in df.columns]
-
-        if callable(postprocess):
-            df = postprocess(df)
-        if df is None or df.empty:
-            return False
-
-        required = {str(c).strip().lower() for c in (required_columns or [])}
-        available = {str(c).strip().lower() for c in df.columns}
-        if required and not required.issubset(available):
-            return False
-
-        conn = _tej_db_conn()
-        df.to_sql(table_name, conn, if_exists="replace", index=False)
-        _tej_mark_synced(conn, table_name)
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
-def _tej_read_table(table_name: str, where: str = None,
-                    params: tuple = None) -> pd.DataFrame:
-    """從本地 SQLite 讀取資料。"""
-    try:
-        conn = _tej_db_conn()
-        sql = f'SELECT * FROM "{table_name}"'
-        if where:
-            sql += f" WHERE {where}"
-        df = pd.read_sql(sql, conn, params=params)
-        conn.close()
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-# ── 每日同步函式 ────────────────────────────────────────────────
-
-def tej_sync_daily_quotes(force: bool = False):
-    """同步全市場最新交易日行情；TWN/APRCD 為 TEJ 上市櫃未調整股價(日)。"""
-    start = (get_tw_now() - timedelta(days=20)).strftime("%Y-%m-%d")
-    columns = [
-        "coid", "mdate", "open_d", "high_d", "low_d", "close_d",
-        "volume", "amount", "roi", "clschg", "limit", "pmkt",
-    ]
-    return _tej_sync_table(
-        "tej_daily_quotes", "TWN/APRCD",
-        opts={"columns": columns, "sort": "mdate.desc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=columns,
-        postprocess=_tej_keep_latest_mdate,
-        force=force,
-    )
-
-
-def tej_sync_daily_quotes_history(days: int = 5, force: bool = False):
-    """同步近 N 日全市場行情，供後續歷史廣度或輪動分析使用。"""
-    start = (get_tw_now() - timedelta(days=max(int(days), 1) + 10)).strftime("%Y-%m-%d")
-    columns = [
-        "coid", "mdate", "open_d", "high_d", "low_d", "close_d",
-        "volume", "amount", "roi", "clschg", "limit", "pmkt",
-    ]
-    return _tej_sync_table(
-        "tej_daily_history", "TWN/APRCD",
-        opts={"columns": columns, "sort": "mdate.desc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=columns,
-        force=force,
-    )
-
-
-def tej_sync_adjusted_prices(force: bool = False):
-    """同步還原除權息股價（5 年），首次或每週一更新。"""
-    table = "tej_adjusted_prices"
-    required = ["coid", "mdate", "close_adj"]
-    if not force and _tej_cache_ready(table, required):
-        return True
-
-    weekday = get_tw_now().weekday()
-    if not force and weekday != 0 and _tej_table_has_rows(table):
-        return True
-
-    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
-    return _tej_sync_table(
-        table, "TWN/APRCD2",
-        opts={"columns": required, "sort": "mdate.asc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=required,
-        force=force,
-    )
-
-
-def tej_sync_financial_statements(force: bool = False):
-    """同步合併財報（累計）。"""
-    table = "tej_financials"
-    columns = ["coid", "mdate", "R531", "R504", "R106",
-               "R401", "R201", "R301", "R103", "R109"]
-    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
-    return _tej_sync_table(
-        table, "TWN/AIM1A",
-        opts={"columns": columns, "sort": "mdate.desc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=columns,
-        force=force,
-    )
-
-
-def tej_sync_eps(force: bool = False):
-    """同步季度 EPS。"""
-    table = "tej_eps"
-    start = (get_tw_now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
-    return _tej_sync_table(
-        table, "TWN/AEPS",
-        opts={"sort": "mdate.desc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=["coid", "mdate"],
-        force=force,
-    )
-
-
-def tej_sync_industry_indices(force: bool = False):
-    """同步 TEJ 產業指數；若方案沒有 TWN/AIND 權限會安全回傳 False。"""
-    start = (get_tw_now() - timedelta(days=20)).strftime("%Y-%m-%d")
-    return _tej_sync_table(
-        "tej_industry_idx", "TWN/AIND",
-        opts={"sort": "mdate.desc"},
-        extra_filter={"mdate": {"gte": start}},
-        required_columns=["mdate"],
-        postprocess=_tej_keep_latest_mdate,
-        force=force,
-    )
-
-
-# ── TEJ 市場觀察資料轉換 ────────────────────────────────────────
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_tej_market_quotes(market: str) -> pd.DataFrame:
-    """把 TWN/APRCD 轉成市場觀察使用的統一欄位格式。"""
-    if not tej_sync_daily_quotes():
-        return pd.DataFrame()
-
-    df = _tej_read_table("tej_daily_quotes")
-    if df.empty:
-        return pd.DataFrame()
-
-    coid_col = _tej_find_column(df.columns, ["coid"])
-    date_col = _tej_find_column(df.columns, ["mdate"])
-    if coid_col is None or date_col is None:
-        return pd.DataFrame()
-
-    try:
-        profiles = _mp_stock_profiles(market)
-    except Exception:
-        profiles = {}
-    if not profiles:
-        return pd.DataFrame()
-
-    rows = []
-    for _, record in df.iterrows():
-        code = str(record.get(coid_col, "") or "").strip()
-        if not re.fullmatch(r"\d{4}", code) or code not in profiles:
-            continue
-
-        profile = profiles.get(code, {})
-        close = _tej_to_number(_tej_get_value(record, ["close_d"]))
-        open_price = _tej_to_number(_tej_get_value(record, ["open_d"]))
-        high_price = _tej_to_number(_tej_get_value(record, ["high_d"]))
-        low_price = _tej_to_number(_tej_get_value(record, ["low_d"]))
-        change = _tej_to_number(_tej_get_value(record, ["clschg", "change_d"]))
-        change_pct = _tej_to_number(_tej_get_value(record, ["roi", "return_d"]))
-        volume_thousand_shares = _tej_to_number(_tej_get_value(record, ["volume"]), 0.0)
-        amount_thousand_dollars = _tej_to_number(_tej_get_value(record, ["amount"]), 0.0)
-
-        if pd.isna(change_pct) and pd.notna(close) and pd.notna(change):
-            previous_close = close - change
-            if previous_close > 0:
-                change_pct = change / previous_close * 100
-        if pd.isna(change_pct):
-            continue
-
-        rows.append({
-            "code": code,
-            "name": str(profile.get("name", "") or "").strip(),
-            "industry": _mp_normalize_industry(profile.get("industry", "未分類")),
-            "close": close,
-            "open": open_price,
-            "high": high_price,
-            "low": low_price,
-            "change": change,
-            "change_pct": float(change_pct),
-            # TEJ volume 單位為千股；市場統一格式使用股。
-            "trade_volume": float(volume_thousand_shares) * 1000,
-            # TEJ amount 單位為千元；市場統一格式使用元。
-            "trade_value": float(amount_thousand_dollars) * 1000,
-            "quote_date": _mp_format_quote_date(record.get(date_col, "")),
-            "market": market,
-        })
-
-    if len(rows) < 50:
-        return pd.DataFrame()
-
-    result = pd.DataFrame(rows)
-    result.attrs["quote_date"] = _mp_result_latest_date(result)
-    result.attrs["source_kind"] = "tej"
-    result.attrs["source"] = "TEJ TWN/APRCD"
-    return result.reset_index(drop=True)
-
-
-def _tej_industry_market_confidence(record, market: str) -> int:
-    """判斷 AIND 列是否明確屬於上市或上櫃；2=明確相符、1=無標示。"""
-    texts = []
-    try:
-        for value in record.values:
-            if value is not None and not (isinstance(value, float) and pd.isna(value)):
-                texts.append(str(value))
-    except Exception:
-        pass
-    joined = " ".join(texts)
-    upper = joined.upper()
-    is_tpex = any(token in joined for token in ["上櫃", "櫃買"]) or any(
-        token in upper for token in ["TPEX", "OTC", "TWO"]
-    )
-    is_twse = "上市" in joined or any(token in upper for token in ["TWSE", "TSE"])
-
-    if market == "TWO":
-        if is_twse and not is_tpex:
-            return 0
-        return 2 if is_tpex else 1
-    if is_tpex:
-        return 0
-    return 2 if is_twse else 1
-
-
-def _tej_extract_industry_key(record, allowed: set):
-    preferred = [
-        "iname", "ind_name", "industry_name", "index_name", "coid_name",
-        "name", "cname", "類股", "產業名稱", "指數名稱", "coid",
-    ]
-    values = []
-    for alias in preferred:
-        value = _tej_get_value(record, [alias], None)
-        if value is not None:
-            values.append(value)
-    try:
-        values.extend(list(record.values))
-    except Exception:
-        pass
-
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        key = _mp_canonical_industry(text)
-        if key in allowed:
-            return key
-    return ""
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_tej_industry_indices(market: str) -> pd.DataFrame:
-    """讀取 TWN/AIND；無權限或欄位無法辨識時交由官方指數備援。"""
-    if not tej_sync_industry_indices():
-        return pd.DataFrame()
-
-    df = _tej_read_table("tej_industry_idx")
-    if df.empty:
-        return pd.DataFrame()
-
-    df = _tej_keep_latest_mdate(df)
-    allowed = _MP_TWSE_INDUSTRY_KEYS if market == "TW" else _MP_TPEX_INDUSTRY_KEYS
-    picked = {}
-    quote_date = ""
-
-    for _, record in df.iterrows():
-        confidence = _tej_industry_market_confidence(record, market)
-        if confidence <= 0:
-            continue
-        key = _tej_extract_industry_key(record, allowed)
-        if not key:
-            continue
-
-        pct = _tej_to_number(_tej_get_value(record, [
-            "roi", "return_d", "change_pct", "ret", "漲跌幅", "漲跌幅(%)", "報酬率",
-        ]))
-        if pd.isna(pct):
-            continue
-        close_index = _tej_to_number(_tej_get_value(record, [
-            "close_d", "close", "index_value", "idx", "收盤指數", "收市指數", "指數值",
-        ]))
-        row_date = _mp_format_quote_date(_tej_get_value(record, ["mdate", "date", "資料日期"], ""))
-        if row_date > quote_date:
-            quote_date = row_date
-
-        item = {
-            "industry_key": key,
-            "類股": _MP_WANTGOO_LABELS.get(key, key),
-            "漲跌%": round(float(pct), 3),
-            "指數值": close_index,
-            "_confidence": confidence,
-        }
-        old = picked.get(key)
-        if old is None or confidence > old.get("_confidence", 0):
-            picked[key] = item
-
-    minimum = 12 if market == "TW" else 8
-    if len(picked) < minimum:
-        return pd.DataFrame()
-
-    result = pd.DataFrame(picked.values()).drop(columns=["_confidence"], errors="ignore")
-    result = result.sort_values("漲跌%", ascending=False).reset_index(drop=True)
-    result.attrs["quote_date"] = quote_date
-    result.attrs["source"] = "TEJ TWN/AIND"
-    return result
-
-
-# ── 個股與財務讀取函式 ──────────────────────────────────────────
-
-def tej_get_stock_quote(code: str) -> dict:
-    """從本地快取讀取個股當日行情。"""
-    tej_sync_daily_quotes()
-    df = _tej_read_table("tej_daily_quotes")
-    if df.empty:
-        return {}
-    coid_col = _tej_find_column(df.columns, ["coid"])
-    if coid_col is None:
-        return {}
-    target = df[df[coid_col].astype(str).str.strip() == str(code).strip()]
-    if target.empty:
-        return {}
-    row = target.iloc[-1]
-
-    close = _tej_to_number(_tej_get_value(row, ["close_d"]), 0.0)
-    change = _tej_to_number(_tej_get_value(row, ["clschg", "change_d"]), 0.0)
-    pct = _tej_to_number(_tej_get_value(row, ["roi", "return_d"]))
-    if pd.isna(pct):
-        prev = close - change if close else 0
-        pct = change / prev * 100 if prev > 0 else 0.0
-
-    # TEJ volume 的單位是千股，數值即等同台股「張」。
-    volume_lots = _tej_to_number(_tej_get_value(row, ["volume"]), 0.0)
-    return {
-        "code": str(code),
-        "收盤": close,
-        "開盤": _tej_to_number(_tej_get_value(row, ["open_d"]), 0.0),
-        "最高": _tej_to_number(_tej_get_value(row, ["high_d"]), 0.0),
-        "最低": _tej_to_number(_tej_get_value(row, ["low_d"]), 0.0),
-        "漲跌幅(%)": float(pct),
-        "成交量(張)": float(volume_lots),
-        "日期": str(_tej_get_value(row, ["mdate"], "")),
-    }
-
-
-def tej_get_financial_ratios(code: str) -> dict:
-    """從 TEJ 財報資料算出財務比率，格式同 fetch_financial_ratios。"""
-    tej_sync_financial_statements()
-    df = _tej_read_table("tej_financials")
-    if df.empty:
-        return {}
-    coid_col = _tej_find_column(df.columns, ["coid"])
-    date_col = _tej_find_column(df.columns, ["mdate"])
-    if coid_col is None or date_col is None:
-        return {}
-    target = df[df[coid_col].astype(str).str.strip() == str(code).strip()].copy()
-    if target.empty:
-        return {}
-    target["_sort_date"] = pd.to_datetime(target[date_col], errors="coerce")
-    latest = target.sort_values("_sort_date").iloc[-1]
-    year = str(latest.get(date_col, ""))[:4]
-    metrics = {}
-    mapping = {
-        "負債占資產比率": "R201",
-        "流動比率": "R301",
-        "營業利益率": "R401",
-        "純益率": "R106",
-        "總資產報酬率": "R109",
-        "股東權益報酬率": "R531",
-    }
-    for name, col in mapping.items():
-        value = _tej_to_number(_tej_get_value(latest, [col]))
-        if pd.notna(value):
-            metrics[name] = float(value)
-    return {"year": f"{year}年", "metrics": metrics} if metrics else {}
-
-
-def tej_get_quarterly_eps(code: str) -> list:
-    """從 TEJ 讀季度 EPS，格式同 fetch_quarterly_eps。"""
-    tej_sync_eps()
-    df = _tej_read_table("tej_eps")
-    if df.empty:
-        return []
-    coid_col = _tej_find_column(df.columns, ["coid"])
-    date_col = _tej_find_column(df.columns, ["mdate"])
-    if coid_col is None or date_col is None:
-        return []
-    target = df[df[coid_col].astype(str).str.strip() == str(code).strip()].copy()
-    if target.empty:
-        return []
-    target["_sort_date"] = pd.to_datetime(target[date_col], errors="coerce")
-    target = target.sort_values("_sort_date", ascending=False)
-
-    rows = []
-    for _, record in target.iterrows():
-        date_value = record.get(date_col, "")
-        dt = pd.to_datetime(date_value, errors="coerce")
-        year_q = (
-            f"{dt.year}Q{(dt.month - 1) // 3 + 1}"
-            if pd.notna(dt) else str(date_value)
-        )
-        eps_val = _tej_to_number(_tej_get_value(record, ["eps", "EPS"]))
-        if pd.notna(eps_val):
-            rows.append({"年季": year_q, "EPS": float(eps_val)})
-    return rows
-
-
-def tej_get_adjusted_close(code: str) -> pd.DataFrame:
-    """從 TEJ 讀還原股價，回傳 DataFrame(date, close)。"""
-    tej_sync_adjusted_prices()
-    df = _tej_read_table("tej_adjusted_prices")
-    if df.empty:
-        return pd.DataFrame()
-    coid_col = _tej_find_column(df.columns, ["coid"])
-    date_col = _tej_find_column(df.columns, ["mdate"])
-    close_col = _tej_find_column(df.columns, ["close_adj"])
-    if coid_col is None or date_col is None or close_col is None:
-        return pd.DataFrame()
-    target = df[df[coid_col].astype(str).str.strip() == str(code).strip()].copy()
-    if target.empty:
-        return pd.DataFrame()
-    target[date_col] = pd.to_datetime(target[date_col], errors="coerce")
-    target[close_col] = pd.to_numeric(target[close_col], errors="coerce")
-    target = target.dropna(subset=[date_col, close_col]).sort_values(date_col)
-    return pd.DataFrame({
-        "date": target[date_col],
-        "close": target[close_col].astype(float),
-    }).reset_index(drop=True)
-
-
-def tej_is_available() -> bool:
-    """TEJ API 是否可用（有設定 API Key 且已安裝 tejapi）。"""
-    return _TEJ_AVAILABLE
-
 def get_headers():
     return {
         'User-Agent': random.choice(USER_AGENTS),
@@ -1542,12 +921,9 @@ def _extract_yahoo_eps_quarterly_from_html(html: str) -> list:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
-    """單季 EPS。優先用 TEJ，TEJ 不可用時退回 Yahoo 股市爬蟲。"""
-    if tej_is_available():
-        result = tej_get_quarterly_eps(code)
-        if result:
-            return result
-    # ── 退回原本的 Yahoo 爬蟲 ──
+    """單季 EPS 列表（近期，依 Yahoo 股市頁面揭露筆數而定，通常近 8~20 季）。
+    台灣公司財報依法為季揭露，這裡的清單以「季」為單位，非每月更新。
+    """
     ticker = f"{code}.{market_suffix}"
     try:
         r = requests.get(f"https://tw.stock.yahoo.com/quote/{ticker}/eps",
@@ -2197,12 +1573,10 @@ def fetch_margin_trading(code: str, market_suffix: str) -> list:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_financial_ratios(code: str) -> dict:
-    """個股年度財務比率。優先用 TEJ，TEJ 不可用時退回 Anue 爬蟲。"""
-    if tej_is_available():
-        result = tej_get_financial_ratios(code)
-        if result:
-            return result
-    # ── 退回原本的 Anue 爬蟲 ──
+    """個股年度財務比率（負債比率、流動比率、ROE、ROA、獲利能力等）。
+    來源：Anue鉅亨網「年度財務比率」頁面。回傳 {"year": "2025年", "metrics": {...}}，
+    抓不到時回傳 {}（fail-open）。
+    """
     url = f"https://www.cnyes.com/twstock/finratio2.aspx?code={code}"
     try:
         r = requests.get(url, headers=get_headers(), timeout=10, verify=False)
@@ -2348,7 +1722,7 @@ def fetch_financial_health_score(code: str) -> float:
 
 MARKET_PULSE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
-    'market_pulse_cache_v6_tej.json',
+    'market_pulse_cache_v5.json',
 )
 MARKET_PROFILE_CACHE_FILE = os.path.join(
     os.path.dirname(__file__) if '__file__' in globals() else '.',
@@ -3331,12 +2705,9 @@ def _mp_load_disk_cache(market: str) -> dict:
             "flat": int(item.get("flat", 0) or 0),
             "quote_date": _mp_format_quote_date(item.get("quote_date", "")),
             "saved_at": item.get("saved_at", ""),
-            "source": item.get("source", "TEJ／官方行情"),
-            "quote_source": item.get("quote_source", item.get("source", "TEJ／官方行情")),
-            "quote_source_kind": item.get("quote_source_kind", "unknown"),
-            "fallback_note": item.get("fallback_note", ""),
+            "source": item.get("source", "TWSE／TPEx 官方 OpenAPI"),
             "industry_coverage": float(item.get("industry_coverage", 0) or 0),
-            "industry_method": item.get("industry_method", "index_cache"),
+            "industry_method": item.get("industry_method", "official_index"),
             "index_source": item.get("index_source", ""),
             "index_quote_date": _mp_format_quote_date(item.get("index_quote_date", "")),
             "is_cached": True,
@@ -3363,12 +2734,9 @@ def _mp_save_disk_cache(market: str, pulse: dict) -> None:
             "flat": int(pulse.get("flat", 0) or 0),
             "quote_date": pulse.get("quote_date", ""),
             "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source": pulse.get("source", "TEJ／官方行情"),
-            "quote_source": pulse.get("quote_source", pulse.get("source", "TEJ／官方行情")),
-            "quote_source_kind": pulse.get("quote_source_kind", "unknown"),
-            "fallback_note": pulse.get("fallback_note", ""),
+            "source": "TWSE／TPEx 官方 OpenAPI",
             "industry_coverage": float(pulse.get("industry_coverage", 0) or 0),
-            "industry_method": pulse.get("industry_method", "index_cache"),
+            "industry_method": pulse.get("industry_method", "official_index"),
             "index_source": pulse.get("index_source", ""),
             "index_quote_date": pulse.get("index_quote_date", ""),
         }
@@ -3398,64 +2766,17 @@ def _mp_build_change_distribution(pct: pd.Series) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def build_market_pulse(market: str) -> dict:
-    """TEJ 優先彙整市場廣度與產業輪動；資料不足時自動改用官方 API。"""
-
-    def _latest_date(frame: pd.DataFrame) -> str:
-        if frame is None or frame.empty:
-            return ""
-        attr_date = str(getattr(frame, "attrs", {}).get("quote_date", "") or "")
-        return _mp_format_quote_date(attr_date) or _mp_result_latest_date(frame)
-
-    def _should_probe_official(tej_date: str) -> bool:
-        """盤後 TEJ 若尚未更新到今天，才額外打官方來源比較日期。"""
-        if not tej_date:
-            return True
-        try:
-            quote_day = datetime.strptime(tej_date, "%Y-%m-%d").date()
-        except Exception:
-            return True
-        now = get_tw_now()
-        age = (now.date() - quote_day).days
-        if age > 4:
-            return True
-        return (
-            now.weekday() < 5
-            and (now.hour > 13 or (now.hour == 13 and now.minute >= 40))
-            and quote_day < now.date()
-        )
-
-    tej_quotes = fetch_tej_market_quotes(market) if tej_is_available() else pd.DataFrame()
-    quotes = tej_quotes
-    quote_source = "TEJ TWN/APRCD"
-    quote_source_kind = "tej"
-    fallback_note = ""
-    tej_date = _latest_date(tej_quotes)
-
-    # TEJ 無資料、無方案權限，或盤後尚未更新時，使用官方 API。
+    """彙整官方行情。類股漲跌採官方價格指數；成交比重與漲跌家數採個股行情。"""
+    quotes = fetch_official_market_quotes(market)
     if quotes.empty:
-        quotes = fetch_official_market_quotes(market)
-        quote_source = "證交所／櫃買中心官方 OpenAPI"
-        quote_source_kind = "official"
-        if tej_is_available():
-            fallback_note = "TEJ 行情目前無可用資料或方案權限不足，已自動切換官方行情。"
-        else:
-            fallback_note = "尚未啟用 TEJ API，已使用官方行情。"
-    elif _should_probe_official(tej_date):
-        official_quotes = fetch_official_market_quotes(market)
-        official_date = _latest_date(official_quotes)
-        if not official_quotes.empty and official_date > tej_date:
-            quotes = official_quotes
-            quote_source = "證交所／櫃買中心官方 OpenAPI"
-            quote_source_kind = "official"
-            fallback_note = (
-                f"TEJ 最新行情日為 {tej_date or '未知'}，官方行情已更新至 {official_date}，"
-                "本次改用日期較新的官方資料。"
-            )
-
-    if quotes is None or quotes.empty:
         return _mp_load_disk_cache(market)
 
-    quote_date = _latest_date(quotes)
+    quote_dates = [
+        _mp_format_quote_date(v) for v in quotes.get("quote_date", pd.Series(dtype=str)).tolist()
+        if str(v).strip()
+    ]
+    quote_date = max(quote_dates) if quote_dates else ""
+
     quotes = quotes.copy()
     quotes["industry_key"] = quotes["industry"].map(_mp_canonical_industry)
     allowed = _MP_TWSE_INDUSTRY_KEYS if market == "TW" else _MP_TPEX_INDUSTRY_KEYS
@@ -3463,7 +2784,7 @@ def build_market_pulse(market: str) -> dict:
     industry_base = quotes[valid_industry_mask].copy()
     industry_coverage = float(valid_industry_mask.mean()) if len(quotes) else 0.0
 
-    # 成交額、成交比重與家數一律由本次選定的個股行情來源彙總。
+    # 個股資料只負責成交額、成交比重與家數；漲跌幅不再採等權平均。
     if industry_base.empty:
         industry_stats = pd.DataFrame()
     else:
@@ -3490,66 +2811,50 @@ def build_market_pulse(market: str) -> dict:
         industry_stats["等權平均漲跌%"] = industry_stats["等權平均漲跌%"].round(3)
         industry_stats = industry_stats.drop(columns=["成交額_元"])
 
-    # 類股漲跌優先採 TEJ AIND；沒有權限／欄位不符時才用交易所官方價格指數。
-    index_frame = fetch_tej_industry_indices(market) if tej_is_available() else pd.DataFrame()
-    index_quote_date = _latest_date(index_frame)
-    industry_method = "tej_index"
-    index_source = "TEJ TWN/AIND"
+    official_indices = fetch_official_industry_indices(market)
+    index_quote_date = str(getattr(official_indices, "attrs", {}).get("quote_date", "") or "")
+    industry_method = "official_index"
+    index_source = "證交所 MI_INDEX" if market == "TW" else "櫃買中心 indexSummary"
 
-    # 不混用不同交易日的類股指數與個股行情。
-    if not index_frame.empty and quote_date and index_quote_date and index_quote_date < quote_date:
-        index_frame = pd.DataFrame()
+    # 個股行情已是今天、但類股指數端點仍停在昨天時，不混用兩個交易日。
+    # 先以同日個股等權平均呈現，下一次官方指數更新後會自動切回。
+    if (not official_indices.empty and quote_date and index_quote_date
+            and index_quote_date < quote_date):
+        official_indices = pd.DataFrame()
+        industry_method = "stale_index_fallback"
+        index_source = f"官方指數尚停於 {index_quote_date}，改用同日成分股"
 
-    if index_frame.empty:
-        official_indices = fetch_official_industry_indices(market)
-        official_index_date = _latest_date(official_indices)
-        if (
-            not official_indices.empty
-            and not (quote_date and official_index_date and official_index_date < quote_date)
-        ):
-            index_frame = official_indices
-            index_quote_date = official_index_date
-            industry_method = "official_index"
-            index_source = "證交所 MI_INDEX" if market == "TW" else "櫃買中心 indexSummary"
-        else:
-            index_frame = pd.DataFrame()
-
-    if not index_frame.empty:
-        industry = index_frame.copy()
+    if not official_indices.empty:
+        industry = official_indices.copy()
         if not industry_stats.empty:
             industry = industry.merge(industry_stats, on="industry_key", how="left")
         industry = industry.sort_values("漲跌%", ascending=False)
     else:
-        # 指數來源皆失敗時，優先使用同一交易日的最近成功指數快取。
+        # 官方指數端點暫時失敗時，優先沿用同日已成功快取的官方類股指數。
         cached = _mp_load_disk_cache(market)
         cached_industry = cached.get("industry", pd.DataFrame()) if cached else pd.DataFrame()
-        cached_method = cached.get("industry_method", "") if cached else ""
         if (
             cached
-            and cached_method in ("tej_index", "official_index", "index_cache", "official_index_cache")
+            and cached.get("industry_method") == "official_index"
             and not cached_industry.empty
             and (not quote_date or cached.get("quote_date") == quote_date)
         ):
             industry = cached_industry.copy()
-            industry_method = "index_cache"
-            index_source = cached.get("index_source", "最近成功類股指數快取")
-            index_quote_date = cached.get("index_quote_date", quote_date)
+            industry_method = "official_index_cache"
+            index_source = cached.get("index_source", index_source)
         elif not industry_stats.empty:
-            # 最後保底才使用成分股等權平均。
+            # 最後保底才顯示等權平均，UI 會明確提示此口徑無法與玩股網直接比較。
             industry = industry_stats.copy()
-            industry["類股"] = industry["industry_key"].map(
-                lambda x: _MP_WANTGOO_LABELS.get(x, x)
-            )
+            industry["類股"] = industry["industry_key"].map(lambda x: _MP_WANTGOO_LABELS.get(x, x))
             industry["漲跌%"] = industry["等權平均漲跌%"]
             industry = industry.sort_values("漲跌%", ascending=False)
-            industry_method = "equal_weight_fallback"
-            index_source = f"{quote_source}成分股等權平均"
-            index_quote_date = quote_date
+            if industry_method != "stale_index_fallback":
+                industry_method = "equal_weight_fallback"
+                index_source = "成分股等權平均備援"
         else:
             industry = pd.DataFrame()
             industry_method = "unavailable"
             index_source = ""
-            index_quote_date = ""
 
     if not industry.empty:
         industry = industry.drop(columns=["industry_key", "等權平均漲跌%"], errors="ignore")
@@ -3582,10 +2887,7 @@ def build_market_pulse(market: str) -> dict:
         "flat": flat,
         "quote_date": quote_date,
         "saved_at": get_tw_now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": quote_source,
-        "quote_source": quote_source,
-        "quote_source_kind": quote_source_kind,
-        "fallback_note": fallback_note,
+        "source": "TWSE／TPEx 官方 OpenAPI",
         "industry_coverage": industry_coverage,
         "industry_method": industry_method,
         "index_source": index_source,
@@ -5514,13 +4816,6 @@ def get_kline_data(code: str, market: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
-    # 優先用 TEJ 還原股價（斜槓方案以上，資料更穩定）
-    if tej_is_available():
-        _adj_code = ticker.split(".")[0]
-        _adj_df = tej_get_adjusted_close(_adj_code)
-        if not _adj_df.empty:
-            return _adj_df
-    # ── 退回原本的 yfinance ──
     """還原股價（除權息還原）K線資料，來源 yfinance auto_adjust=True。
 
     get_kline_data() 抓的是 TWSE/TPEx 官方原始成交價，不會因除權息往回調整；
@@ -9414,7 +8709,7 @@ with tab_market:
         '<div class="section-head"><div>'
         '<div class="section-title">市場觀察</div>'
         '<div class="section-help">當日產業資金流向與個股漲跌結構，'
-        '資料來源：TEJ 行情與產業指數優先，證交所／櫃買中心官方 API 備援；約 5 分鐘自動更新，連線失敗時顯示最近成功快取。</div>'
+        '資料來源：證交所／櫃買中心官方類股指數與個股 OpenAPI；約 5 分鐘自動更新，連線失敗時顯示最近成功快取。</div>'
         '</div></div>',
         unsafe_allow_html=True,
     )
@@ -9433,18 +8728,6 @@ with tab_market:
         )
     with _mp_head_r:
         if st.button("🔄 重新整理行情", use_container_width=True, key="mp_force_refresh"):
-            try:
-                tej_invalidate_market_cache()
-            except Exception:
-                pass
-            try:
-                fetch_tej_market_quotes.clear()
-            except Exception:
-                pass
-            try:
-                fetch_tej_industry_indices.clear()
-            except Exception:
-                pass
             try:
                 fetch_official_market_quotes.clear()
             except Exception:
@@ -9540,24 +8823,20 @@ with tab_market:
                 st.link_button("開啟 Yahoo 除權息行事曆", "https://tw.stock.yahoo.com/calendar/dividend")
 
     else:
-        with st.spinner("正在從 TEJ 取得市場資料；必要時自動切換官方備援…"):
+        with st.spinner("正在從證交所／櫃買中心取得市場資料…"):
             pulse = build_market_pulse(mp_market)
 
         if pulse and pulse.get("is_cached"):
             cached_at = pulse.get("saved_at", "")
             qd = pulse.get("quote_date", "")
             st.warning(
-                f"TEJ 與官方來源目前皆無法取得新資料，現顯示最近成功快取"
+                f"官方 API 暫時無法連線，現顯示快取資料"
                 f"{f'（行情日 {qd}）' if qd else ''}"
                 f"{f'・快取於 {cached_at}' if cached_at else ''}。"
                 "請按右上「🔄 重新整理行情」強制重抓。"
             )
         elif pulse:
             quote_date = pulse.get("quote_date", "")
-            source_name = pulse.get("quote_source", pulse.get("source", "TEJ／官方行情"))
-            fallback_note = pulse.get("fallback_note", "")
-            if fallback_note:
-                st.info(fallback_note)
             if quote_date:
                 try:
                     _qd = datetime.strptime(quote_date, "%Y-%m-%d").date()
@@ -9567,17 +8846,17 @@ with tab_market:
                     _age = 0
                 if _age >= 2:
                     st.warning(
-                        f"{source_name}最新資料日期：{quote_date}（距今 {_age} 天）。"
+                        f"官方最新資料日期：{quote_date}（距今 {_age} 天）。"
                         "若今日已收盤仍顯示舊日期，請按「🔄 重新整理行情」；"
-                        "週末／休市則停留在上一交易日，屬正常現象。"
+                        "週末／休市則會停留在上一交易日，屬正常現象。"
                     )
                 else:
-                    st.caption(f"行情來源：{source_name}・最新資料日期：{quote_date}")
+                    st.caption(f"官方最新資料日期：{quote_date}")
 
         if not pulse:
             st.warning(
-                f"目前無法取得{mp_market_label}的 TEJ 或官方行情，且尚無可用快取。"
-                "請確認 TEJ_API_KEY、tejapi 套件與網路連線；若 TEJ 方案不含所需資料，系統仍會自動使用官方來源。"
+                f"目前無法取得{mp_market_label}官方行情，且尚無可用快取。"
+                "請稍後重新整理；首次部署若遇休市日，待下一個交易日成功抓取後便會建立快取。"
             )
         elif mp_sub == "📊 產業類股表現":
             ind = pulse.get("industry", pd.DataFrame())
@@ -9588,16 +8867,19 @@ with tab_market:
                     f"目前產業覆蓋率為 {coverage:.0%}；可先切換至「個股漲跌分布」，系統也會持續使用最近成功快取。"
                 )
             else:
-                _industry_method = pulse.get("industry_method", "tej_index")
-                if _industry_method == "equal_weight_fallback":
-                    st.warning(
-                        "TEJ AIND 與官方類股指數目前皆無法取得同交易日資料，"
-                        "以下漲跌幅暫以成分股等權平均呈現；此口徑與類股價格指數不同。"
+                _industry_method = pulse.get("industry_method", "official_index")
+                if _industry_method == "stale_index_fallback":
+                    st.info(
+                        "今日個股收盤行情已更新，但證交所類股指數 latest 檔仍停在前一日；"
+                        "目前先用今日成分股等權平均，官方指數更新後會自動切回。"
                     )
-                elif _industry_method in ("index_cache", "official_index_cache"):
-                    st.info("目前類股漲跌幅沿用同一交易日最近成功取得的指數快取。")
-                elif _industry_method == "official_index":
-                    st.info("TEJ AIND 目前無權限、無資料或欄位無法辨識，本次類股漲跌改用交易所官方價格指數。")
+                elif _industry_method == "equal_weight_fallback":
+                    st.warning(
+                        "官方類股指數端點目前暫時無法取得，以下漲跌幅為成分股等權平均備援；"
+                        "此口徑不會與玩股網完全一致。官方指數恢復後會自動切回正確口徑。"
+                    )
+                elif _industry_method == "official_index_cache":
+                    st.info("目前類股漲跌幅沿用同一交易日最近成功取得的官方指數快取。")
 
                 pm_mode = st.radio(
                     "排序", ["漲幅", "跌幅", "成交比重"], horizontal=True,
@@ -9639,22 +8921,16 @@ with tab_market:
                     )
                     st.plotly_chart(fig, use_container_width=True, key=f"mp_ind_{mp_market}_{pm_mode}")
 
-                _method = pulse.get("industry_method", "")
-                _quote_source = pulse.get("quote_source", pulse.get("source", "TEJ／官方行情"))
-                if _method == "tej_index":
+                if pulse.get("industry_method") in ("official_index", "official_index_cache"):
                     st.caption(
-                        f"類股漲跌來源：{pulse.get('index_source', 'TEJ TWN/AIND')}；"
-                        f"成交額、成交比重與漲跌家數來源：{_quote_source}。"
-                    )
-                elif _method in ("official_index", "index_cache", "official_index_cache"):
-                    st.caption(
-                        f"類股漲跌來源：{pulse.get('index_source', '證交所／櫃買中心官方類股指數')}；"
-                        f"成交額、成交比重與漲跌家數來源：{_quote_source}。"
+                        f"資料來源：{pulse.get('index_source', '證交所／櫃買中心官方類股指數')}。"
+                        f"{mp_market_label}類股漲跌幅直接採官方價格指數，與玩股網類股行情屬相同計算口徑；"
+                        "成交比重則依官方個股成交額彙總。"
                     )
                 else:
                     st.caption(
-                        f"資料來源：{_quote_source}。目前類股漲跌為成分股等權平均備援，"
-                        "不能直接拿來與類股價格指數比較。"
+                        "資料來源：證交所／櫃買中心官方個股行情。"
+                        "目前為成分股等權平均備援，不能直接拿來與玩股網的類股價格指數比較。"
                     )
 
                 with st.expander("完整產業列表", expanded=False):
@@ -9750,6 +9026,6 @@ with tab_market:
                         unsafe_allow_html=True)
 
                 st.caption(
-                    f"資料來源：{pulse.get('quote_source', pulse.get('source', 'TEJ／官方行情'))}。"
+                    f"資料來源：證交所／櫃買中心官方 OpenAPI。"
                     f"漲跌家數為{mp_market_label}一般股票最新收盤行情統計。"
                 )
