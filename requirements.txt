@@ -8,4 +8,3 @@ beautifulsoup4
 plotly
 urllib3
 yfinance
-tejapi
