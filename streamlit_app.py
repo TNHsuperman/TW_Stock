@@ -4872,6 +4872,27 @@ def warm_kline_data_async(stocks):
         pass
 
 
+# ---------- [效能修補 2] st.fragment 相容包裝 ----------
+def _ui_fragment(func):
+    """把函式標記成 Streamlit fragment；舊版 Streamlit 沒有這個 API 就原樣回傳。
+
+    st.tabs 是純前端切換，每次 rerun 六個頁籤的程式碼都會重跑一遍。把個股
+    工作台包成 fragment 之後，chip／上一檔／下一檔等 widget 觸發時，Streamlit
+    只會重跑這個 fragment，其他頁籤（市場掃描、持倉、自選、分析報告、市場觀察）
+    完全不執行，切股等待時間大幅縮短。
+    Streamlit 1.37+ 用 st.fragment，1.33~1.36 用 st.experimental_fragment，
+    更舊的版本就退回一般函式（行為跟修補前相同，fail-open）。
+    """
+    frag = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+    return frag(func) if callable(frag) else func
+
+
+def _rerun_fragment_only():
+    """只重跑目前的 fragment；不支援時退回整頁 rerun（fail-open）。"""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
 # ---------- [效能修補] 切換候選股加速：on_click callback ＋ 併發預熱 ----------
 def _set_current_idx(pos: int):
     """[效能] chip 按鈕的 on_click callback。
@@ -6888,7 +6909,18 @@ with tab_workspace:
                                   on_click=_jump_to_stock_code, args=(str(row['code']),))
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
-        with right_col:
+        # [效能修補 2] 個股工作台包成 fragment：切換候選股時只重跑這一段，
+        # 其他五個頁籤不會跟著重新執行。df／total_found 由參數傳入（Streamlit
+        # 會保存 fragment 的參數供後續 fragment rerun 使用），current_stock 則
+        # 依當下的 current_idx 重新取，確保 chip 切股後拿到的是新股票。
+        @_ui_fragment
+        def _render_stock_workbench(df, total_found):
+            if total_found <= 0:
+                return
+            if st.session_state.current_idx >= total_found:
+                st.session_state.current_idx = 0
+            current_stock = df.iloc[st.session_state.current_idx]
+
             # ══════════════ 模組化資訊總覽（全寬儀表板版面）══════════════
             # 版面順序：頂欄 → 報價卡＋動作區／候選 chips
             #           → K線走勢 ＋ 交易計畫 ＋ 持倉摘要 ＋ 風險設定（4 欄）
@@ -7038,7 +7070,8 @@ with tab_workspace:
             with _tb2:
                 if st.button("📋 交易計畫", use_container_width=True, key="wb_toggle_plan"):
                     st.session_state.wb_open_plan = not bool(st.session_state.get('wb_open_plan', False))
-                    st.rerun()
+                    # [效能] 只是展開／收合本頁區塊，不必重跑整份腳本
+                    _rerun_fragment_only()
             with _tb3:
                 # [效能] 改 on_click：索引在腳本開跑前更新，避免 double-rerun。
                 st.button("← 上一檔", use_container_width=True, key="chart_prev",
@@ -8315,6 +8348,11 @@ with tab_workspace:
                 '</div>',
                 unsafe_allow_html=True,
             )
+
+        # [效能修補 2] 實際把工作台畫進原本的 right_col 容器；
+        # 之後的 fragment rerun 也會重新渲染到同一個容器位置。
+        with right_col:
+            _render_stock_workbench(df, total_found)
 
     else:
         st.info("目前沒有候選股票。可以直接在下面輸入代碼查詢，或先到「市場掃描」頁籤執行全市場掃描。")
