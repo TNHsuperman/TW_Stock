@@ -4871,6 +4871,100 @@ def warm_kline_data_async(stocks):
     except Exception:
         pass
 
+
+# ---------- [效能修補] 切換候選股加速：on_click callback ＋ 併發預熱 ----------
+def _set_current_idx(pos: int):
+    """[效能] chip 按鈕的 on_click callback。
+
+    原本寫法是 `if st.button(...): st.session_state.current_idx = pos; st.rerun()`，
+    點一下會先把整頁（含舊股票所有模組）跑到按鈕那一行，才 st.rerun() 從頭再跑
+    第二次——等於每次切股都渲染兩遍。改用 on_click 後，索引在腳本開跑前就已更新，
+    一次 rerun 就以新股票渲染完成，選中 chip 的高亮也同步正確。"""
+    st.session_state.current_idx = int(pos)
+
+
+def _step_current_idx(delta: int, total: int):
+    """[效能] 上一檔／下一檔按鈕的 on_click callback（理由同 _set_current_idx）。"""
+    if total > 0:
+        st.session_state.current_idx = (st.session_state.current_idx + int(delta)) % int(total)
+
+
+def _jump_to_stock_code(code: str):
+    """[效能] 手機版候選卡片的 on_click callback。
+
+    callback 執行時腳本尚未開跑、拿不到當下的 df，因此沿用既有的
+    manual_current_code 機制：共用結果解析區塊會依代碼找到列並切換
+    current_idx，跟手動查詢走完全相同的路徑。"""
+    st.session_state.manual_current_code = str(code)
+
+
+def _warm_stock_workbench_data(code: str, mkt: str, ticker: str,
+                               wait: bool = True, timeout: float = 12.0):
+    """[效能] 併發預抓個股工作台所有模組需要的資料來源。
+
+    原本切到新股票時，K線→行事曆→財務比率→三大法人→資券→目標價→季EPS→
+    長期股價→新聞在渲染過程中一個接一個循序抓取，第一次看某檔股票要等
+    「所有來源時間的總和」。這裡改成同時抓（全部都走既有的 @st.cache_data，
+    快取行為完全不變），等待時間縮短為「最慢的單一來源」。
+
+    wait=True：當下這檔股票，join 到抓完（有 timeout 上限，逾時就放給
+               渲染端照原本流程自己抓，fail-open）。
+    wait=False：純背景預熱（給相鄰 ±1 檔用），不阻塞本次渲染。"""
+    tasks = [
+        (get_kline_data, (code, mkt)),
+        (fetch_stock_calendar, (code, mkt)),
+        (fetch_financial_ratios, (code,)),
+        (fetch_institutional_trading, (code, mkt)),
+        (fetch_margin_trading, (code, mkt)),
+        (fetch_analyst_target_price, (code, mkt)),
+        (fetch_quarterly_eps, (code, mkt)),
+        (get_long_price_history, (ticker,)),
+        (get_tw_stock_news, (code,)),
+    ]
+    try:  # 「還原股價」開關開著時，連還原K線也一起預熱
+        if bool(st.session_state.get('kline_show_adjusted', False)):
+            tasks.append((get_kline_data_adjusted, (ticker,)))
+    except Exception:
+        pass
+
+    # 盡量把 ScriptRunContext 掛到子執行緒上，避免 log 出現 missing context 警告；
+    # 拿不到（例如 Streamlit 版本差異）就直接不掛，快取本身仍照常運作（fail-open）。
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        _ctx = get_script_run_ctx()
+    except Exception:
+        add_script_run_ctx, _ctx = None, None
+
+    def _run(fn, args):
+        try:
+            if add_script_run_ctx is not None and _ctx is not None:
+                add_script_run_ctx(threading.current_thread(), _ctx)
+        except Exception:
+            pass
+        try:
+            fn(*args)
+        except Exception:
+            pass  # 預熱失敗不影響渲染端，渲染時會照原本流程再抓一次
+
+    def _launch():
+        threads = [threading.Thread(target=_run, args=t, daemon=True) for t in tasks]
+        for th in threads:
+            th.start()
+        if wait:
+            deadline = time.time() + timeout
+            for th in threads:
+                th.join(max(0.0, deadline - time.time()))
+
+    try:
+        if wait:
+            _launch()
+        else:
+            threading.Thread(target=_launch, daemon=True).start()
+    except Exception:
+        pass
+# ---------- [效能修補] 區塊結束 ----------
+
+
 def draw_k_line(ticker, name, chart_mode='K線圖', chart_period='日', adjusted=False):
     """畫出有實際切換功能的金融圖表。
     chart_mode: K線圖 / 走勢圖 / 技術指標
@@ -6787,11 +6881,11 @@ with tab_workspace:
                           </div>
                         </div>
                         """, unsafe_allow_html=True)
-                        if st.button(f"查看 {row['name']} ({row['code']})", key=f"mobile_card_{row['code']}", use_container_width=True):
-                            matches = df.index[df['code'].astype(str) == str(row['code'])].tolist()
-                            if matches:
-                                st.session_state.current_idx = matches[0]
-                                st.rerun()
+                        # [效能] 改 on_click：callback 內拿不到 df，改沿用既有的
+                        # manual_current_code 機制，由共用結果解析區塊依代碼切換。
+                        st.button(f"查看 {row['name']} ({row['code']})", key=f"mobile_card_{row['code']}",
+                                  use_container_width=True,
+                                  on_click=_jump_to_stock_code, args=(str(row['code']),))
 
         # ══════════════ 右欄：個股工作台（報價 + 分段切換 K線／AI分析／新聞）══════════════
         with right_col:
@@ -6804,6 +6898,10 @@ with tab_workspace:
             # 同一檔股票在 TTL 內重複切換不會重打。
             _code = str(current_stock['code'])
             _mkt = "TW" if str(current_stock['ticker']).endswith(".TW") else "TWO"
+
+            # [效能] 先併發預抓這檔股票所有模組需要的資料來源（都走 @st.cache_data），
+            # 之後各區塊渲染時直接命中快取；首次看這檔的等待 ≈ 最慢的單一來源。
+            _warm_stock_workbench_data(_code, _mkt, str(current_stock['ticker']), wait=True)
 
             st.markdown(
                 '<div class="wb-topbar">'
@@ -6942,13 +7040,12 @@ with tab_workspace:
                     st.session_state.wb_open_plan = not bool(st.session_state.get('wb_open_plan', False))
                     st.rerun()
             with _tb3:
-                if st.button("← 上一檔", use_container_width=True, key="chart_prev"):
-                    st.session_state.current_idx = (st.session_state.current_idx - 1) % total_found
-                    st.rerun()
+                # [效能] 改 on_click：索引在腳本開跑前更新，避免 double-rerun。
+                st.button("← 上一檔", use_container_width=True, key="chart_prev",
+                          on_click=_step_current_idx, args=(-1, total_found))
             with _tb4:
-                if st.button("下一檔 →", use_container_width=True, key="chart_next"):
-                    st.session_state.current_idx = (st.session_state.current_idx + 1) % total_found
-                    st.rerun()
+                st.button("下一檔 →", use_container_width=True, key="chart_next",
+                          on_click=_step_current_idx, args=(1, total_found))
 
             # ══════════════ 區塊 C：候選股橫向 chips（獨立一列，可捲動切股）══════════════
             _max_chips = 150
@@ -6975,12 +7072,13 @@ with tab_workspace:
                     else:
                         _ccls = "down"
                     with _chip_cols[_pos]:
-                        if st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
-                                     use_container_width=True,
-                                     type="primary" if _pos == st.session_state.current_idx else "secondary",
-                                     help=f"{_crow.get('name', '')} ({_crow['code']})"):
-                            st.session_state.current_idx = _pos
-                            st.rerun()
+                        # [效能] 改 on_click：點 chip 只跑一次腳本（原寫法會先以舊股票
+                        # 渲染到這裡、再 st.rerun() 整頁重跑一次，等待時間近乎翻倍）。
+                        st.button(_clabel, key=f"wb_chip_{_pos}_{_crow['code']}",
+                                  use_container_width=True,
+                                  type="primary" if _pos == st.session_state.current_idx else "secondary",
+                                  help=f"{_crow.get('name', '')} ({_crow['code']})",
+                                  on_click=_set_current_idx, args=(_pos,))
                         st.markdown(
                             f'<div class="wb-chip-sub {_ccls}" title="{_crow.get("name", "")} {_cprice} {_cpct}">'
                             f'{_cprice}  {_cpct}</div>',
@@ -7011,9 +7109,16 @@ with tab_workspace:
                 if k_fig:
                     render_kline_chart_with_axis_price(k_fig, height=390)
                     try:
-                        preload_tickers = [df.iloc[(st.session_state.current_idx + offset) % total_found]['ticker']
-                                           for offset in (-1, 1)]
-                        warm_kline_data_async(preload_tickers)
+                        # [效能] 預載升級：原本只預載相鄰 ±1 檔的 K 線，改成把工作台
+                        # 全部資料來源一起背景預熱（wait=False 不阻塞本次渲染），
+                        # 點相鄰 chip／上一檔／下一檔時各模組直接命中快取、幾乎即時。
+                        for _off in (-1, 1):
+                            _nrow = df.iloc[(st.session_state.current_idx + _off) % total_found]
+                            _ntk = str(_nrow['ticker'])
+                            _warm_stock_workbench_data(
+                                str(_nrow['code']),
+                                "TW" if _ntk.endswith(".TW") else "TWO",
+                                _ntk, wait=False)
                     except Exception:
                         pass
                 else:
