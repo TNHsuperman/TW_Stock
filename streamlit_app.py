@@ -20,6 +20,8 @@ import os
 import json
 import threading
 
+# FinMind 版：請在 Streamlit secrets 設 FINMIND_TOKEN；一般帳號 FINMIND_MODE="hybrid"。
+
 # ============================================================
 # 1. 基礎設定與環境初始化
 # ============================================================
@@ -5727,6 +5729,901 @@ def build_investment_report(row_data: dict, closes: pd.Series, industry_peers: p
 
 
 
+
+# ============================================================
+# 2-FM. FinMind 低呼叫量資料層（2026-08）
+# ============================================================
+# 設計目標：
+# 1) 不把「全市場掃描」改成每檔股票各打一支 FinMind API，避免 600 requests/hour
+#    很快被用完。
+# 2) 所有 FinMind request 都走同一個 Query Cache；同 dataset + stock + 日期區間只打一次。
+# 3) 加入 request coalescing：Streamlit 多執行緒同時要同一份資料時，只會有一條真的送 API。
+# 4) 本地 rolling-hour soft limit，預留安全額度；遇 402 或網路失敗優先回舊快取（fail-open）。
+# 5) Hybrid（預設）：全市場 6~9 個月歷史資料仍沿用 yfinance 批次下載；FinMind 用在
+#    「使用者真的點到的個股」資料。這是一般 token 最省 FinMind call 的作法。
+# 6) Bulk：只有 FinMind backer/sponsor 建議開啟；利用「指定交易日一次拿全市場」建立
+#    日資料快取。第一次約需近 10 個月的交易日數次 request，之後每交易日只補新的一天。
+#
+# Streamlit Cloud 建議在 .streamlit/secrets.toml：
+# FINMIND_TOKEN = "你的 token"
+# FINMIND_MODE = "hybrid"     # 一般帳號建議；backer/sponsor 才改 "bulk"
+# FINMIND_HOURLY_SOFT_LIMIT = 540
+#
+# 也支援環境變數 FINMIND_TOKEN / FINMIND_MODE / FINMIND_HOURLY_SOFT_LIMIT。
+
+import hashlib
+import gzip
+
+
+def _fm_setting(name: str, default=''):
+    value = os.getenv(name, '')
+    if str(value).strip():
+        return value
+    try:
+        value = st.secrets[name]
+        if str(value).strip():
+            return value
+    except Exception:
+        pass
+    return default
+
+
+FINMIND_TOKEN = str(_fm_setting('FINMIND_TOKEN', '')).strip()
+FINMIND_MODE = str(_fm_setting('FINMIND_MODE', 'hybrid')).strip().lower()
+if FINMIND_MODE not in {'hybrid', 'bulk'}:
+    FINMIND_MODE = 'hybrid'
+try:
+    FINMIND_HOURLY_SOFT_LIMIT = int(_fm_setting(
+        'FINMIND_HOURLY_SOFT_LIMIT', 540 if FINMIND_TOKEN else 270
+    ))
+except Exception:
+    FINMIND_HOURLY_SOFT_LIMIT = 540 if FINMIND_TOKEN else 270
+FINMIND_HOURLY_SOFT_LIMIT = max(20, FINMIND_HOURLY_SOFT_LIMIT)
+
+FINMIND_API_URL = 'https://api.finmindtrade.com/api/v4/data'
+FINMIND_USER_INFO_URL = 'https://api.web.finmindtrade.com/v2/user_info'
+FINMIND_CACHE_DIR = os.path.join(APP_DATA_DIR, '.finmind_cache_v2')
+FINMIND_CALL_LOG_FILE = os.path.join(FINMIND_CACHE_DIR, '_request_times.json')
+os.makedirs(FINMIND_CACHE_DIR, exist_ok=True)
+
+# 保留舊資料來源，FinMind 權限不足 / 暫時無資料時可安全 fallback。
+_legacy_get_stock_market_list = get_stock_market_list
+_legacy_download_batch_history = download_batch_history
+_legacy_run_strategy_backtest = run_strategy_backtest
+_legacy_get_kline_data = get_kline_data
+_legacy_get_kline_data_adjusted = get_kline_data_adjusted
+_legacy_get_long_price_history = get_long_price_history
+_legacy_fetch_quarterly_eps = fetch_quarterly_eps
+_legacy_fetch_institutional_trading = fetch_institutional_trading
+_legacy_fetch_margin_trading = fetch_margin_trading
+_legacy_fetch_financial_ratios = fetch_financial_ratios
+_legacy_fetch_deep_info = fetch_deep_info
+_legacy_fetch_pe = fetch_pe
+_legacy_fetch_dividend_history = fetch_dividend_history
+_legacy_warm_stock_workbench_data = _warm_stock_workbench_data
+
+_FM_KEY_LOCKS = {}
+_FM_KEY_LOCKS_GUARD = threading.Lock()
+_FM_QUOTA_LOCK = threading.Lock()
+_FM_BULK_DISABLED = False
+_FM_BULK_MEM = {}
+
+
+def _fm_json_default(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if pd.isna(value) else float(value)
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def _fm_query_key(params: dict) -> str:
+    raw = json.dumps(params, ensure_ascii=False, sort_keys=True, default=_fm_json_default)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def _fm_cache_path(key: str) -> str:
+    return os.path.join(FINMIND_CACHE_DIR, f'{key}.json.gz')
+
+
+def _fm_read_cache(key: str, ttl_seconds: int):
+    path = _fm_cache_path(key)
+    try:
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
+            payload = json.load(f)
+        fetched_at = float(payload.get('fetched_at', 0) or 0)
+        data = payload.get('data', [])
+        if not isinstance(data, list):
+            return pd.DataFrame(), False
+        df = pd.DataFrame(data)
+        fresh = (time.time() - fetched_at) <= max(int(ttl_seconds), 0)
+        return df, fresh
+    except Exception:
+        return pd.DataFrame(), False
+
+
+def _fm_write_cache(key: str, df: pd.DataFrame):
+    path = _fm_cache_path(key)
+    temp = path + '.tmp'
+    try:
+        payload = {
+            'fetched_at': time.time(),
+            'data': [] if df is None or df.empty else df.astype(object).where(pd.notna(df), None).to_dict(orient='records'),
+        }
+        with gzip.open(temp, 'wt', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(',', ':'), default=_fm_json_default)
+        os.replace(temp, path)
+    except Exception:
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except Exception:
+            pass
+
+
+def _fm_get_key_lock(key: str):
+    with _FM_KEY_LOCKS_GUARD:
+        lock = _FM_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _FM_KEY_LOCKS[key] = lock
+        return lock
+
+
+def _fm_reserve_request_slot() -> tuple[bool, int]:
+    """本地 rolling-hour soft limit。只記真正要送出去的 request，不把 cache hit 算進去。"""
+    now_ts = time.time()
+    with _FM_QUOTA_LOCK:
+        calls = []
+        try:
+            with open(FINMIND_CALL_LOG_FILE, 'r', encoding='utf-8') as f:
+                calls = json.load(f)
+        except Exception:
+            calls = []
+        calls = [float(x) for x in calls if now_ts - float(x) < 3600]
+        if len(calls) >= FINMIND_HOURLY_SOFT_LIMIT:
+            return False, len(calls)
+        calls.append(now_ts)
+        try:
+            with open(FINMIND_CALL_LOG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(calls, f)
+        except Exception:
+            pass
+        return True, len(calls)
+
+
+def finmind_local_usage() -> dict:
+    """不呼叫 FinMind 的本地計數器，可在除錯時查看目前 1 小時實際送出的 request 數。"""
+    now_ts = time.time()
+    calls = []
+    try:
+        with open(FINMIND_CALL_LOG_FILE, 'r', encoding='utf-8') as f:
+            calls = json.load(f)
+    except Exception:
+        calls = []
+    calls = [float(x) for x in calls if now_ts - float(x) < 3600]
+    return {
+        'mode': FINMIND_MODE,
+        'used_last_hour_local': len(calls),
+        'soft_limit': FINMIND_HOURLY_SOFT_LIMIT,
+        'remaining_soft': max(FINMIND_HOURLY_SOFT_LIMIT - len(calls), 0),
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_finmind_server_usage() -> dict:
+    """最多 5 分鐘查一次 FinMind 官方 quota；UI 沒呼叫就完全不浪費這支 request。"""
+    if not FINMIND_TOKEN:
+        return {}
+    try:
+        headers = {'Authorization': f'Bearer {FINMIND_TOKEN}'}
+        r = requests.get(FINMIND_USER_INFO_URL, headers=headers, timeout=(3, 8))
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        return {
+            'user_count': data.get('user_count'),
+            'api_request_limit': data.get('api_request_limit'),
+        }
+    except Exception:
+        return {}
+
+
+def _fm_query(dataset: str, data_id: str | None = None,
+              start_date: str | None = None, end_date: str | None = None,
+              ttl_seconds: int = 3600, extra: dict | None = None,
+              allow_stale: bool = True) -> pd.DataFrame:
+    """FinMind REST 共用入口：磁碟 cache + 同 key 合併 + soft limit + stale fallback。"""
+    global _FM_BULK_DISABLED
+    params = {'dataset': dataset}
+    if data_id not in (None, ''):
+        params['data_id'] = str(data_id)
+    if start_date:
+        params['start_date'] = str(start_date)
+    if end_date:
+        params['end_date'] = str(end_date)
+    if extra:
+        params.update({k: v for k, v in extra.items() if v is not None})
+
+    key = _fm_query_key(params)
+    cached, fresh = _fm_read_cache(key, ttl_seconds)
+    if fresh:
+        return cached
+
+    lock = _fm_get_key_lock(key)
+    with lock:
+        cached, fresh = _fm_read_cache(key, ttl_seconds)
+        if fresh:
+            return cached
+
+        # Bulk 權限已確認不可用後，不再讓每個交易日都白打一支失敗 request。
+        if data_id in (None, '') and dataset in {
+            'TaiwanStockPrice', 'TaiwanStockPriceAdj', 'TaiwanStockPER',
+            'TaiwanStockFinancialStatements', 'TaiwanStockBalanceSheet',
+            'TaiwanStockMonthRevenue', 'TaiwanStockMarginPurchaseShortSale',
+            'TaiwanStockInstitutionalInvestorsBuySellWide',
+        } and _FM_BULK_DISABLED:
+            return cached if allow_stale else pd.DataFrame()
+
+        ok, _ = _fm_reserve_request_slot()
+        if not ok:
+            return cached if allow_stale else pd.DataFrame()
+
+        headers = {'Accept': 'application/json'}
+        if FINMIND_TOKEN:
+            headers['Authorization'] = f'Bearer {FINMIND_TOKEN}'
+
+        try:
+            # 不做自動 retry：每一次 retry 都可能再吃一次 quota；低呼叫量優先。
+            r = requests.get(FINMIND_API_URL, headers=headers, params=params, timeout=(4, 18))
+            payload = r.json() if r.text else {}
+            if r.status_code == 402 or (isinstance(payload, dict) and payload.get('status') == 402):
+                return cached if allow_stale else pd.DataFrame()
+            if r.status_code != 200:
+                msg = str(payload.get('msg', '') if isinstance(payload, dict) else '')
+                if data_id in (None, '') and dataset != 'TaiwanStockTradingDate' and (
+                    r.status_code in {400, 401, 403} or
+                    any(x in msg.lower() for x in ('backer', 'sponsor', 'permission', 'level'))
+                ):
+                    _FM_BULK_DISABLED = True
+                return cached if allow_stale else pd.DataFrame()
+            rows = payload.get('data', []) if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                return cached if allow_stale else pd.DataFrame()
+            df = pd.DataFrame(rows)
+            _fm_write_cache(key, df)
+            return df
+        except Exception:
+            return cached if allow_stale else pd.DataFrame()
+
+
+def _fm_days_ago(days: int) -> str:
+    return (get_tw_now().date() - timedelta(days=int(days))).strftime('%Y-%m-%d')
+
+
+def _fm_today() -> str:
+    return get_tw_now().strftime('%Y-%m-%d')
+
+
+def _fm_num(frame: pd.DataFrame, columns: list[str]):
+    for col in columns:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors='coerce')
+    return frame
+
+
+def _fm_normalize_price(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.rename(columns={
+        'max': 'high', 'min': 'low', 'Trading_Volume': 'volume',
+        'Trading_money': 'trading_money', 'Trading_turnover': 'trading_turnover',
+    })
+    required = ['date', 'open', 'high', 'low', 'close', 'volume']
+    if any(c not in out.columns for c in required):
+        return pd.DataFrame()
+    out = _fm_num(out, ['open', 'high', 'low', 'close', 'volume', 'trading_money', 'trading_turnover'])
+    out['date'] = pd.to_datetime(out['date'], errors='coerce')
+    out = out.dropna(subset=['date', 'close'])
+    # TaiwanStockPrice 的成交量是股；原程式技術指標一律用「張」。
+    out['volume'] = out['volume'] / 1000.0
+    out = out[out['close'] > 0]
+    return out.sort_values('date').drop_duplicates('date', keep='last').reset_index(drop=True)
+
+
+def _fm_stock_price(code: str, adjusted: bool = False) -> pd.DataFrame:
+    # 3 年固定窗口：K 線、PE 河流、法人頁需要價格時共用同一份 query/cache。
+    dataset = 'TaiwanStockPriceAdj' if adjusted else 'TaiwanStockPrice'
+    raw = _fm_query(
+        dataset, data_id=str(code), start_date=_fm_days_ago(1150), end_date=_fm_today(),
+        ttl_seconds=3600,
+    )
+    return _fm_normalize_price(raw)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_stock_market_list():
+    """FinMind TaiwanStockInfo：一天只需 1 call；失敗才退回舊 TWSE/TPEx 清單。"""
+    raw = _fm_query('TaiwanStockInfo', ttl_seconds=86400)
+    if raw is None or raw.empty or 'stock_id' not in raw.columns:
+        return _legacy_get_stock_market_list()
+    try:
+        df = raw.copy()
+        df['stock_id'] = df['stock_id'].astype(str).str.strip()
+        df['date'] = pd.to_datetime(df.get('date'), errors='coerce')
+        # 轉板股票 FinMind 會保留舊列，取同 stock_id 最新市場別。
+        df = df.sort_values('date').drop_duplicates('stock_id', keep='last')
+        df = df[df.get('type', '').isin(['twse', 'tpex'])]
+        # 維持原程式掃描範圍：四碼上市櫃股票/ETF，不納入權證等。
+        df = df[df['stock_id'].str.fullmatch(r'\d{4}', na=False)]
+        rows = []
+        for _, r in df.iterrows():
+            tp = str(r.get('type', '')).lower()
+            suffix = 'TW' if tp == 'twse' else 'TWO'
+            rows.append({
+                'ticker': f"{r['stock_id']}.{suffix}",
+                'name': normalize_stock_name(r.get('stock_name', '')),
+                'industry': str(r.get('industry_category', '') or '未分類').strip() or '未分類',
+                'code': str(r['stock_id']),
+                '市場別': '上市' if tp == 'twse' else '上櫃',
+            })
+        if len(rows) > 500:
+            return sorted(rows, key=lambda x: x['code'])
+    except Exception:
+        pass
+    return _legacy_get_stock_market_list()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_kline_data(code: str, market: str) -> pd.DataFrame:
+    """個股原始日 K：FinMind TaiwanStockPrice，一檔/小時最多 1 call，3 年窗口共用。"""
+    df = _fm_stock_price(str(code), adjusted=False)
+    if df.empty:
+        return _legacy_get_kline_data(code, market)
+    cutoff = pd.Timestamp(get_tw_now().date()) - pd.Timedelta(days=210)
+    out = df[df['date'] >= cutoff][['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+    out['date'] = out['date'].dt.strftime('%Y-%m-%d')
+    # FinMind 日資料盤後更新；用既有官方全市場收盤快照補今天，不增加 FinMind quota。
+    try:
+        suffix = 'TW' if market == 'TW' else 'TWO'
+        tk = f'{code}.{suffix}'
+        official = _official_quote_map_for_tickers((tk,)).get(tk)
+        if official:
+            out = _merge_latest_official_quote(out, official)
+    except Exception:
+        pass
+    return out.reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_kline_data_adjusted(ticker: str) -> pd.DataFrame:
+    """還原 K：FinMind TaiwanStockPriceAdj 僅 backer/sponsor；Hybrid 保留 yfinance。"""
+    if FINMIND_MODE != 'bulk':
+        return _legacy_get_kline_data_adjusted(ticker)
+    code = str(ticker).split('.')[0]
+    df = _fm_stock_price(code, adjusted=True)
+    if df.empty:
+        return _legacy_get_kline_data_adjusted(ticker)
+    cutoff = pd.Timestamp(get_tw_now().date()) - pd.Timedelta(days=400)
+    out = df[df['date'] >= cutoff][['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+    out['date'] = out['date'].dt.strftime('%Y-%m-%d')
+    return out.reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_long_price_history(ticker: str, period: str = '3y') -> pd.DataFrame:
+    """PE 河流用原始日收盤；與 K 線共用同一支 TaiwanStockPrice query。"""
+    code = str(ticker).split('.')[0]
+    df = _fm_stock_price(code, adjusted=False)
+    if df.empty:
+        return _legacy_get_long_price_history(ticker, period)
+    out = df[['date', 'close']].copy()
+    out['date'] = pd.to_datetime(out['date']).astype('datetime64[ns]')
+    return out.sort_values('date').reset_index(drop=True)
+
+
+def _fm_trading_dates() -> list[str]:
+    raw = _fm_query('TaiwanStockTradingDate', ttl_seconds=86400)
+    if raw is None or raw.empty:
+        return []
+    date_col = 'date' if 'date' in raw.columns else raw.columns[0]
+    dates = pd.to_datetime(raw[date_col], errors='coerce').dropna()
+    return sorted(set(d.strftime('%Y-%m-%d') for d in dates))
+
+
+def _fm_bulk_price_history(adjusted: bool = True, lookback_days: int = 320) -> pd.DataFrame:
+    """Backer/Sponsor：每個交易日 1 request，舊交易日永久磁碟快取；後續只補新日。"""
+    global _FM_BULK_DISABLED
+    if FINMIND_MODE != 'bulk' or _FM_BULK_DISABLED:
+        return pd.DataFrame()
+    mem_key = (bool(adjusted), int(lookback_days))
+    mem = _FM_BULK_MEM.get(mem_key)
+    if mem and time.time() - mem[0] < 1800:
+        return mem[1]
+
+    dataset = 'TaiwanStockPriceAdj' if adjusted else 'TaiwanStockPrice'
+    start = pd.Timestamp(get_tw_now().date()) - pd.Timedelta(days=lookback_days)
+    end = pd.Timestamp(get_tw_now().date())
+    dates = [d for d in _fm_trading_dates() if start <= pd.Timestamp(d) <= end]
+    if not dates:
+        return pd.DataFrame()
+
+    frames = []
+    today = _fm_today()
+    for d in dates:
+        ttl = 3600 if d == today else 60 * 60 * 24 * 365
+        day = _fm_query(dataset, start_date=d, ttl_seconds=ttl)
+        if _FM_BULK_DISABLED:
+            return pd.DataFrame()
+        if day is not None and not day.empty:
+            frames.append(day)
+    if not frames:
+        return pd.DataFrame()
+    raw = pd.concat(frames, ignore_index=True)
+    out = _fm_normalize_price(raw)
+    if out.empty or 'stock_id' not in raw.columns:
+        return pd.DataFrame()
+
+    # _fm_normalize_price 會保留 stock_id，但 drop_duplicates 不能只按 date；
+    # 因此 all-market 必須重新用 stock_id + date 正規化。
+    all_df = raw.copy().rename(columns={
+        'max': 'high', 'min': 'low', 'Trading_Volume': 'volume',
+        'Trading_money': 'trading_money', 'Trading_turnover': 'trading_turnover',
+    })
+    need = ['stock_id', 'date', 'open', 'high', 'low', 'close', 'volume']
+    if any(c not in all_df.columns for c in need):
+        return pd.DataFrame()
+    all_df = _fm_num(all_df, ['open', 'high', 'low', 'close', 'volume'])
+    all_df['stock_id'] = all_df['stock_id'].astype(str).str.strip()
+    all_df['date'] = pd.to_datetime(all_df['date'], errors='coerce')
+    all_df = all_df.dropna(subset=['date', 'close'])
+    all_df = all_df[all_df['close'] > 0]
+    all_df['volume'] = all_df['volume'] / 1000.0
+    all_df = all_df.sort_values(['stock_id', 'date']).drop_duplicates(['stock_id', 'date'], keep='last')
+    _FM_BULK_MEM[mem_key] = (time.time(), all_df.reset_index(drop=True))
+    return _FM_BULK_MEM[mem_key][1]
+
+
+def download_batch_history(tickers: tuple) -> dict:
+    """全市場掃描的關鍵：Hybrid 完全不吃 FinMind quota；Bulk 則重用全市場日快取。"""
+    if not tickers:
+        return {}
+    if FINMIND_MODE != 'bulk':
+        return _legacy_download_batch_history(tickers)
+
+    bulk = _fm_bulk_price_history(adjusted=True, lookback_days=320)
+    if bulk.empty:
+        return _legacy_download_batch_history(tickers)
+    result = {}
+    for tk in tickers:
+        code = str(tk).split('.')[0]
+        sub = bulk[bulk['stock_id'] == code]
+        if sub.empty:
+            continue
+        df = sub[['date', 'close', 'high', 'low', 'volume']].copy().sort_values('date')
+        df = df.set_index('date')
+        result[tk] = df
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_strategy_backtest(strategy_name: str, tickers: tuple, param_value: float, vol_limit: int) -> pd.DataFrame:
+    if FINMIND_MODE != 'bulk':
+        return _legacy_run_strategy_backtest(strategy_name, tickers, param_value, vol_limit)
+    checker = _STRATEGY_CHECKERS.get(strategy_name)
+    if checker is None or not tickers:
+        return pd.DataFrame()
+    history_map = download_batch_history(tuple(tickers))
+    records = []
+    for tk in tickers:
+        sub = history_map.get(tk)
+        if sub is None or sub.empty:
+            continue
+        sub = sub[['close', 'volume']].dropna().sort_index()
+        min_bars = 80 if strategy_name == '均線多頭+攻擊量縮拉回' else 65
+        if len(sub) < min_bars:
+            continue
+        closes = sub['close'].astype(float).reset_index(drop=True)
+        volumes = sub['volume'].astype(float).reset_index(drop=True)  # 已是張
+        dates = sub.index
+        n = len(closes)
+        last_signal_i = -99
+        for i in range(60, n - 1):
+            if i - last_signal_i < 5:
+                continue
+            try:
+                ok, _ = checker(closes, volumes, i, param_value)
+            except Exception:
+                continue
+            if not ok or volumes.iloc[max(0, i - 4):i + 1].mean() < vol_limit:
+                continue
+            entry = float(closes.iloc[i])
+            rec = {'ticker': tk, '訊號日': pd.Timestamp(dates[i]).strftime('%Y-%m-%d'), '進場價': round(entry, 2)}
+            for h in (5, 10, 20):
+                rec[f'{h}日報酬(%)'] = round((float(closes.iloc[i + h]) / entry - 1) * 100, 2) if i + h < n else np.nan
+            records.append(rec)
+            last_signal_i = i
+    return pd.DataFrame(records)
+
+
+def _fm_per_df(code: str) -> pd.DataFrame:
+    return _fm_query(
+        'TaiwanStockPER', data_id=str(code), start_date=_fm_days_ago(120), end_date=_fm_today(),
+        ttl_seconds=6 * 3600,
+    )
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_pe(ticker: str) -> float:
+    code = str(ticker).split('.')[0]
+    df = _fm_per_df(code)
+    if df is None or df.empty or 'PER' not in df.columns:
+        return _legacy_fetch_pe(ticker)
+    try:
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['PER'] = pd.to_numeric(df['PER'], errors='coerce')
+        s = df.sort_values('date')['PER'].replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[s > 0]
+        return round(float(s.iloc[-1]), 2) if len(s) else np.nan
+    except Exception:
+        return _legacy_fetch_pe(ticker)
+
+
+def _fm_revenue_df(code: str) -> pd.DataFrame:
+    return _fm_query(
+        'TaiwanStockMonthRevenue', data_id=str(code), start_date=_fm_days_ago(520), end_date=_fm_today(),
+        ttl_seconds=12 * 3600,
+    )
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_deep_info(ticker: str) -> dict:
+    """FinMind PER + 月營收；每個 dataset 一次，整個 app 共用 query cache。"""
+    code = str(ticker).split('.')[0]
+    res = {'pe': fetch_pe(ticker), 'mom': np.nan, 'yoy': np.nan}
+    df = _fm_revenue_df(code)
+    if df is None or df.empty or 'revenue' not in df.columns:
+        return res
+    try:
+        x = df.copy()
+        x['revenue'] = pd.to_numeric(x['revenue'], errors='coerce')
+        if 'revenue_year' in x.columns and 'revenue_month' in x.columns:
+            x['period'] = pd.to_datetime(
+                x['revenue_year'].astype('Int64').astype(str) + '-' +
+                x['revenue_month'].astype('Int64').astype(str).str.zfill(2) + '-01', errors='coerce'
+            )
+        else:
+            x['period'] = pd.to_datetime(x['date'], errors='coerce')
+        x = x.dropna(subset=['period', 'revenue']).sort_values('period').drop_duplicates('period', keep='last')
+        if len(x) >= 2 and x['revenue'].iloc[-2] != 0:
+            res['mom'] = round((x['revenue'].iloc[-1] / x['revenue'].iloc[-2] - 1) * 100, 2)
+        latest = x.iloc[-1] if len(x) else None
+        if latest is not None:
+            target_period = latest['period'] - pd.DateOffset(years=1)
+            old = x[x['period'] == target_period]
+            if not old.empty and old['revenue'].iloc[-1] != 0:
+                res['yoy'] = round((latest['revenue'] / old['revenue'].iloc[-1] - 1) * 100, 2)
+    except Exception:
+        pass
+    return res
+
+
+def _fm_statement_df(code: str) -> pd.DataFrame:
+    # EPS 顯示 12 季、財務評分共用完全相同窗口，避免同一檔重複 request。
+    return _fm_query(
+        'TaiwanStockFinancialStatements', data_id=str(code),
+        start_date=_fm_days_ago(1400), end_date=_fm_today(), ttl_seconds=24 * 3600,
+    )
+
+
+def _fm_balance_df(code: str) -> pd.DataFrame:
+    return _fm_query(
+        'TaiwanStockBalanceSheet', data_id=str(code),
+        start_date=_fm_days_ago(900), end_date=_fm_today(), ttl_seconds=24 * 3600,
+    )
+
+
+def _fm_pick_metric(frame: pd.DataFrame, type_names=(), origin_keywords=()):
+    if frame is None or frame.empty:
+        return np.nan
+    try:
+        if 'type' in frame.columns:
+            for name in type_names:
+                s = frame.loc[frame['type'].astype(str) == str(name), 'value']
+                s = pd.to_numeric(s, errors='coerce').dropna()
+                if len(s):
+                    return float(s.iloc[-1])
+        if 'origin_name' in frame.columns:
+            names = frame['origin_name'].astype(str)
+            for kw in origin_keywords:
+                s = frame.loc[names.str.contains(str(kw), regex=False, na=False), 'value']
+                s = pd.to_numeric(s, errors='coerce').dropna()
+                if len(s):
+                    return float(s.iloc[-1])
+    except Exception:
+        pass
+    return np.nan
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_quarterly_eps(code: str, market_suffix: str) -> list:
+    df = _fm_statement_df(str(code))
+    if df is None or df.empty:
+        return _legacy_fetch_quarterly_eps(code, market_suffix)
+    try:
+        eps = df[df['type'].astype(str) == 'EPS'].copy()
+        if eps.empty:
+            return _legacy_fetch_quarterly_eps(code, market_suffix)
+        eps['date'] = pd.to_datetime(eps['date'], errors='coerce')
+        eps['EPS'] = pd.to_numeric(eps['value'], errors='coerce')
+        eps = eps.dropna(subset=['date', 'EPS']).sort_values('date').drop_duplicates('date', keep='last')
+        values = eps[['date', 'EPS']].tail(12).reset_index(drop=True)
+        rows = []
+        for i in range(len(values) - 1, -1, -1):
+            d = values.loc[i, 'date']
+            v = float(values.loc[i, 'EPS'])
+            q = (int(d.month) - 1) // 3 + 1
+            qoq = (v / float(values.loc[i-1, 'EPS']) - 1) * 100 if i >= 1 and float(values.loc[i-1, 'EPS']) != 0 else np.nan
+            yoy = (v / float(values.loc[i-4, 'EPS']) - 1) * 100 if i >= 4 and float(values.loc[i-4, 'EPS']) != 0 else np.nan
+            rows.append({
+                '年季': f'{d.year} Q{q}', 'EPS': v,
+                '季增率(%)': qoq, '年增率(%)': yoy, '季均價': np.nan,
+            })
+        return rows
+    except Exception:
+        return _legacy_fetch_quarterly_eps(code, market_suffix)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_financial_ratios(code: str) -> dict:
+    """FinMind 損益表 + 資產負債表共 2 個 dataset；EPS 頁會重用損益表 cache。"""
+    inc = _fm_statement_df(str(code))
+    bal = _fm_balance_df(str(code))
+    if inc is None or inc.empty or bal is None or bal.empty:
+        return _legacy_fetch_financial_ratios(code)
+    try:
+        inc = inc.copy(); bal = bal.copy()
+        inc['date'] = pd.to_datetime(inc['date'], errors='coerce')
+        bal['date'] = pd.to_datetime(bal['date'], errors='coerce')
+        inc = inc.dropna(subset=['date']).sort_values(['date'])
+        bal = bal.dropna(subset=['date']).sort_values(['date'])
+        latest_inc_date = inc['date'].max()
+        latest_bal_date = bal['date'].max()
+        iq = inc[inc['date'] == latest_inc_date].copy()
+        bq = bal[bal['date'] == latest_bal_date].copy()
+
+        revenue = _fm_pick_metric(iq, ('Revenue', 'OperatingRevenue'), ('營業收入', '收入合計'))
+        op_income = _fm_pick_metric(iq, ('OperatingIncome',), ('營業利益',))
+        net_income = _fm_pick_metric(iq, ('IncomeAfterTaxes', 'IncomeAfterTax'), ('本期淨利', '本期稅後淨利'))
+        assets = _fm_pick_metric(bq, ('Assets',), ('資產總計',))
+        liabilities = _fm_pick_metric(bq, ('Liabilities',), ('負債總計',))
+        current_assets = _fm_pick_metric(bq, ('CurrentAssets',), ('流動資產',))
+        current_liab = _fm_pick_metric(bq, ('CurrentLiabilities',), ('流動負債',))
+        inventory = _fm_pick_metric(bq, ('Inventory', 'Inventories'), ('存貨',))
+        equity = _fm_pick_metric(bq, ('Equity', 'EquityAttributableToOwnersOfParent'), ('權益總計', '權益總額'))
+        if pd.isna(equity) and pd.notna(assets) and pd.notna(liabilities):
+            equity = assets - liabilities
+
+        metrics = {}
+        if pd.notna(assets) and assets != 0 and pd.notna(liabilities):
+            metrics['負債占資產比率'] = liabilities / assets * 100
+        if pd.notna(current_assets) and pd.notna(current_liab) and current_liab != 0:
+            metrics['流動比率'] = current_assets / current_liab * 100
+            if pd.notna(inventory):
+                metrics['速動比率'] = (current_assets - inventory) / current_liab * 100
+        if pd.notna(revenue) and revenue != 0:
+            if pd.notna(op_income):
+                metrics['營業利益率'] = op_income / revenue * 100
+            if pd.notna(net_income):
+                metrics['純益率'] = net_income / revenue * 100
+        # ROA/ROE 以最新財報期淨利粗略年化；若是 Q4 factor=1，Q1=4。
+        if pd.notna(net_income):
+            factor = 12 / max(int(latest_inc_date.month), 3)
+            annualized = net_income * factor
+            if pd.notna(assets) and assets != 0:
+                metrics['總資產報酬率'] = annualized / assets * 100
+            if pd.notna(equity) and equity != 0:
+                metrics['股東權益報酬率'] = annualized / equity * 100
+        metrics = {k: float(v) for k, v in metrics.items() if pd.notna(v) and np.isfinite(v)}
+        if not metrics:
+            return _legacy_fetch_financial_ratios(code)
+        return {'year': f'{latest_inc_date.year}年', 'metrics': metrics}
+    except Exception:
+        return _legacy_fetch_financial_ratios(code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_institutional_trading(code: str, market_suffix: str) -> list:
+    df = _fm_query(
+        'TaiwanStockInstitutionalInvestorsBuySellWide', data_id=str(code),
+        start_date=_fm_days_ago(130), end_date=_fm_today(), ttl_seconds=3600,
+    )
+    if df is None or df.empty:
+        return _legacy_fetch_institutional_trading(code, market_suffix)
+    try:
+        x = df.copy()
+        x['date'] = pd.to_datetime(x['date'], errors='coerce')
+        num_cols = [c for c in x.columns if c.endswith('_buy') or c.endswith('_sell')]
+        for c in num_cols:
+            x[c] = pd.to_numeric(x[c], errors='coerce').fillna(0)
+        def net(prefix):
+            return x.get(prefix + '_buy', 0) - x.get(prefix + '_sell', 0)
+        foreign = net('Foreign_Investor') + net('Foreign_Dealer_Self')
+        trust = net('Investment_Trust')
+        dealer = net('Dealer') + net('Dealer_self') + net('Dealer_Hedging')
+        # 法人原始單位是股，UI 沿用「張」。
+        x['_foreign'] = foreign / 1000.0
+        x['_trust'] = trust / 1000.0
+        x['_dealer'] = dealer / 1000.0
+        x['_total'] = x['_foreign'] + x['_trust'] + x['_dealer']
+
+        # K 線通常已被工作台暖過；即使這裡第一次取，也與其他模組共用同一 query key。
+        px = _fm_stock_price(str(code), adjusted=False)
+        price_map = {}
+        if px is not None and not px.empty:
+            p = px.copy().sort_values('date')
+            p['chg'] = p['close'].pct_change() * 100
+            price_map = {
+                pd.Timestamp(r['date']).strftime('%Y-%m-%d'): (r['chg'], r['volume'])
+                for _, r in p.iterrows()
+            }
+        rows = []
+        for _, r in x.sort_values('date', ascending=False).head(60).iterrows():
+            ds = pd.Timestamp(r['date']).strftime('%Y-%m-%d')
+            chg, vol = price_map.get(ds, (np.nan, np.nan))
+            rows.append({
+                '日期': ds, '外資': float(r['_foreign']), '投信': float(r['_trust']),
+                '自營商': float(r['_dealer']), '合計': float(r['_total']),
+                '外資籌碼(%)': np.nan, '漲跌幅(%)': chg, '成交量': vol,
+            })
+        return rows
+    except Exception:
+        return _legacy_fetch_institutional_trading(code, market_suffix)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_margin_trading(code: str, market_suffix: str) -> list:
+    df = _fm_query(
+        'TaiwanStockMarginPurchaseShortSale', data_id=str(code),
+        start_date=_fm_days_ago(130), end_date=_fm_today(), ttl_seconds=3600,
+    )
+    if df is None or df.empty:
+        return _legacy_fetch_margin_trading(code, market_suffix)
+    try:
+        x = df.copy()
+        x['date'] = pd.to_datetime(x['date'], errors='coerce')
+        fields = [
+            'MarginPurchaseTodayBalance', 'MarginPurchaseYesterdayBalance', 'MarginPurchaseLimit',
+            'ShortSaleTodayBalance', 'ShortSaleYesterdayBalance', 'ShortSaleLimit', 'OffsetLoanAndShort',
+        ]
+        for c in fields:
+            if c in x.columns:
+                x[c] = pd.to_numeric(x[c], errors='coerce')
+        rows = []
+        for _, r in x.sort_values('date', ascending=False).head(60).iterrows():
+            mb = r.get('MarginPurchaseTodayBalance', np.nan)
+            my = r.get('MarginPurchaseYesterdayBalance', np.nan)
+            ml = r.get('MarginPurchaseLimit', np.nan)
+            sb = r.get('ShortSaleTodayBalance', np.nan)
+            sy = r.get('ShortSaleYesterdayBalance', np.nan)
+            sl = r.get('ShortSaleLimit', np.nan)
+            rows.append({
+                '日期': pd.Timestamp(r['date']).strftime('%Y-%m-%d'),
+                '融資增減': mb - my if pd.notna(mb) and pd.notna(my) else np.nan,
+                '融資餘額': mb,
+                '融資使用率(%)': mb / ml * 100 if pd.notna(mb) and pd.notna(ml) and ml else np.nan,
+                '融券增減': sb - sy if pd.notna(sb) and pd.notna(sy) else np.nan,
+                '融券餘額': sb,
+                '融券使用率(%)': sb / sl * 100 if pd.notna(sb) and pd.notna(sl) and sl else np.nan,
+                '券資比(%)': sb / mb * 100 if pd.notna(sb) and pd.notna(mb) and mb else np.nan,
+                '資券互抵': r.get('OffsetLoanAndShort', np.nan),
+            })
+        return rows
+    except Exception:
+        return _legacy_fetch_margin_trading(code, market_suffix)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_dividend_history(code: str, market_suffix: str) -> dict:
+    df = _fm_query(
+        'TaiwanStockDividend', data_id=str(code), start_date=_fm_days_ago(4000), end_date=_fm_today(),
+        ttl_seconds=24 * 3600,
+    )
+    if df is None or df.empty:
+        return _legacy_fetch_dividend_history(code, market_suffix)
+    try:
+        x = df.copy()
+        x['date'] = pd.to_datetime(x['date'], errors='coerce')
+        for c in ['CashEarningsDistribution', 'CashStatutorySurplus', 'StockEarningsDistribution', 'StockStatutorySurplus']:
+            if c in x.columns:
+                x[c] = pd.to_numeric(x[c], errors='coerce').fillna(0)
+            else:
+                x[c] = 0.0
+        x['cash'] = x['CashEarningsDistribution'] + x['CashStatutorySurplus']
+        x['stock'] = x['StockEarningsDistribution'] + x['StockStatutorySurplus']
+        rows = []
+        for _, r in x.sort_values('date', ascending=False).iterrows():
+            period = str(r.get('year', '') or '')
+            exd = str(r.get('CashExDividendTradingDate', '') or '').strip() or '尚未公布'
+            rows.append({
+                '所屬期間': period, '現金股利': float(r['cash']), '股票股利': float(r['stock']),
+                '除息日': exd, '填息天數': np.nan,
+            })
+        streak = 0
+        # FinMind 可能有季配息，同一年先彙總後再算連續配息年度。
+        yearly = {}
+        for r in rows:
+            ymatch = re.search(r'(\d{3,4})', str(r['所屬期間']))
+            y = ymatch.group(1) if ymatch else str(r['所屬期間'])
+            yearly[y] = yearly.get(y, 0.0) + float(r.get('現金股利', 0) or 0) + float(r.get('股票股利', 0) or 0)
+        for _, total in sorted(yearly.items(), key=lambda kv: kv[0], reverse=True):
+            if total > 0:
+                streak += 1
+            else:
+                break
+        summary = {
+            '連續配息年數': streak if streak else None,
+            '歷年合計股利': float(sum(float(r.get('現金股利', 0) or 0) + float(r.get('股票股利', 0) or 0) for r in rows)),
+        }
+        return {'rows': rows, 'summary': summary}
+    except Exception:
+        return _legacy_fetch_dividend_history(code, market_suffix)
+
+
+def _scan_deep_info_low_call(ticker: str) -> dict:
+    """全市場掃描候選補值刻意不逐檔打 FinMind：官方批次 PE + Yahoo 月營收，FinMind quota = 0。"""
+    code = str(ticker).split('.')[0]
+    res = {'pe': np.nan, 'mom': np.nan, 'yoy': np.nan}
+    try:
+        pe_map = load_official_pe_map(False)
+        pe = _clean_pe_value(pe_map.get(code))
+        if pd.notna(pe):
+            res['pe'] = round(float(pe), 2)
+    except Exception:
+        pass
+    try:
+        rev_url = f'https://tw.stock.yahoo.com/quote/{code}/revenue'
+        rev_resp = requests.get(rev_url, headers=get_headers(), timeout=10)
+        soup = BeautifulSoup(rev_resp.text, 'html.parser')
+        list_items = soup.find_all('li', class_=lambda c: c and 'List' in ' '.join(c) if isinstance(c, list) else c and 'List' in c)
+        row = list_items[0] if list_items else None
+        if row:
+            percents = [s.get_text(strip=True) for s in row.find_all('span') if '%' in s.get_text()]
+            if len(percents) >= 2:
+                res['mom'] = clean_percent(percents[0])
+                res['yoy'] = clean_percent(percents[1])
+    except Exception:
+        pass
+    return res
+
+
+def _scan_health_low_call(code: str) -> float:
+    """全市場候選可能數十/上百檔，維持舊年度比率來源，避免 2 FinMind calls × N。"""
+    try:
+        ratios = _legacy_fetch_financial_ratios(code)
+        health = calc_financial_health_score(ratios.get('metrics', {}) if ratios else {})
+        return health.get('overall', np.nan) if health else np.nan
+    except Exception:
+        return np.nan
+
+
+def _warm_stock_workbench_data(code: str, mkt: str, ticker: str,
+                               wait: bool = True, timeout: float = 12.0):
+    """低 call 預熱：只抓工作台一定會用到的 K 線；其他 FinMind dataset 等使用者真的切頁再抓。"""
+    try:
+        if wait:
+            get_kline_data(code, mkt)
+        else:
+            threading.Thread(target=lambda: get_kline_data(code, mkt), daemon=True).start()
+    except Exception:
+        pass
+
+# ---------- FinMind 低呼叫量資料層結束 ----------
+
 # ============================================================
 # 3. 全域 CSS（TradingView 機構終端機風格）
 # ============================================================
@@ -6540,7 +7437,7 @@ with tab_scan:
                 一起在同一個 worker 裡依序抓取，不額外開一個執行緒池，
                 避免同時對兩個資料來源發出過多平行請求（fail-open：任一步
                 失敗都不影響另一步的結果）。"""
-                return fetch_deep_info(ticker), fetch_financial_health_score(code)
+                return _scan_deep_info_low_call(ticker), _scan_health_low_call(code)
 
             final_list = []
             with ThreadPoolExecutor(max_workers=6) as ex:
@@ -7817,7 +8714,7 @@ with tab_workspace:
                         else:
                             st.info("目前無法取得這檔 ETF 的成分股資料，可能是新掛牌 ETF 或資料來源暫時無回應，請稍後再試。")
                     else:
-                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：Yahoo 股市，僅供參考。</div></div></div>', unsafe_allow_html=True)
+                        st.markdown('<div class="section-head" style="margin-top:22px;"><div><div class="section-title" style="font-size:15px;">單季 EPS 列表</div><div class="section-help">台灣財報依法採季揭露，非每月更新；資料來源：FinMind TaiwanStockFinancialStatements，僅供參考。</div></div></div>', unsafe_allow_html=True)
                         eps_rows = fetch_quarterly_eps(current_stock['code'], market_suffix)
                         if eps_rows:
                             eps_df = pd.DataFrame(eps_rows)
@@ -7987,7 +8884,7 @@ with tab_workspace:
 
                 # ---------- 財務體質評分 ----------
                 elif view_mode == "🩺 財務體質":
-                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 財務體質評分</div><div class="section-help">資料來源：Anue鉅亨網「年度財務比率」頁面，整合負債比率、流動比率、獲利能力等指標估算；不同產業合理區間本就不同，僅供快速篩選參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 財務體質評分</div><div class="section-help">資料來源：FinMind TaiwanStockFinancialStatements / TaiwanStockBalanceSheet，由程式計算負債比率、流動比率與獲利能力等指標；不同產業合理區間本就不同，僅供快速篩選參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
 
                     fin_data = fetch_financial_ratios(current_stock['code'])
                     fin_metrics = fin_data.get("metrics", {})
@@ -8037,7 +8934,7 @@ with tab_workspace:
                 # ---------- 股利政策／殖利率／除權息 ----------
                 elif view_mode == "💵 股利政策":
                     market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><div class="section-help">資料來源：Yahoo 股市個股「股利」頁面，彙整歷年現金股利／股票股利／除息日，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 股利政策</div><div class="section-help">資料來源：FinMind TaiwanStockDividend，彙整歷年現金股利／股票股利／除息日，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
 
                     div_data = fetch_dividend_history(current_stock['code'], market_suffix)
                     div_rows = div_data.get("rows", [])
@@ -8111,7 +9008,7 @@ with tab_workspace:
                 # ---------- 三大法人買賣情況 ----------
                 elif view_mode == "💰 三大法人":
                     market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 三大法人買賣情況</div><div class="section-help">資料來源：Yahoo 股市個股「法人買賣」頁面，彙整外資、投信、自營商逐日買賣超，僅供參考，非官方逐筆對帳資料。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 三大法人買賣情況</div><div class="section-help">資料來源：FinMind TaiwanStockInstitutionalInvestorsBuySellWide，彙整外資、投信、自營商逐日買賣超。</div></div></div>', unsafe_allow_html=True)
 
                     inst_rows = fetch_institutional_trading(current_stock['code'], market_suffix)
                     if inst_rows:
@@ -8182,7 +9079,7 @@ with tab_workspace:
                 # ---------- 資券變化 ----------
                 elif view_mode == "📊 資券變化":
                     market_suffix = "TW" if current_stock['ticker'].endswith(".TW") else "TWO"
-                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 融資融券／資券變化</div><div class="section-help">資料來源：Yahoo 股市個股「資券變化」頁面，彙整融資融券逐日增減與餘額，僅供參考，非投資建議。</div></div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="section-head" style="margin-top:4px;"><div><div class="section-title" style="font-size:15px;">{current_stock["name"]} ({current_stock["code"]}) 融資融券／資券變化</div><div class="section-help">資料來源：FinMind TaiwanStockMarginPurchaseShortSale，彙整融資融券逐日增減、餘額與使用率。</div></div></div>', unsafe_allow_html=True)
 
                     margin_rows = fetch_margin_trading(current_stock['code'], market_suffix)
                     if margin_rows:
@@ -8344,7 +9241,7 @@ with tab_workspace:
             st.markdown(
                 '<div class="wb-disclaimer">'
                 '<span>本資料僅供參考・投資有風險・請審慎評估</span>'
-                '<span>資料來源：TWSE／TPEx OpenAPI・Yahoo 股市・Anue鉅亨網</span>'
+                '<span>資料來源：FinMind・TWSE／TPEx OpenAPI・Yahoo 股市・Anue鉅亨網（依功能分流與備援）</span>'
                 '</div>',
                 unsafe_allow_html=True,
             )
