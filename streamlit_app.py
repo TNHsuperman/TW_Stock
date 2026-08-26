@@ -20,7 +20,7 @@ import os
 import json
 import threading
 
-# FinMind 版：請在 Streamlit secrets 設 FINMIND_TOKEN；一般帳號 FINMIND_MODE="hybrid"。
+# FinMind V2：Token 強制驗證 + 官方/本地用量監控 + Cache 統計；一般帳號 FINMIND_MODE="hybrid"。
 
 # ============================================================
 # 1. 基礎設定與環境初始化
@@ -5784,6 +5784,7 @@ FINMIND_API_URL = 'https://api.finmindtrade.com/api/v4/data'
 FINMIND_USER_INFO_URL = 'https://api.web.finmindtrade.com/v2/user_info'
 FINMIND_CACHE_DIR = os.path.join(APP_DATA_DIR, '.finmind_cache_v2')
 FINMIND_CALL_LOG_FILE = os.path.join(FINMIND_CACHE_DIR, '_request_times.json')
+FINMIND_STATS_FILE = os.path.join(FINMIND_CACHE_DIR, '_runtime_stats.json')
 os.makedirs(FINMIND_CACHE_DIR, exist_ok=True)
 
 # 保留舊資料來源，FinMind 權限不足 / 暫時無資料時可安全 fallback。
@@ -5805,6 +5806,7 @@ _legacy_warm_stock_workbench_data = _warm_stock_workbench_data
 _FM_KEY_LOCKS = {}
 _FM_KEY_LOCKS_GUARD = threading.Lock()
 _FM_QUOTA_LOCK = threading.Lock()
+_FM_STATS_LOCK = threading.Lock()
 _FM_BULK_DISABLED = False
 _FM_BULK_MEM = {}
 
@@ -5912,30 +5914,109 @@ def finmind_local_usage() -> dict:
     }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def _fm_read_runtime_stats() -> dict:
+    """讀取程式端 FinMind 統計；這份統計不會呼叫 FinMind。"""
+    default = {
+        'api_attempt': 0,
+        'api_success': 0,
+        'cache_hit': 0,
+        'stale_fallback': 0,
+        'token_missing': 0,
+        'soft_limit_blocked': 0,
+        'quota_402': 0,
+        'api_failure': 0,
+        'last_dataset': '',
+        'last_status': '',
+        'last_event_at': '',
+    }
+    try:
+        with open(FINMIND_STATS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            default.update(data)
+    except Exception:
+        pass
+    return default
+
+
+def _fm_record_event(event: str, dataset: str = '', status: str = ''):
+    """記錄 Data API / Cache 行為，讓 UI 可以直接看出資料到底從哪裡來。"""
+    with _FM_STATS_LOCK:
+        data = _fm_read_runtime_stats()
+        if event in data and isinstance(data.get(event), (int, float)):
+            data[event] = int(data.get(event, 0) or 0) + 1
+        if dataset:
+            data['last_dataset'] = str(dataset)
+        if status:
+            data['last_status'] = str(status)
+        data['last_event_at'] = get_tw_now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            tmp = FINMIND_STATS_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, FINMIND_STATS_FILE)
+        except Exception:
+            pass
+
+
+def finmind_runtime_stats() -> dict:
+    data = _fm_read_runtime_stats()
+    data.update(finmind_local_usage())
+    return data
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def get_finmind_server_usage() -> dict:
-    """最多 5 分鐘查一次 FinMind 官方 quota；UI 沒呼叫就完全不浪費這支 request。"""
+    """查 FinMind 官方 user_info。這是帳號/Token 驗證來源，不以匿名方式查。"""
     if not FINMIND_TOKEN:
-        return {}
+        return {
+            'ok': False,
+            'status_code': None,
+            'message': 'FINMIND_TOKEN 未載入',
+            'user_count': None,
+            'api_request_limit': None,
+        }
     try:
         headers = {'Authorization': f'Bearer {FINMIND_TOKEN}'}
         r = requests.get(FINMIND_USER_INFO_URL, headers=headers, timeout=(3, 8))
+        payload = r.json() if r.text else {}
         if r.status_code != 200:
-            return {}
-        data = r.json()
+            return {
+                'ok': False,
+                'status_code': r.status_code,
+                'message': str(payload.get('msg', payload) if isinstance(payload, dict) else r.text),
+                'user_count': None,
+                'api_request_limit': None,
+            }
         return {
-            'user_count': data.get('user_count'),
-            'api_request_limit': data.get('api_request_limit'),
+            'ok': True,
+            'status_code': r.status_code,
+            'message': 'Token 驗證成功',
+            'user_count': payload.get('user_count') if isinstance(payload, dict) else None,
+            'api_request_limit': payload.get('api_request_limit') if isinstance(payload, dict) else None,
         }
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {
+            'ok': False,
+            'status_code': None,
+            'message': f'user_info 連線失敗：{exc}',
+            'user_count': None,
+            'api_request_limit': None,
+        }
 
 
 def _fm_query(dataset: str, data_id: str | None = None,
               start_date: str | None = None, end_date: str | None = None,
               ttl_seconds: int = 3600, extra: dict | None = None,
-              allow_stale: bool = True) -> pd.DataFrame:
-    """FinMind REST 共用入口：磁碟 cache + 同 key 合併 + soft limit + stale fallback。"""
+              allow_stale: bool = True, force_network: bool = False) -> pd.DataFrame:
+    """FinMind REST 共用入口。
+
+    V2 原則：
+    - Token 未載入時「禁止匿名 FinMind CALL」，直接走 stale cache / legacy fallback。
+    - cache hit 不吃 API quota。
+    - 相同 query 併發時只允許一條 request。
+    - force_network 只供 UI 的「測試資料 CALL」使用；每按一次固定最多送 1 個 Data API request。
+    """
     global _FM_BULK_DISABLED
     params = {'dataset': dataset}
     if data_id not in (None, ''):
@@ -5949,14 +6030,24 @@ def _fm_query(dataset: str, data_id: str | None = None,
 
     key = _fm_query_key(params)
     cached, fresh = _fm_read_cache(key, ttl_seconds)
-    if fresh:
+    if fresh and not force_network:
+        _fm_record_event('cache_hit', dataset, 'fresh cache')
         return cached
 
     lock = _fm_get_key_lock(key)
     with lock:
         cached, fresh = _fm_read_cache(key, ttl_seconds)
-        if fresh:
+        if fresh and not force_network:
+            _fm_record_event('cache_hit', dataset, 'fresh cache after coalescing')
             return cached
+
+        # V2：不再匿名打 FinMind。Token 設定錯誤會在 UI 明確顯示紅色警告。
+        if not FINMIND_TOKEN:
+            _fm_record_event('token_missing', dataset, 'blocked: token missing')
+            if allow_stale and cached is not None and not cached.empty:
+                _fm_record_event('stale_fallback', dataset, 'stale cache because token missing')
+                return cached
+            return pd.DataFrame()
 
         # Bulk 權限已確認不可用後，不再讓每個交易日都白打一支失敗 request。
         if data_id in (None, '') and dataset in {
@@ -5965,38 +6056,82 @@ def _fm_query(dataset: str, data_id: str | None = None,
             'TaiwanStockMonthRevenue', 'TaiwanStockMarginPurchaseShortSale',
             'TaiwanStockInstitutionalInvestorsBuySellWide',
         } and _FM_BULK_DISABLED:
-            return cached if allow_stale else pd.DataFrame()
+            if allow_stale and cached is not None and not cached.empty:
+                _fm_record_event('stale_fallback', dataset, 'bulk disabled; stale cache')
+                return cached
+            return pd.DataFrame()
 
-        ok, _ = _fm_reserve_request_slot()
+        ok, used = _fm_reserve_request_slot()
         if not ok:
-            return cached if allow_stale else pd.DataFrame()
+            _fm_record_event('soft_limit_blocked', dataset, f'local soft limit {FINMIND_HOURLY_SOFT_LIMIT}')
+            if allow_stale and cached is not None and not cached.empty:
+                _fm_record_event('stale_fallback', dataset, 'soft limit; stale cache')
+                return cached
+            return pd.DataFrame()
 
-        headers = {'Accept': 'application/json'}
-        if FINMIND_TOKEN:
-            headers['Authorization'] = f'Bearer {FINMIND_TOKEN}'
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {FINMIND_TOKEN}',
+        }
+        _fm_record_event('api_attempt', dataset, f'HTTP request #{used} in local rolling hour')
 
         try:
             # 不做自動 retry：每一次 retry 都可能再吃一次 quota；低呼叫量優先。
             r = requests.get(FINMIND_API_URL, headers=headers, params=params, timeout=(4, 18))
             payload = r.json() if r.text else {}
             if r.status_code == 402 or (isinstance(payload, dict) and payload.get('status') == 402):
-                return cached if allow_stale else pd.DataFrame()
+                _fm_record_event('quota_402', dataset, 'HTTP 402 quota exceeded')
+                if allow_stale and cached is not None and not cached.empty:
+                    _fm_record_event('stale_fallback', dataset, '402; stale cache')
+                    return cached
+                return pd.DataFrame()
             if r.status_code != 200:
                 msg = str(payload.get('msg', '') if isinstance(payload, dict) else '')
+                _fm_record_event('api_failure', dataset, f'HTTP {r.status_code}: {msg[:160]}')
                 if data_id in (None, '') and dataset != 'TaiwanStockTradingDate' and (
                     r.status_code in {400, 401, 403} or
                     any(x in msg.lower() for x in ('backer', 'sponsor', 'permission', 'level'))
                 ):
                     _FM_BULK_DISABLED = True
-                return cached if allow_stale else pd.DataFrame()
+                if allow_stale and cached is not None and not cached.empty:
+                    _fm_record_event('stale_fallback', dataset, f'HTTP {r.status_code}; stale cache')
+                    return cached
+                return pd.DataFrame()
             rows = payload.get('data', []) if isinstance(payload, dict) else []
             if not isinstance(rows, list):
+                _fm_record_event('api_failure', dataset, 'HTTP 200 but payload.data is not a list')
                 return cached if allow_stale else pd.DataFrame()
             df = pd.DataFrame(rows)
             _fm_write_cache(key, df)
+            _fm_record_event('api_success', dataset, f'HTTP 200, {len(df)} rows')
             return df
-        except Exception:
-            return cached if allow_stale else pd.DataFrame()
+        except Exception as exc:
+            _fm_record_event('api_failure', dataset, f'exception: {str(exc)[:160]}')
+            if allow_stale and cached is not None and not cached.empty:
+                _fm_record_event('stale_fallback', dataset, 'exception; stale cache')
+                return cached
+            return pd.DataFrame()
+
+
+def finmind_test_data_call() -> dict:
+    """固定用 2330 的極短日期範圍送 1 次 Data API，專供使用者驗證帳號計數。"""
+    if not FINMIND_TOKEN:
+        return {'ok': False, 'message': 'FINMIND_TOKEN 未載入，未送出任何 FinMind request。'}
+    end = get_tw_now().date()
+    start = end - timedelta(days=10)
+    before = finmind_local_usage().get('used_last_hour_local', 0)
+    df = _fm_query(
+        'TaiwanStockPrice', data_id='2330',
+        start_date=start.strftime('%Y-%m-%d'), end_date=end.strftime('%Y-%m-%d'),
+        ttl_seconds=0, allow_stale=False, force_network=True,
+    )
+    after = finmind_local_usage().get('used_last_hour_local', 0)
+    return {
+        'ok': df is not None and not df.empty,
+        'message': ('FinMind Data API 測試成功' if df is not None and not df.empty else 'FinMind Data API 測試失敗，請看狀態面板'),
+        'rows': 0 if df is None else len(df),
+        'local_calls_added': max(int(after) - int(before), 0),
+    }
 
 
 def _fm_days_ago(days: int) -> str:
@@ -7324,6 +7459,69 @@ def wb_bar_row(label, pct, color="#36c99a"):
 
 user_bias = st.session_state.user_bias
 user_vol = st.session_state.user_vol
+
+# ============================================================
+# FinMind V2 狀態面板：Token / 官方額度 / 本地 CALL / Cache 命中
+# ============================================================
+fm_server = get_finmind_server_usage()
+fm_stats = finmind_runtime_stats()
+
+with st.container(border=True, key="finmind_status_panel"):
+    head_l, head_r = st.columns([4.2, 1.2])
+    with head_l:
+        st.markdown("**FinMind API 狀態** · V2 低 CALL 架構")
+        if FINMIND_MODE == 'hybrid':
+            st.caption("Hybrid：全市場策略掃描沿用批次行情來源，不消耗 FinMind；點進個股後，K線／PER／財務／法人／資券／股利優先使用 FinMind。")
+        else:
+            st.caption("Bulk：Backer/Sponsor 模式，嘗試用 FinMind 全市場指定交易日資料建立本地快取。")
+    with head_r:
+        if st.button("重新檢查額度", use_container_width=True, key="fm_refresh_usage"):
+            try:
+                get_finmind_server_usage.clear()
+            except Exception:
+                pass
+            st.rerun()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    token_ok = bool(FINMIND_TOKEN) and bool(fm_server.get('ok'))
+    c1.metric("Token", "✅ 已驗證" if token_ok else "❌ 未驗證")
+    server_used = fm_server.get('user_count')
+    server_limit = fm_server.get('api_request_limit')
+    c2.metric("官方使用量", f"{server_used if server_used is not None else '--'} / {server_limit if server_limit is not None else '--'}")
+    c3.metric("程式近1小時 CALL", f"{fm_stats.get('used_last_hour_local', 0)} / {fm_stats.get('soft_limit', FINMIND_HOURLY_SOFT_LIMIT)}")
+    c4.metric("FinMind 成功 CALL", int(fm_stats.get('api_success', 0) or 0))
+    c5.metric("Cache Hit", int(fm_stats.get('cache_hit', 0) or 0))
+
+    if not FINMIND_TOKEN:
+        st.error("找不到 FINMIND_TOKEN。V2 已禁止匿名 FinMind CALL，所以目前所有 FinMind 資料會改走既有 fallback；請到 Streamlit Secrets 設定 FINMIND_TOKEN。")
+    elif not fm_server.get('ok'):
+        st.error(f"FINMIND_TOKEN 已讀到，但官方 user_info 驗證失敗：{fm_server.get('message', '未知錯誤')}")
+    else:
+        last_ds = fm_stats.get('last_dataset') or '尚未送出 Data API'
+        last_status = fm_stats.get('last_status') or '尚無紀錄'
+        last_at = fm_stats.get('last_event_at') or '--'
+        st.caption(f"最近事件：{last_ds}｜{last_status}｜{last_at}")
+
+    with st.expander("FinMind 連線診斷／資料來源說明", expanded=False):
+        st.write("**資料來源策略**")
+        st.write("• 市場掃描（Hybrid）：批次行情來源，FinMind CALL = 0；這是刻意避免約千檔股票逐檔耗額度。")
+        st.write("• 個股工作台：TaiwanStockPrice、TaiwanStockPER、財務、法人、資券、股利等優先 FinMind；同查詢命中磁碟快取時 CALL = 0。")
+        st.write("• FinMind 失敗／無資料：才回退既有來源，確保畫面不因單一 API 暫時失效而整頁掛掉。")
+        b1, b2 = st.columns([1, 2])
+        with b1:
+            if st.button("測試 FinMind Data API（+1）", use_container_width=True, key="fm_test_data_api", disabled=not bool(FINMIND_TOKEN)):
+                test_result = finmind_test_data_call()
+                try:
+                    get_finmind_server_usage.clear()
+                except Exception:
+                    pass
+                if test_result.get('ok'):
+                    st.success(f"{test_result.get('message')}：取得 {test_result.get('rows', 0)} 筆，程式計數 +{test_result.get('local_calls_added', 0)}。官方 user_count 可能需要短暫刷新後才更新。")
+                else:
+                    st.error(test_result.get('message', '測試失敗'))
+        with b2:
+            st.caption("這個按鈕會強制送出 1 次 TaiwanStockPrice(2330) Data API request，僅用於確認你的 Token 與 FinMind 官網使用次數是否一致；不要連續重複按。")
+
 
 tab_scan, tab_workspace, tab_portfolio, tab_watchlist, tab_report, tab_market = st.tabs([
     "市場掃描",
