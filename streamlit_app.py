@@ -64,6 +64,15 @@ for key, default in [
     ('show_guide',       True),
     # [新功能] 多策略切換 / 策略回測比較
     ('scan_strategy_used', '均線多頭排列'),
+    # [修正] 記住「實際執行掃描時」的參數，避免掃描完成後 UI 參數被調整，
+    # 候選清單卻仍拿新參數去解讀舊結果。
+    ('scan_param_used', None),
+    ('scan_vol_used', 500),
+    ('scan_completed_at', None),
+    # [修正] 候選清單是掃描當下的快照；工作台 K 線會持續更新。
+    # 記錄最後重驗時間，定期用最新行情重新驗證，避免已跌破 MA30 的股票仍留在候選。
+    ('scan_last_revalidate_at', 0.0),
+    ('scan_revalidate_removed', 0),
     ('backtest_results',   {}),   # {策略名稱: DataFrame} 讓不同策略的回測結果可以並排比較
     # [新功能] 自選股／追蹤清單
     ('watchlist_quotes',       pd.DataFrame()),
@@ -3858,6 +3867,80 @@ def load_official_pe_map(force_refresh: bool = False) -> dict:
 
 
 # ============================================================
+# [修正] 候選清單即時重驗：避免「掃描快照」與工作台最新 K 線不同步
+# ============================================================
+def revalidate_scan_results(scan_df: pd.DataFrame, strategy_name: str, param_value: float, vol_limit: int) -> pd.DataFrame:
+    """
+    用目前最新的批次行情重新套用「當次掃描真正使用的策略與參數」。
+
+    原本 scan_results 只在按下「開始全市場掃描」時建立一次，之後會一直保留在
+    session_state；但工作台 K 線有自己的 5~30 分鐘快取，會持續更新。結果就是：
+    股票掃描當下可能收在 MA30 之上而入選，稍後最新收盤已跌破 MA30，候選 chip
+    仍顯示舊價、舊訊號，看起來像「策略判斷錯誤」。
+
+    這裡只重算技術面欄位，不重抓 PE／營收／財務評分，因此成本很低；不再符合
+    原策略的股票會直接從候選清單移除。
+    """
+    if scan_df is None or scan_df.empty:
+        return pd.DataFrame()
+    cfg = STRATEGY_REGISTRY.get(strategy_name)
+    if cfg is None:
+        return scan_df.copy()
+
+    work = scan_df.copy()
+    tickers = tuple(dict.fromkeys(work['ticker'].astype(str).tolist()))
+    if not tickers:
+        return work
+
+    history_map = download_batch_history(tickers)
+    if not history_map:
+        # 行情來源暫時失敗時不要誤刪全部候選，保留舊結果（fail-open）。
+        return work
+
+    stock_map = []
+    seen = set()
+    for _, r in work.iterrows():
+        tk = str(r.get('ticker', ''))
+        if not tk or tk in seen:
+            continue
+        seen.add(tk)
+        stock_map.append({
+            'ticker': tk,
+            'code': str(r.get('code', '')),
+            'name': r.get('name', ''),
+            'industry': r.get('industry', '未分類'),
+            '市場別': r.get('市場別', '上市' if tk.endswith('.TW') else '上櫃'),
+        })
+
+    fresh_hits = cfg['func'](history_map, stock_map, float(param_value), int(vol_limit))
+    fresh_by_ticker = {str(r['ticker']): r for r in fresh_hits}
+    if not fresh_by_ticker:
+        return work.iloc[0:0].copy()
+
+    # 財務面欄位沿用原掃描結果；只以最新行情覆蓋技術面／策略訊號欄位。
+    technical_cols = [
+        '收盤', '漲跌幅(%)', '乖離30MA(%)', '成交量(張)', '量變動(%)', '量比20日',
+        '主力成本', '主力成本乖離(%)', 'RSI14', 'MACD柱', 'ATR20', 'ATR比例(%)',
+        '突破20日高', '接近60日高', '策略', '訊號說明'
+    ]
+    kept_rows = []
+    for _, old_row in work.iterrows():
+        tk = str(old_row.get('ticker', ''))
+        fresh = fresh_by_ticker.get(tk)
+        if fresh is None:
+            continue
+        row = old_row.to_dict()
+        for col in technical_cols:
+            if col in fresh:
+                row[col] = fresh[col]
+        kept_rows.append(row)
+
+    if not kept_rows:
+        return work.iloc[0:0].copy()
+    return pd.DataFrame(kept_rows).reset_index(drop=True)
+
+
+# ============================================================
 # [新功能] 產業別同儕比較
 # ============================================================
 # 完全用「已經全市場批次快取」的資料算，不逐股即時打 API：
@@ -7591,6 +7674,12 @@ with tab_scan:
         st.session_state.current_idx = 0
         st.session_state.last_selected_row = None
         st.session_state.scan_strategy_used = strategy_name
+        # [修正] 把按下掃描瞬間的參數一起鎖定。後續自動重驗一定使用同一組條件，
+        # 不會因為 UI 數字被改掉而造成「同一份候選清單、判斷標準卻變了」。
+        st.session_state.scan_param_used = float(param_value)
+        st.session_state.scan_vol_used = int(user_vol)
+        st.session_state.scan_last_revalidate_at = 0.0
+        st.session_state.scan_revalidate_removed = 0
         st.session_state.industry_filter = None  # [新功能] 新掃描結果的產業別分布會變，舊篩選清掉避免篩出空清單
         st.rerun()
 
@@ -7600,7 +7689,9 @@ with tab_scan:
         BATCH = 200
         active_strategy = st.session_state.get("scan_strategy_used", strategy_name)
         active_cfg = STRATEGY_REGISTRY[active_strategy]
-        active_param = st.session_state[f"strategy_param__{active_strategy}"]
+        _saved_param = st.session_state.get('scan_param_used')
+        active_param = float(_saved_param if _saved_param is not None else st.session_state[f"strategy_param__{active_strategy}"])
+        active_vol = int(st.session_state.get('scan_vol_used', user_vol))
 
         def _update_progress(pct: float, msg: str):
             """[新功能] 進度條同時顯示百分比文字，狀態訊息同步更新，一目了然。"""
@@ -7623,7 +7714,7 @@ with tab_scan:
             history_map.update(download_batch_history(tuple(batch)))
 
         _update_progress(0.80, f"步驟 3/3：套用「{active_strategy}」策略計算候選股票…")
-        initial_hits = active_cfg["func"](history_map, stock_map, active_param, user_vol)
+        initial_hits = active_cfg["func"](history_map, stock_map, active_param, active_vol)
 
         if initial_hits:
             _update_progress(0.80, f"已找到 {len(initial_hits)} 檔候選股，正在補齊本益比、營收與財務體質評分…")
@@ -7669,9 +7760,13 @@ with tab_scan:
                     final_list.append(row_data)
             _update_progress(1.0, "掃描完成，正在整理結果…")
             st.session_state.scan_results = pd.DataFrame(final_list).sort_values("AI評分", ascending=False, na_position="last").reset_index(drop=True)
+            st.session_state.scan_completed_at = get_tw_now().isoformat(timespec='seconds')
+            st.session_state.scan_last_revalidate_at = time.time()
             status.success(f"掃描完成，共找到 {len(st.session_state.scan_results)} 檔候選股票。")
         else:
             st.session_state.scan_results = pd.DataFrame()
+            st.session_state.scan_completed_at = get_tw_now().isoformat(timespec='seconds')
+            st.session_state.scan_last_revalidate_at = time.time()
             status.warning("查無符合目前條件的股票，請放寬乖離或成交量條件後再試。")
 
         st.session_state.is_scanning = False
@@ -7696,6 +7791,36 @@ with tab_scan:
           <div class="tv-caption" style="margin-top:9px;line-height:1.8;">設定條件後按下「開始全市場掃描」。<br>完成後請切換到「個股工作台」頁籤。</div>
         </div>
         """, unsafe_allow_html=True)
+
+# [修正] scan_results 是「掃描當下快照」，但 K 線會持續更新。
+# 每 120 秒最多重驗一次候選技術條件；download_batch_history 自身另有 300 秒快取，
+# 因此不會因 Streamlit 每次 rerun 就重打行情來源。
+if isinstance(st.session_state.scan_results, pd.DataFrame) and not st.session_state.scan_results.empty:
+    _now_ts = time.time()
+    _last_revalidate = float(st.session_state.get('scan_last_revalidate_at', 0.0) or 0.0)
+    if _now_ts - _last_revalidate >= 120:
+        try:
+            _before_n = len(st.session_state.scan_results)
+            _scan_strategy = st.session_state.get('scan_strategy_used', '均線多頭排列')
+            _scan_param = st.session_state.get('scan_param_used')
+            if _scan_param is None:
+                _scan_param = st.session_state.get(
+                    f'strategy_param__{_scan_strategy}',
+                    STRATEGY_REGISTRY[_scan_strategy]['param_default']
+                )
+            _scan_vol = int(st.session_state.get('scan_vol_used', st.session_state.get('user_vol', 500)))
+            _refreshed = revalidate_scan_results(
+                st.session_state.scan_results, _scan_strategy, float(_scan_param), _scan_vol
+            )
+            st.session_state.scan_results = _refreshed
+            st.session_state.scan_revalidate_removed = max(_before_n - len(_refreshed), 0)
+            if st.session_state.current_idx >= max(len(_refreshed), 1):
+                st.session_state.current_idx = 0
+        except Exception:
+            # 行情暫時失敗時保留原結果，不因重驗機制把候選清空。
+            pass
+        finally:
+            st.session_state.scan_last_revalidate_at = _now_ts
 
 # 共用結果與目前股票：合併「策略掃描結果」跟「手動查詢股票」，
 # 兩種來源共用同一份 current_idx / current_stock，個股工作台的程式碼完全不用區分來源。
@@ -7765,6 +7890,10 @@ def render_manual_search_box(key_suffix: str, with_border: bool = True):
 # TAB 2：候選與分析工作台（主從式雙欄：左清單常駐 + 右側分段切換）
 # ------------------------------------------------------------
 with tab_workspace:
+    _removed_by_revalidate = int(st.session_state.get('scan_revalidate_removed', 0) or 0)
+    if _removed_by_revalidate > 0:
+        st.info(f"最新行情重驗：已自動移除 {_removed_by_revalidate} 檔不再符合原掃描條件的股票。")
+        st.session_state.scan_revalidate_removed = 0
     if has_results:
         avg_score = scan_df['AI評分'].mean() if 'AI評分' in scan_df.columns else np.nan
         strong_count = int((scan_df['AI評分'] >= 80).sum()) if 'AI評分' in scan_df.columns else 0
