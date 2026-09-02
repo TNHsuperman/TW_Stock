@@ -73,6 +73,7 @@ for key, default in [
     # 記錄最後重驗時間，定期用最新行情重新驗證，避免已跌破 MA30 的股票仍留在候選。
     ('scan_last_revalidate_at', 0.0),
     ('scan_revalidate_removed', 0),
+    ('scan_logic_version_used', None),  # 選股核心條件版本；版本升級時強制舊結果重驗
     ('backtest_results',   {}),   # {策略名稱: DataFrame} 讓不同策略的回測結果可以並排比較
     # [新功能] 自選股／追蹤清單
     ('watchlist_quotes',       pd.DataFrame()),
@@ -3148,20 +3149,66 @@ def download_batch_history(tickers: tuple) -> dict:
 # 這組判斷函式同時被「即時掃描」（判斷最後一天）與「策略回測」（判斷歷史每一天）
 # 共用——確保回測驗證的邏輯跟實際掃描時用的邏輯完全一致，回測結果才有意義。
 
-def _check_ma_condition(closes: pd.Series, volumes: pd.Series, i: int, bias_limit: float):
-    """策略1：均線多頭排列。MA30>MA45>MA60，收盤價須 ≥ 30MA（明確限制，不追高超過乖離上限）。"""
+def _round_signal_price(value, digits: int = 2):
+    """
+    技術條件用的顯示精度正規化。
+
+    K 線 hover 的 MA30 / MA45 / MA60 只顯示到小數第 2 位；舊邏輯卻直接比較
+    pandas mean() 的完整浮點數，因此可能出現畫面看起來 MA45=13.79、MA60=13.79，
+    實際內部卻是 13.7941 > 13.7896，最後被判成「多頭排列」的邊界誤選。
+
+    選股條件改以與畫面相同的 2 位小數做嚴格排序，讓使用者看到的數字與
+    程式判斷完全一致。Decimal + ROUND_HALF_UP 也避免 Python round() 的銀行家捨入差異。
+    """
+    try:
+        if pd.isna(value):
+            return np.nan
+        quantum = Decimal('1').scaleb(-int(digits))
+        return float(Decimal(str(float(value))).quantize(quantum, rounding=ROUND_HALF_UP))
+    except Exception:
+        return np.nan
+
+
+def _ma_bullish_order(closes: pd.Series, i: int):
+    """回傳 (是否為明確多頭排列, MA30, MA45, MA60)。排序以畫面顯示的 2 位小數判斷。"""
     if i < 59:
-        return False, np.nan
+        return False, np.nan, np.nan, np.nan
     ma30 = closes.iloc[i-29:i+1].mean()
     ma45 = closes.iloc[i-44:i+1].mean()
     ma60 = closes.iloc[i-59:i+1].mean()
-    price = closes.iloc[i]
-    if pd.isna(ma30) or ma30 <= 0:
+    if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
+        return False, ma30, ma45, ma60
+
+    ma30_cmp = _round_signal_price(ma30, 2)
+    ma45_cmp = _round_signal_price(ma45, 2)
+    ma60_cmp = _round_signal_price(ma60, 2)
+    ok = (ma30_cmp > ma45_cmp > ma60_cmp)
+    return ok, ma30, ma45, ma60
+
+
+def _check_ma_condition(closes: pd.Series, volumes: pd.Series, i: int, bias_limit: float):
+    """
+    策略1：均線多頭排列。
+
+    必須同時符合：
+    1) MA30 > MA45 > MA60，而且以畫面顯示的 2 位小數做「嚴格」比較；
+       若 MA45、MA60 顯示同價（例如都 13.79），直接判定不成立。
+    2) 收盤價 >= MA30（同樣以 2 位小數比較）。
+    3) 30MA 正乖離不可超過使用者設定上限。
+    """
+    if i < 59:
         return False, np.nan
+
+    ma_order_ok, ma30, ma45, ma60 = _ma_bullish_order(closes, i)
+    price = closes.iloc[i]
+    if pd.isna(ma30) or ma30 <= 0 or pd.isna(price):
+        return False, np.nan
+
     bias = (price - ma30) / ma30 * 100
-    # [新限制] 收盤價一定要 >= 30MA（price >= ma30），獨立寫成明確條件，
-    # 不再只靠 bias >= 0 隱含達成；乖離上限則另外限制「不能貼太多、追高太多」。
-    ok = (ma30 > ma45 > ma60) and (price >= ma30) and (bias <= bias_limit)
+    price_cmp = _round_signal_price(price, 2)
+    ma30_cmp = _round_signal_price(ma30, 2)
+
+    ok = ma_order_ok and (price_cmp >= ma30_cmp) and (0 <= bias <= bias_limit)
     return ok, bias
 
 
@@ -3215,12 +3262,10 @@ def _check_ma_attack_pullback_condition(closes: pd.Series, volumes: pd.Series, i
     45MA支撐——代表這是主力拉回洗浮額，而非趨勢轉弱。"""
     if i < 79:
         return False, np.nan
-    ma30 = closes.iloc[i-29:i+1].mean()
-    ma45 = closes.iloc[i-44:i+1].mean()
-    ma60 = closes.iloc[i-59:i+1].mean()
-    if pd.isna(ma30) or pd.isna(ma45) or pd.isna(ma60):
-        return False, np.nan
-    if not (ma30 > ma45 > ma60):
+    # 與策略1共用同一個「明確多頭排列」判斷，避免 MA45 / MA60 只差隱藏小數
+    # 但畫面顯示同價時仍被當成多頭排列。
+    ma_order_ok, ma30, ma45, ma60 = _ma_bullish_order(closes, i)
+    if not ma_order_ok:
         return False, np.nan
 
     price = closes.iloc[i]
@@ -3282,6 +3327,8 @@ def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
     vol_yesterday = float(volumes.iloc[-2]) if len(volumes) >= 2 else np.nan
     avg_vol20 = float(volumes.tail(20).mean())
     ma30 = closes.rolling(30).mean().iloc[-1]
+    ma45 = closes.rolling(45).mean().iloc[-1]
+    ma60 = closes.rolling(60).mean().iloc[-1]
     main_cost = calc_main_cost(df, 20)
     cost_gap = ((curr_price - main_cost) / main_cost * 100) if pd.notna(main_cost) and main_cost > 0 else np.nan
     high20 = float(closes.tail(20).max())
@@ -3299,6 +3346,9 @@ def _build_common_signal_fields(s: dict, df: pd.DataFrame) -> dict:
         "收盤":       round(curr_price, 2),
         "漲跌幅(%)":   round(price_change, 2) if pd.notna(price_change) else np.nan,
         "乖離30MA(%)": round(bias_30, 2) if pd.notna(bias_30) else np.nan,
+        "MA30":       _round_signal_price(ma30, 2),
+        "MA45":       _round_signal_price(ma45, 2),
+        "MA60":       _round_signal_price(ma60, 2),
         "成交量(張)":  vol_today,
         "量變動(%)":   round(vol_change, 2),
         "量比20日":    round(vol_today / avg_vol20, 2) if avg_vol20 > 0 else np.nan,
@@ -3328,7 +3378,8 @@ def calc_ma_signals(history_map, stock_map, bias_limit, vol_limit):
         if ok:
             row = _build_common_signal_fields(s, df)
             row["策略"] = "均線多頭排列"
-            row["訊號說明"] = f"MA30>MA45>MA60 多頭排列，收盤價≥30MA，乖離 {bias:.1f}%"
+            row["訊號說明"] = (f"MA30 {row.get('MA30', np.nan):.2f} > MA45 {row.get('MA45', np.nan):.2f} > "
+                                 f"MA60 {row.get('MA60', np.nan):.2f}，收盤價≥30MA，乖離 {bias:.1f}%")
             hits.append(row)
     return hits
 
@@ -3405,10 +3456,12 @@ def calc_ma_attack_pullback_signals(history_map, stock_map, shrink_ratio_limit, 
 
 
 # 策略登記表：新增策略只要在這裡註冊，Tab1 的選單與掃描流程會自動支援。
+SCAN_LOGIC_VERSION = '2026-09-02-ma-round-v2'
+
 STRATEGY_REGISTRY = {
     "均線多頭排列": {
         "func": calc_ma_signals,
-        "desc": "尋找 MA30 &gt; MA45 &gt; MA60 的多頭排列股票，且收盤價須 ≥ 30MA，適合抓穩定趨勢股。",
+        "desc": "尋找 MA30 &gt; MA45 &gt; MA60 的明確多頭排列股票（均線以小數第2位嚴格比較，同價不算），且收盤價須 ≥ 30MA，適合抓穩定趨勢股。",
         "param_label": "30MA 乖離上限 (%)", "param_help": "數值越小，越偏向尋找貼近 30 日均線的股票。",
         "param_min": 0.1, "param_max": 15.0, "param_default": 3.0, "param_step": 0.1,
     },
@@ -3919,7 +3972,7 @@ def revalidate_scan_results(scan_df: pd.DataFrame, strategy_name: str, param_val
 
     # 財務面欄位沿用原掃描結果；只以最新行情覆蓋技術面／策略訊號欄位。
     technical_cols = [
-        '收盤', '漲跌幅(%)', '乖離30MA(%)', '成交量(張)', '量變動(%)', '量比20日',
+        '收盤', '漲跌幅(%)', '乖離30MA(%)', 'MA30', 'MA45', 'MA60', '成交量(張)', '量變動(%)', '量比20日',
         '主力成本', '主力成本乖離(%)', 'RSI14', 'MACD柱', 'ATR20', 'ATR比例(%)',
         '突破20日高', '接近60日高', '策略', '訊號說明'
     ]
@@ -7680,6 +7733,7 @@ with tab_scan:
         st.session_state.scan_vol_used = int(user_vol)
         st.session_state.scan_last_revalidate_at = 0.0
         st.session_state.scan_revalidate_removed = 0
+        st.session_state.scan_logic_version_used = SCAN_LOGIC_VERSION
         st.session_state.industry_filter = None  # [新功能] 新掃描結果的產業別分布會變，舊篩選清掉避免篩出空清單
         st.rerun()
 
@@ -7743,7 +7797,9 @@ with tab_scan:
                         "industry": base["industry"],
                         "市場別": base.get("市場別", "上市" if str(base.get("ticker", "")).endswith(".TW") else "上櫃" if str(base.get("ticker", "")).endswith(".TWO") else "興櫃"),
                         "收盤": base["收盤"], "漲跌幅(%)": base.get("漲跌幅(%)", np.nan),
-                        "乖離30MA(%)": base["乖離30MA(%)"], "成交量(張)": base["成交量(張)"],
+                        "乖離30MA(%)": base["乖離30MA(%)"],
+                        "MA30": base.get("MA30", np.nan), "MA45": base.get("MA45", np.nan), "MA60": base.get("MA60", np.nan),
+                        "成交量(張)": base["成交量(張)"],
                         "量變動(%)": base["量變動(%)"], "量比20日": base.get("量比20日", np.nan),
                         "主力成本": base.get("主力成本", np.nan),
                         "主力成本乖離(%)": base.get("主力成本乖離(%)", np.nan),
@@ -7795,6 +7851,11 @@ with tab_scan:
 # [修正] scan_results 是「掃描當下快照」，但 K 線會持續更新。
 # 每 120 秒最多重驗一次候選技術條件；download_batch_history 自身另有 300 秒快取，
 # 因此不會因 Streamlit 每次 rerun 就重打行情來源。
+# 若程式升級了選股核心條件（例如本版修正「均線隱藏小數」問題），舊 session 裡的
+# scan_results 不能直接沿用；把重驗時間歸零，讓下一段立刻用新規則重驗一次。
+if st.session_state.get('scan_logic_version_used') != SCAN_LOGIC_VERSION:
+    st.session_state.scan_last_revalidate_at = 0.0
+
 if isinstance(st.session_state.scan_results, pd.DataFrame) and not st.session_state.scan_results.empty:
     _now_ts = time.time()
     _last_revalidate = float(st.session_state.get('scan_last_revalidate_at', 0.0) or 0.0)
@@ -7814,6 +7875,7 @@ if isinstance(st.session_state.scan_results, pd.DataFrame) and not st.session_st
             )
             st.session_state.scan_results = _refreshed
             st.session_state.scan_revalidate_removed = max(_before_n - len(_refreshed), 0)
+            st.session_state.scan_logic_version_used = SCAN_LOGIC_VERSION
             if st.session_state.current_idx >= max(len(_refreshed), 1):
                 st.session_state.current_idx = 0
         except Exception:
